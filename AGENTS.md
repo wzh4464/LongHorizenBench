@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is an evaluation workspace for coding-agent experiments, not a single deployable application. The canonical task definitions live under `base_repo/` (`C1-C5`, `M1-M3`, `K1-K4`, `T01-T50`), each with `repo/`, `prompts/`, and `eval/`. Put benchmark workflow changes under `experiment/`, which now primarily contains per-run experiment repos such as `experiment/K4-codex-gpt-5_4-short-20260418` plus runner/audit scripts. Use `docs/` for project knowledge and CapBench classification notes, `scripts/` for verification helpers, `paper2/` for the ASE paper (`main.tex`, `sections/`, `references.bib`), and `proxy-docker/` for the standalone proxy stack. `experiment_zips/` and `legacy/` hold archival material and notes; top-level `*_eval_report.md`, `scoring_summary.md`, and `sankey.py` are analysis artifacts. Generated directories such as `experiment/eval_results/` or files such as `experiment/all_scores.csv` may be absent in a given checkout. For detailed workflow context, prefer `GUIDE.md` and `docs/PROJECT_KNOWLEDGE.md`.
+This repository is an evaluation workspace for coding-agent experiments, not a single deployable application. The canonical task definitions live under `base_repo/` (`C1-C5`, `M1-M3`, `K1-K4`, `T01-T50`), each with `repo/`, `prompts/`, and `eval/`. Put benchmark workflow changes under `experiment/`, which contains per-run experiment repos (gitignored) plus runner/audit scripts. Use `docs/` for project knowledge and CapBench classification notes, `scripts/` for verification helpers, and `paper2/` for the ASE paper (a **git submodule** pointing to `wzh4464/LongHorizenBench-paper`). Top-level `*_eval_report.md`, `scoring_summary.md`, and `sankey.py` are analysis artifacts. Large data (`experiment/eval_results/`, `source_repos/`, `base_repo/*/repo/`, per-run experiment repos) are gitignored and managed by DVC or rsync. For detailed workflow context, prefer `GUIDE.md` and `docs/PROJECT_KNOWLEDGE.md`.
 
 ## Build, Test, and Development Commands
 There is no repo-wide build. Use targeted commands:
@@ -12,8 +12,9 @@ There is no repo-wide build. Use targeted commands:
 - `python3 experiment/audit_codex_cheating.py [--task K4] [--verbose]` reruns the anti-cheating audit over Codex experiment logs.
 - `python3 scripts/verify_classification.py T01 T02 ...` verifies HW/AG file classification for CapBench tasks.
 - `bash experiment/check_gt_preapplied.sh` checks for accidental GT pre-application contamination.
+- `python3 experiment/diagnose_session.py <experiment_dir>` diagnoses Claude session issues (brainstorming traps, unanswered questions).
+- `bash experiment/monitor_experiments.sh` monitors running experiment status.
 - `cd paper2 && pdflatex main && bibtex main && pdflatex main && pdflatex main` rebuilds the paper PDF.
-- `bash proxy-docker/deploy.sh user@host` deploys the proxy stack.
 
 Several runner and audit scripts are point-in-time snapshots with hardcoded dates, batch files, or model assumptions, especially `run_batch.sh`, `run_eval_batch.sh`, `run_eval_codex.sh`, `monitor_experiments.sh`, and `check_gt_preapplied.sh`. Read the script before reusing it for a new campaign.
 
@@ -31,7 +32,7 @@ This repo vendors a local `diff-eval-local` skill for repo-based experiment scor
 - Other agents: follow the same workflow from either local copy; GT diff should be read from `base_repo/<task>/eval/gt_diff.patch`, not generated from the experiment repo.
 
 ## Commit & Pull Request Guidelines
-This workspace now includes `.git`, but the working tree may still contain many untracked or generated artifacts, so inspect `git status` before assuming a clean baseline. Use short imperative subjects with a clear scope, for example `experiment: tighten Codex audit heuristics` or `paper2: refresh results table`. PRs should state the research impact, list affected paths, mention any regenerated artifacts, and include the exact validation commands run.
+Large experiment data is gitignored (see `.gitignore`); only scripts, task metadata (`base_repo/*/eval/`, `base_repo/*/prompts/`), docs, and skills are tracked. Use short imperative subjects with a clear scope, for example `experiment: tighten Codex audit heuristics` or `paper2: refresh results table`. PRs should state the research impact, list affected paths, mention any regenerated artifacts, and include the exact validation commands run. Paper changes go into the `paper2` submodule repo.
 
 ## Security & Sanitization Notes
-Do not reattach remotes or expose ground-truth commits. Treat `base_repo/<task>/eval/` as sensitive ground-truth data: during experiments these directories may be intentionally `chmod 000` to prevent cheating, so do not relax those permissions unless you are explicitly doing sanctioned setup or evaluation work. If a run harness injects a fake `gh` guard or similar anti-leakage wrapper, do not bypass it. Treat `.env` files and VPS credentials in `proxy-docker/` as local secrets.
+Do not reattach remotes or expose ground-truth commits. `base_repo/<task>/eval/` directories are `chmod 000` by default to prevent agent cheating during experiments — do not relax these permissions unless you are explicitly doing sanctioned setup or evaluation work. If a run harness injects a fake `gh` guard or similar anti-leakage wrapper, do not bypass it. Treat `.env` files as local secrets. The experiment timeout standard is 7200s for all runs; always use `2>&1` when capturing agent output to merge stderr.

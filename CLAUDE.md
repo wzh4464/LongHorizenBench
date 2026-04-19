@@ -14,22 +14,19 @@ An evaluation benchmark for an ASE 2026 Industry Showcase paper, measuring how w
 - `docs/PROJECT_KNOWLEDGE.md` — project context, layout, workflow ground rules, current state of base_repo
 - `docs/CAPBENCH_CLASSIFICATION_TODO.md` — HW/AG classification work order for 41 unclassified CapBench tasks
 - `experiment_plan.md` — frozen experiment design matrix
-- `paper2/` — LaTeX manuscript (`paper2/main.tex` + `paper2/sections/*.tex`)
+- `paper2/` — LaTeX manuscript, git submodule (`paper2/main.tex` + `paper2/sections/*.tex`)
 
 ## Common Commands
 
 ```bash
-# View scores (single source of truth)
-cat experiment/all_scores.csv
+# Run a single Codex experiment
+bash experiment/run_codex_experiment.sh run T01 long
 
-# Rebuild scores CSV from eval_report.md files
-python3 experiment/build_scores_csv.py
+# Check Codex experiment status
+bash experiment/run_codex_experiment.sh status
 
 # Run anti-cheating audit over experiment logs
-python3 experiment/audit_cheating.py
-
-# Run a single Codex experiment (uses base_repo tasks)
-bash experiment/run_codex_experiment.sh
+python3 experiment/audit_codex_cheating.py
 
 # Batch run: Codex (all 62 tasks × 2 prompts)
 bash experiment/run_batch.sh batch1_experiments.txt [parallel_count]
@@ -82,8 +79,7 @@ experiment/
 ├── {task}-{config}-{prompt}[-{date}]/  # Per-run experiment repos (each is a git repo)
 ├── eval_results/{task}-{config}-{prompt}/  # Eval output (eval_report.md, coverage.json, diffs)
 ├── prompts/                       # Legacy prompt files ({task}-{short,long}.md)
-├── all_scores.csv                 # Unified results, rebuilt by build_scores_csv.py
-├── bin/gh                         # Fake gh binary (blocks GitHub API during experiments)
+├── bin/gh                         # Fake gh binary (blocks GitHub API during experiments, may not be in git)
 ├── run_batch.sh                   # Codex batch runner
 ├── run_claude_batch.sh            # Claude Code batch runner
 ├── run_cursor_batch.sh            # Cursor batch runner
@@ -92,7 +88,7 @@ experiment/
 └── *.py                           # audit_cheating, build_scores_csv, diagnose_session
 
 source_repos/                      # Full clones of upstream repos (for building tasks)
-paper2/                            # LaTeX manuscript
+paper2/                            # LaTeX manuscript (git submodule → wzh4464/LongHorizenBench-paper)
   main.tex, sections/*.tex, references.bib
 ```
 
