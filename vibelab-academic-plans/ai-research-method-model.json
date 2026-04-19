@@ -1,0 +1,142 @@
+{
+  "id": "ai-research-method-model",
+  "name": "AI Research - Method/Model",
+  "description": "For algorithmic, architectural, and model innovation projects",
+  "domain": "ai-research",
+  "category": "ai-research",
+  "format": "research-brief-json",
+  "fileName": "research_brief.json",
+  "metaFields": [
+    { "key": "title", "label": "Paper Title", "path": "meta.title", "placeholder": "Optional project title" },
+    { "key": "lead_author", "label": "Lead Author", "path": "meta.lead_author", "placeholder": "Optional lead author" },
+    { "key": "target_venue", "label": "Target Venue", "path": "meta.target_venue", "placeholder": "Optional venue" }
+  ],
+  "sectionFields": {
+    "ideation": [
+      { "key": "research_goal", "label": "Research Goal", "path": "sections.ideation.research_goal", "placeholder": "Main hypothesis and expected gains" },
+      { "key": "problem_framing", "label": "Problem Framing", "path": "sections.ideation.problem_framing", "placeholder": "Novelty boundary vs prior work" },
+      { "key": "evidence_plan", "label": "Evidence Plan", "path": "sections.ideation.evidence_plan", "placeholder": "Related work and intended comparisons" },
+      { "key": "success_criteria", "label": "Success Criteria", "path": "sections.ideation.success_criteria", "type": "array", "placeholder": "One criterion per line" }
+    ],
+    "experiment": [
+      { "key": "hypothesis_or_validation_goal", "label": "Validation Goal", "path": "sections.experiment.hypothesis_or_validation_goal", "placeholder": "What should ablations prove?" },
+      { "key": "dataset_or_data_source", "label": "Dataset Plan", "path": "sections.experiment.dataset_or_data_source", "placeholder": "Datasets and splits" },
+      { "key": "method_or_protocol", "label": "Method Protocol", "path": "sections.experiment.method_or_protocol", "placeholder": "Architecture/training/inference plan" },
+      { "key": "evaluation_plan", "label": "Evaluation Plan", "path": "sections.experiment.evaluation_plan", "placeholder": "Metrics, robustness, significance tests" }
+    ],
+    "publication": [
+      { "key": "paper_outline", "label": "Paper Outline", "path": "sections.publication.paper_outline", "placeholder": "Contribution narrative and sections" },
+      { "key": "figures_tables_plan", "label": "Figures/Tables Plan", "path": "sections.publication.figures_tables_plan", "placeholder": "Ablation and benchmark tables" },
+      { "key": "artifact_plan", "label": "Artifact Plan", "path": "sections.publication.artifact_plan", "placeholder": "Code/config/repro script release" },
+      { "key": "submission_checklist", "label": "Submission Checklist", "path": "sections.publication.submission_checklist", "type": "array", "placeholder": "One item per line" }
+    ]
+  },
+  "pipeline": {
+    "version": "1.1",
+    "mode": "idea",
+    "stages": {
+      "ideation": {
+        "required_elements": [
+          "sections.ideation.research_goal",
+          "sections.ideation.problem_framing"
+        ],
+        "optional_elements": [
+          "sections.ideation.evidence_plan",
+          "sections.ideation.success_criteria"
+        ],
+        "quality_gate": [
+          "Novel method contribution over baselines is explicit",
+          "Claim boundaries and target setting are concrete"
+        ],
+        "task_blueprints": [
+          {
+            "id": "method_novelty_and_claim_definition",
+            "title": "Define novelty claim and theoretical motivation",
+            "description": "Clarify what is new, why it should work, and expected tradeoffs.",
+            "taskType": "analysis",
+            "recommended_skills": ["inno-research-orchestrator"]
+          },
+          {
+            "id": "method_design_space_and_baselines",
+            "title": "Map design space and baseline comparison plan",
+            "description": "Identify main design alternatives and strong baseline families.",
+            "taskType": "exploration",
+            "recommended_skills": ["inno-idea-generation", "inno-research-orchestrator"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-idea-generation",
+          "inno-research-orchestrator"
+        ]
+      },
+      "experiment": {
+        "required_elements": [
+          "sections.experiment.hypothesis_or_validation_goal",
+          "sections.experiment.method_or_protocol",
+          "sections.experiment.evaluation_plan"
+        ],
+        "optional_elements": [
+          "sections.experiment.dataset_or_data_source"
+        ],
+        "quality_gate": [
+          "Ablation matrix and training protocol are executable",
+          "Evaluation includes robustness and significance checks"
+        ],
+        "task_blueprints": [
+          {
+            "id": "method_implementation_and_repro_setup",
+            "title": "Implement method and reproducible training setup",
+            "description": "Prepare code path, hyperparameter defaults, seeds, and run manifests.",
+            "taskType": "implementation",
+            "recommended_skills": ["inno-experiment-dev"]
+          },
+          {
+            "id": "method_ablation_and_robustness_evaluation",
+            "title": "Run ablations, robustness checks, and statistical validation",
+            "description": "Execute core benchmarks, ablations, and reliability analysis.",
+            "taskType": "analysis",
+            "recommended_skills": ["inno-experiment-analysis"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-experiment-dev",
+          "inno-experiment-analysis"
+        ]
+      },
+      "publication": {
+        "required_elements": [
+          "sections.publication.paper_outline",
+          "sections.publication.submission_checklist"
+        ],
+        "optional_elements": [
+          "sections.publication.figures_tables_plan",
+          "sections.publication.artifact_plan"
+        ],
+        "quality_gate": [
+          "Claims are aligned with empirical evidence",
+          "Figures/tables communicate ablations and comparisons clearly"
+        ],
+        "task_blueprints": [
+          {
+            "id": "method_results_narrative_and_figures",
+            "title": "Draft results narrative and key comparison figures",
+            "description": "Turn experiment outcomes into coherent claim-evidence storytelling.",
+            "taskType": "writing",
+            "recommended_skills": ["inno-paper-writing", "inno-reference-audit"]
+          },
+          {
+            "id": "method_repro_appendix_and_submission_polish",
+            "title": "Finalize reproducibility appendix and submission-ready manuscript",
+            "description": "Complete appendix/checklists and final manuscript polish for submission.",
+            "taskType": "writing",
+            "recommended_skills": ["inno-paper-writing"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-paper-writing",
+          "inno-reference-audit"
+        ]
+      }
+    }
+  }
+}

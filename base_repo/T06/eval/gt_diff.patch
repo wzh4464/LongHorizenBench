@@ -1,0 +1,2751 @@
+diff --git a/core/config/project_settings.cpp b/core/config/project_settings.cpp
+index 4e3196dec3..8096407430 100644
+--- a/core/config/project_settings.cpp
++++ b/core/config/project_settings.cpp
+@@ -281,6 +281,11 @@ bool ProjectSettings::_set(const StringName &p_name, const Variant &p_value) {
+ 			if (autoloads.has(node_name)) {
+ 				remove_autoload(node_name);
+ 			}
++		} else if (p_name.operator String().begins_with("global_group/")) {
++			String group_name = p_name.operator String().get_slice("/", 1);
++			if (global_groups.has(group_name)) {
++				remove_global_group(group_name);
++			}
+ 		}
+ 	} else {
+ 		if (p_name == CoreStringNames::get_singleton()->_custom_features) {
+@@ -327,6 +332,9 @@ bool ProjectSettings::_set(const StringName &p_name, const Variant &p_value) {
+ 				autoload.path = path;
+ 			}
+ 			add_autoload(autoload);
++		} else if (p_name.operator String().begins_with("global_group/")) {
++			String group_name = p_name.operator String().get_slice("/", 1);
++			add_global_group(group_name, p_value);
+ 		}
+ 	}
+ 
+@@ -674,6 +682,8 @@ Error ProjectSettings::setup(const String &p_path, const String &p_main_pack, bo
+ 
+ 	Compression::gzip_level = GLOBAL_GET("compression/formats/gzip/compression_level");
+ 
++	load_scene_groups_cache();
++
+ 	project_loaded = err == OK;
+ 	return err;
+ }
+@@ -1241,6 +1251,73 @@ ProjectSettings::AutoloadInfo ProjectSettings::get_autoload(const StringName &p_
+ 	return autoloads[p_name];
+ }
+ 
++const HashMap<StringName, String> &ProjectSettings::get_global_groups_list() const {
++	return global_groups;
++}
++
++void ProjectSettings::add_global_group(const StringName &p_name, const String &p_description) {
++	ERR_FAIL_COND_MSG(p_name == StringName(), "Trying to add global group with no name.");
++	global_groups[p_name] = p_description;
++}
++
++void ProjectSettings::remove_global_group(const StringName &p_name) {
++	ERR_FAIL_COND_MSG(!global_groups.has(p_name), "Trying to remove non-existent global group.");
++	global_groups.erase(p_name);
++}
++
++bool ProjectSettings::has_global_group(const StringName &p_name) const {
++	return global_groups.has(p_name);
++}
++
++void ProjectSettings::remove_scene_groups_cache(const StringName &p_path) {
++	scene_groups_cache.erase(p_path);
++}
++
++void ProjectSettings::add_scene_groups_cache(const StringName &p_path, const HashSet<StringName> &p_cache) {
++	scene_groups_cache[p_path] = p_cache;
++}
++
++void ProjectSettings::save_scene_groups_cache() {
++	Ref<ConfigFile> cf;
++	cf.instantiate();
++	for (const KeyValue<StringName, HashSet<StringName>> &E : scene_groups_cache) {
++		if (E.value.is_empty()) {
++			continue;
++		}
++		Array list;
++		for (const StringName &group : E.value) {
++			list.push_back(group);
++		}
++		cf->set_value(E.key, "groups", list);
++	}
++	cf->save(get_scene_groups_cache_path());
++}
++
++String ProjectSettings::get_scene_groups_cache_path() const {
++	return get_project_data_path().path_join("scene_groups_cache.cfg");
++}
++
++void ProjectSettings::load_scene_groups_cache() {
++	Ref<ConfigFile> cf;
++	cf.instantiate();
++	if (cf->load(get_scene_groups_cache_path()) == OK) {
++		List<String> scene_paths;
++		cf->get_sections(&scene_paths);
++		for (const String &E : scene_paths) {
++			Array scene_groups = cf->get_value(E, "groups", Array());
++			HashSet<StringName> cache;
++			for (int i = 0; i < scene_groups.size(); ++i) {
++				cache.insert(scene_groups[i]);
++			}
++			add_scene_groups_cache(E, cache);
++		}
++	}
++}
++
++const HashMap<StringName, HashSet<StringName>> &ProjectSettings::get_scene_groups_cache() const {
++	return scene_groups_cache;
++}
++
+ void ProjectSettings::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("has_setting", "name"), &ProjectSettings::has_setting);
+ 	ClassDB::bind_method(D_METHOD("set_setting", "name", "value"), &ProjectSettings::set_setting);
+diff --git a/core/config/project_settings.h b/core/config/project_settings.h
+index 302df7e8d0..55d5957ad1 100644
+--- a/core/config/project_settings.h
++++ b/core/config/project_settings.h
+@@ -106,6 +106,8 @@ protected:
+ 
+ 	LocalVector<String> hidden_prefixes;
+ 	HashMap<StringName, AutoloadInfo> autoloads;
++	HashMap<StringName, String> global_groups;
++	HashMap<StringName, HashSet<StringName>> scene_groups_cache;
+ 
+ 	Array global_class_list;
+ 	bool is_global_class_list_loaded = false;
+@@ -208,6 +210,18 @@ public:
+ 	bool has_autoload(const StringName &p_autoload) const;
+ 	AutoloadInfo get_autoload(const StringName &p_name) const;
+ 
++	const HashMap<StringName, String> &get_global_groups_list() const;
++	void add_global_group(const StringName &p_name, const String &p_description);
++	void remove_global_group(const StringName &p_name);
++	bool has_global_group(const StringName &p_name) const;
++
++	const HashMap<StringName, HashSet<StringName>> &get_scene_groups_cache() const;
++	void add_scene_groups_cache(const StringName &p_path, const HashSet<StringName> &p_cache);
++	void remove_scene_groups_cache(const StringName &p_path);
++	void save_scene_groups_cache();
++	String get_scene_groups_cache_path() const;
++	void load_scene_groups_cache();
++
+ 	ProjectSettings();
+ 	~ProjectSettings();
+ };
+diff --git a/editor/editor_file_system.cpp b/editor/editor_file_system.cpp
+index 6d1e1eaaa0..807f0c8eb7 100644
+--- a/editor/editor_file_system.cpp
++++ b/editor/editor_file_system.cpp
+@@ -44,6 +44,7 @@
+ #include "editor/editor_paths.h"
+ #include "editor/editor_resource_preview.h"
+ #include "editor/editor_settings.h"
++#include "scene/resources/packed_scene.h"
+ 
+ EditorFileSystem *EditorFileSystem::singleton = nullptr;
+ //the name is the version, to keep compatibility with different versions of Godot
+@@ -615,6 +616,9 @@ bool EditorFileSystem::_update_scan_actions() {
+ 				if (ClassDB::is_parent_class(ia.new_file->type, SNAME("Script"))) {
+ 					_queue_update_script_class(ia.dir->get_file_path(idx));
+ 				}
++				if (ia.new_file->type == SNAME("PackedScene")) {
++					_queue_update_scene_groups(ia.dir->get_file_path(idx));
++				}
+ 
+ 			} break;
+ 			case ItemAction::ACTION_FILE_REMOVE: {
+@@ -624,6 +628,9 @@ bool EditorFileSystem::_update_scan_actions() {
+ 				if (ClassDB::is_parent_class(ia.dir->files[idx]->type, SNAME("Script"))) {
+ 					_queue_update_script_class(ia.dir->get_file_path(idx));
+ 				}
++				if (ia.dir->files[idx]->type == SNAME("PackedScene")) {
++					_queue_update_scene_groups(ia.dir->get_file_path(idx));
++				}
+ 
+ 				_delete_internal_files(ia.dir->files[idx]->file);
+ 				memdelete(ia.dir->files[idx]);
+@@ -662,6 +669,9 @@ bool EditorFileSystem::_update_scan_actions() {
+ 				if (ClassDB::is_parent_class(ia.dir->files[idx]->type, SNAME("Script"))) {
+ 					_queue_update_script_class(full_path);
+ 				}
++				if (ia.dir->files[idx]->type == SNAME("PackedScene")) {
++					_queue_update_scene_groups(full_path);
++				}
+ 
+ 				reloads.push_back(full_path);
+ 
+@@ -732,6 +742,7 @@ void EditorFileSystem::scan() {
+ 		_update_scan_actions();
+ 		scanning = false;
+ 		_update_pending_script_classes();
++		_update_pending_scene_groups();
+ 		emit_signal(SNAME("filesystem_changed"));
+ 		emit_signal(SNAME("sources_changed"), sources_changed.size() > 0);
+ 		first_scan = false;
+@@ -942,6 +953,9 @@ void EditorFileSystem::_scan_new_dir(EditorFileSystemDirectory *p_dir, Ref<DirAc
+ 				if (ClassDB::is_parent_class(fi->type, SNAME("Script"))) {
+ 					_queue_update_script_class(path);
+ 				}
++				if (fi->type == SNAME("PackedScene")) {
++					_queue_update_scene_groups(path);
++				}
+ 			}
+ 		}
+ 
+@@ -1196,6 +1210,7 @@ void EditorFileSystem::scan_changes() {
+ 			_scan_fs_changes(filesystem, sp);
+ 			bool changed = _update_scan_actions();
+ 			_update_pending_script_classes();
++			_update_pending_scene_groups();
+ 			if (changed) {
+ 				emit_signal(SNAME("filesystem_changed"));
+ 			}
+@@ -1262,6 +1277,7 @@ void EditorFileSystem::_notification(int p_what) {
+ 						}
+ 						bool changed = _update_scan_actions();
+ 						_update_pending_script_classes();
++						_update_pending_scene_groups();
+ 						if (changed) {
+ 							emit_signal(SNAME("filesystem_changed"));
+ 						}
+@@ -1281,6 +1297,7 @@ void EditorFileSystem::_notification(int p_what) {
+ 					thread.wait_to_finish();
+ 					_update_scan_actions();
+ 					_update_pending_script_classes();
++					_update_pending_scene_groups();
+ 					emit_signal(SNAME("filesystem_changed"));
+ 					emit_signal(SNAME("sources_changed"), sources_changed.size() > 0);
+ 					first_scan = false;
+@@ -1635,6 +1652,65 @@ void EditorFileSystem::_queue_update_script_class(const String &p_path) {
+ 	update_script_mutex.unlock();
+ }
+ 
++void EditorFileSystem::_update_scene_groups() {
++	update_scene_mutex.lock();
++
++	for (const String &path : update_scene_paths) {
++		ProjectSettings::get_singleton()->remove_scene_groups_cache(path);
++
++		int index = -1;
++		EditorFileSystemDirectory *efd = find_file(path, &index);
++
++		if (!efd || index < 0) {
++			// The file was removed.
++			continue;
++		}
++
++		const HashSet<StringName> scene_groups = _get_scene_groups(path);
++		if (!scene_groups.is_empty()) {
++			ProjectSettings::get_singleton()->add_scene_groups_cache(path, scene_groups);
++		}
++	}
++
++	update_scene_paths.clear();
++	update_scene_mutex.unlock();
++
++	ProjectSettings::get_singleton()->save_scene_groups_cache();
++}
++
++void EditorFileSystem::_update_pending_scene_groups() {
++	if (!FileAccess::exists(ProjectSettings::get_singleton()->get_scene_groups_cache_path())) {
++		_get_all_scenes(get_filesystem(), update_scene_paths);
++		_update_scene_groups();
++	} else if (!update_scene_paths.is_empty()) {
++		_update_scene_groups();
++	}
++}
++
++void EditorFileSystem::_queue_update_scene_groups(const String &p_path) {
++	update_scene_mutex.lock();
++	update_scene_paths.insert(p_path);
++	update_scene_mutex.unlock();
++}
++
++void EditorFileSystem::_get_all_scenes(EditorFileSystemDirectory *p_dir, HashSet<String> &r_list) {
++	for (int i = 0; i < p_dir->get_file_count(); i++) {
++		if (p_dir->get_file_type(i) == SNAME("PackedScene")) {
++			r_list.insert(p_dir->get_file_path(i));
++		}
++	}
++
++	for (int i = 0; i < p_dir->get_subdir_count(); i++) {
++		_get_all_scenes(p_dir->get_subdir(i), r_list);
++	}
++}
++
++HashSet<StringName> EditorFileSystem::_get_scene_groups(const String &p_path) {
++	Ref<PackedScene> packed_scene = ResourceLoader::load(p_path);
++	ERR_FAIL_COND_V(packed_scene.is_null(), HashSet<StringName>());
++	return packed_scene->get_state()->get_all_groups();
++}
++
+ void EditorFileSystem::update_file(const String &p_file) {
+ 	ERR_FAIL_COND(p_file.is_empty());
+ 	EditorFileSystemDirectory *fs = nullptr;
+@@ -1658,12 +1734,16 @@ void EditorFileSystem::update_file(const String &p_file) {
+ 			if (ClassDB::is_parent_class(fs->files[cpos]->type, SNAME("Script"))) {
+ 				_queue_update_script_class(p_file);
+ 			}
++			if (fs->files[cpos]->type == SNAME("PackedScene")) {
++				_queue_update_scene_groups(p_file);
++			}
+ 
+ 			memdelete(fs->files[cpos]);
+ 			fs->files.remove_at(cpos);
+ 		}
+ 
+ 		_update_pending_script_classes();
++		_update_pending_scene_groups();
+ 		call_deferred(SNAME("emit_signal"), "filesystem_changed"); //update later
+ 		return;
+ 	}
+@@ -1730,8 +1810,12 @@ void EditorFileSystem::update_file(const String &p_file) {
+ 	if (ClassDB::is_parent_class(fs->files[cpos]->type, SNAME("Script"))) {
+ 		_queue_update_script_class(p_file);
+ 	}
++	if (fs->files[cpos]->type == SNAME("PackedScene")) {
++		_queue_update_scene_groups(p_file);
++	}
+ 
+ 	_update_pending_script_classes();
++	_update_pending_scene_groups();
+ 	call_deferred(SNAME("emit_signal"), "filesystem_changed"); //update later
+ }
+ 
+@@ -2341,6 +2425,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
+ 
+ 	_save_filesystem_cache();
+ 	_update_pending_script_classes();
++	_update_pending_scene_groups();
+ 	importing = false;
+ 	if (!is_scanning()) {
+ 		emit_signal(SNAME("filesystem_changed"));
+diff --git a/editor/editor_file_system.h b/editor/editor_file_system.h
+index 0d558c84c5..2a34c06b0d 100644
+--- a/editor/editor_file_system.h
++++ b/editor/editor_file_system.h
+@@ -267,6 +267,14 @@ class EditorFileSystem : public Node {
+ 	void _update_script_classes();
+ 	void _update_pending_script_classes();
+ 
++	Mutex update_scene_mutex;
++	HashSet<String> update_scene_paths;
++	void _queue_update_scene_groups(const String &p_path);
++	void _update_scene_groups();
++	void _update_pending_scene_groups();
++	HashSet<StringName> _get_scene_groups(const String &p_path);
++	void _get_all_scenes(EditorFileSystemDirectory *p_dir, HashSet<String> &r_list);
++
+ 	String _get_global_script_class(const String &p_type, const String &p_path, String *r_extends, String *r_icon_path) const;
+ 
+ 	static Error _resource_import(const String &p_path);
+diff --git a/editor/group_settings_editor.cpp b/editor/group_settings_editor.cpp
+new file mode 100644
+index 0000000000..a91154ae36
+--- /dev/null
++++ b/editor/group_settings_editor.cpp
+@@ -0,0 +1,537 @@
++/**************************************************************************/
++/*  group_settings_editor.cpp                                             */
++/**************************************************************************/
++/*                         This file is part of:                          */
++/*                             GODOT ENGINE                               */
++/*                        https://godotengine.org                         */
++/**************************************************************************/
++/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
++/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
++/*                                                                        */
++/* Permission is hereby granted, free of charge, to any person obtaining  */
++/* a copy of this software and associated documentation files (the        */
++/* "Software"), to deal in the Software without restriction, including    */
++/* without limitation the rights to use, copy, modify, merge, publish,    */
++/* distribute, sublicense, and/or sell copies of the Software, and to     */
++/* permit persons to whom the Software is furnished to do so, subject to  */
++/* the following conditions:                                              */
++/*                                                                        */
++/* The above copyright notice and this permission notice shall be         */
++/* included in all copies or substantial portions of the Software.        */
++/*                                                                        */
++/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
++/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
++/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
++/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
++/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
++/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
++/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
++/**************************************************************************/
++
++#include "group_settings_editor.h"
++
++#include "core/config/project_settings.h"
++#include "editor/editor_scale.h"
++#include "editor/editor_undo_redo_manager.h"
++#include "editor/filesystem_dock.h"
++#include "editor/gui/editor_validation_panel.h"
++#include "editor/scene_tree_dock.h"
++#include "editor_file_system.h"
++#include "editor_node.h"
++#include "scene/resources/packed_scene.h"
++
++void GroupSettingsEditor::_notification(int p_what) {
++	switch (p_what) {
++		case NOTIFICATION_ENTER_TREE: {
++			update_groups();
++		} break;
++	}
++}
++
++void GroupSettingsEditor::_item_edited() {
++	if (updating_groups) {
++		return;
++	}
++
++	TreeItem *ti = tree->get_edited();
++	int column = tree->get_edited_column();
++
++	if (!ti) {
++		return;
++	}
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	if (column == 1) {
++		// Description Edited.
++		String name = ti->get_text(0);
++		String new_description = ti->get_text(1);
++		String old_description = ti->get_meta("__description");
++
++		if (new_description == old_description) {
++			return;
++		}
++
++		name = GLOBAL_GROUP_PREFIX + name;
++
++		undo_redo->create_action(TTR("Set Group Description"));
++
++		undo_redo->add_do_property(ProjectSettings::get_singleton(), name, new_description);
++		undo_redo->add_undo_property(ProjectSettings::get_singleton(), name, old_description);
++
++		undo_redo->add_do_method(this, "call_deferred", "update_groups");
++		undo_redo->add_undo_method(this, "call_deferred", "update_groups");
++
++		undo_redo->add_do_method(this, "emit_signal", group_changed);
++		undo_redo->add_undo_method(this, "emit_signal", group_changed);
++
++		undo_redo->commit_action();
++	}
++}
++
++void GroupSettingsEditor::_item_button_pressed(Object *p_item, int p_column, int p_id, MouseButton p_button) {
++	if (p_button != MouseButton::LEFT) {
++		return;
++	}
++
++	TreeItem *ti = Object::cast_to<TreeItem>(p_item);
++
++	if (!ti) {
++		return;
++	}
++	ti->select(0);
++	_show_remove_dialog();
++}
++
++String GroupSettingsEditor::_check_new_group_name(const String &p_name) {
++	if (p_name.is_empty()) {
++		return TTR("Invalid group name. It cannot be empty.");
++	}
++
++	if (ProjectSettings::get_singleton()->has_global_group(p_name)) {
++		return vformat(TTR("A group with the name '%s' already exists."), p_name);
++	}
++
++	return "";
++}
++
++void GroupSettingsEditor::_check_rename() {
++	String new_name = rename_group->get_text().strip_edges();
++	String old_name = rename_group_dialog->get_meta("__name");
++
++	if (new_name == old_name) {
++		return;
++	}
++
++	if (new_name.is_empty()) {
++		rename_validation_panel->set_message(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group can't be empty."), EditorValidationPanel::MSG_ERROR);
++	} else if (ProjectSettings::get_singleton()->has_global_group(new_name)) {
++		rename_validation_panel->set_message(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group already exists."), EditorValidationPanel::MSG_ERROR);
++	}
++}
++
++void GroupSettingsEditor::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("remove_references"), &GroupSettingsEditor::remove_references);
++	ClassDB::bind_method(D_METHOD("rename_references"), &GroupSettingsEditor::rename_references);
++
++	ClassDB::bind_method(D_METHOD("update_groups"), &GroupSettingsEditor::update_groups);
++
++	ADD_SIGNAL(MethodInfo("group_changed"));
++}
++
++void GroupSettingsEditor::_add_group(const String &p_name, const String &p_description) {
++	String name = p_name.strip_edges();
++
++	String error = _check_new_group_name(name);
++	if (!error.is_empty()) {
++		show_message(error);
++		return;
++	}
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Add Group"));
++
++	name = GLOBAL_GROUP_PREFIX + name;
++
++	undo_redo->add_do_property(ProjectSettings::get_singleton(), name, p_description);
++	undo_redo->add_undo_property(ProjectSettings::get_singleton(), name, Variant());
++
++	undo_redo->add_do_method(this, "call_deferred", "update_groups");
++	undo_redo->add_undo_method(this, "call_deferred", "update_groups");
++
++	undo_redo->add_do_method(this, "emit_signal", group_changed);
++	undo_redo->add_undo_method(this, "emit_signal", group_changed);
++
++	undo_redo->commit_action();
++
++	group_name->clear();
++	group_description->clear();
++}
++
++void GroupSettingsEditor::_add_group() {
++	_add_group(group_name->get_text(), group_description->get_text());
++}
++
++void GroupSettingsEditor::_text_submitted(const String &p_text) {
++	if (!add_button->is_disabled()) {
++		_add_group();
++	}
++}
++
++void GroupSettingsEditor::_group_name_text_changed(const String &p_name) {
++	String error = _check_new_group_name(p_name.strip_edges());
++	add_button->set_tooltip_text(error);
++	add_button->set_disabled(!error.is_empty());
++}
++
++void GroupSettingsEditor::_modify_references(const StringName &p_name, const StringName &p_new_name, bool p_is_rename) {
++	HashSet<String> scenes;
++
++	HashMap<StringName, HashSet<StringName>> scene_groups_cache = ProjectSettings::get_singleton()->get_scene_groups_cache();
++	for (const KeyValue<StringName, HashSet<StringName>> &E : scene_groups_cache) {
++		if (E.value.has(p_name)) {
++			scenes.insert(E.key);
++		}
++	}
++
++	int steps = scenes.size();
++	Vector<EditorData::EditedScene> edited_scenes = EditorNode::get_editor_data().get_edited_scenes();
++	for (const EditorData::EditedScene &es : edited_scenes) {
++		if (!es.root) {
++			continue;
++		}
++		if (es.path.is_empty()) {
++			++steps;
++		} else if (!scenes.has(es.path)) {
++			++steps;
++		}
++	}
++
++	String progress_task = p_is_rename ? "rename_reference" : "remove_references";
++	String progress_label = p_is_rename ? TTR("Renaming Group References") : TTR("Removing Group References");
++	EditorProgress progress(progress_task, progress_label, steps);
++
++	int step = 0;
++	// Update opened scenes.
++	HashSet<String> edited_scenes_path;
++	for (const EditorData::EditedScene &es : edited_scenes) {
++		if (!es.root) {
++			continue;
++		}
++		progress.step(es.path, step++);
++		bool edited = p_is_rename ? rename_node_references(es.root, p_name, p_new_name) : remove_node_references(es.root, p_name);
++		if (!es.path.is_empty()) {
++			scenes.erase(es.path);
++			if (edited) {
++				edited_scenes_path.insert(es.path);
++			}
++		}
++	}
++	if (!edited_scenes_path.is_empty()) {
++		EditorNode::get_singleton()->save_scene_list(edited_scenes_path);
++		SceneTreeDock::get_singleton()->get_tree_editor()->update_tree();
++	}
++
++	for (const String &E : scenes) {
++		Ref<PackedScene> packed_scene = ResourceLoader::load(E);
++		progress.step(E, step++);
++		ERR_CONTINUE(packed_scene.is_null());
++		if (p_is_rename) {
++			if (packed_scene->get_state()->rename_group_references(p_name, p_new_name)) {
++				ResourceSaver::save(packed_scene, E);
++			}
++		} else {
++			if (packed_scene->get_state()->remove_group_references(p_name)) {
++				ResourceSaver::save(packed_scene, E);
++			}
++		}
++	}
++}
++
++void GroupSettingsEditor::remove_references(const StringName &p_name) {
++	_modify_references(p_name, StringName(), false);
++}
++
++void GroupSettingsEditor::rename_references(const StringName &p_old_name, const StringName &p_new_name) {
++	_modify_references(p_old_name, p_new_name, true);
++}
++
++bool GroupSettingsEditor::remove_node_references(Node *p_node, const StringName &p_name) {
++	bool edited = false;
++	if (p_node->is_in_group(p_name)) {
++		p_node->remove_from_group(p_name);
++		edited = true;
++	}
++
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		edited |= remove_node_references(p_node->get_child(i), p_name);
++	}
++	return edited;
++}
++
++bool GroupSettingsEditor::rename_node_references(Node *p_node, const StringName &p_old_name, const StringName &p_new_name) {
++	bool edited = false;
++	if (p_node->is_in_group(p_old_name)) {
++		p_node->remove_from_group(p_old_name);
++		p_node->add_to_group(p_new_name, true);
++		edited = true;
++	}
++
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		edited |= rename_node_references(p_node->get_child(i), p_old_name, p_new_name);
++	}
++	return edited;
++}
++
++void GroupSettingsEditor::update_groups() {
++	if (updating_groups) {
++		return;
++	}
++	updating_groups = true;
++	groups_cache = ProjectSettings::get_singleton()->get_global_groups_list();
++
++	tree->clear();
++	TreeItem *root = tree->create_item();
++
++	List<StringName> keys;
++	for (const KeyValue<StringName, String> &E : groups_cache) {
++		keys.push_back(E.key);
++	}
++	keys.sort_custom<NoCaseComparator>();
++
++	for (const StringName &E : keys) {
++		TreeItem *item = tree->create_item(root);
++		item->set_meta("__name", E);
++		item->set_meta("__description", groups_cache[E]);
++
++		item->set_text(0, E);
++		item->set_editable(0, false);
++
++		item->set_text(1, groups_cache[E]);
++		item->set_editable(1, true);
++		item->add_button(2, get_editor_theme_icon(SNAME("Remove")));
++		item->set_selectable(2, false);
++	}
++
++	updating_groups = false;
++}
++
++void GroupSettingsEditor::connect_filesystem_dock_signals(FileSystemDock *p_fs_dock) {
++	p_fs_dock->connect("files_moved", callable_mp(ProjectSettings::get_singleton(), &ProjectSettings::remove_scene_groups_cache).unbind(1));
++	p_fs_dock->connect("file_removed", callable_mp(ProjectSettings::get_singleton(), &ProjectSettings::remove_scene_groups_cache));
++}
++
++void GroupSettingsEditor::_confirm_rename() {
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
++
++	String old_name = ti->get_meta("__name");
++	String new_name = rename_group->get_text().strip_edges();
++
++	if (old_name == new_name) {
++		return;
++	}
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Rename Group"));
++
++	String property_new_name = GLOBAL_GROUP_PREFIX + new_name;
++	String property_old_name = GLOBAL_GROUP_PREFIX + old_name;
++
++	String description = ti->get_meta("__description");
++
++	undo_redo->add_do_property(ProjectSettings::get_singleton(), property_new_name, description);
++	undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_new_name, Variant());
++
++	undo_redo->add_do_property(ProjectSettings::get_singleton(), property_old_name, Variant());
++	undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_old_name, description);
++
++	if (rename_check_box->is_pressed()) {
++		undo_redo->add_do_method(this, "rename_references", old_name, new_name);
++		undo_redo->add_undo_method(this, "rename_references", new_name, old_name);
++	}
++
++	undo_redo->add_do_method(this, "call_deferred", "update_groups");
++	undo_redo->add_undo_method(this, "call_deferred", "update_groups");
++
++	undo_redo->add_do_method(this, "emit_signal", group_changed);
++	undo_redo->add_undo_method(this, "emit_signal", group_changed);
++
++	undo_redo->commit_action();
++}
++
++void GroupSettingsEditor::_confirm_delete() {
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
++
++	String name = ti->get_text(0);
++	String description = groups_cache[name];
++	String property_name = GLOBAL_GROUP_PREFIX + name;
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Remove Group"));
++
++	undo_redo->add_do_property(ProjectSettings::get_singleton(), property_name, Variant());
++	undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_name, description);
++
++	if (remove_check_box->is_pressed()) {
++		undo_redo->add_do_method(this, "remove_references", name);
++	}
++
++	undo_redo->add_do_method(this, "call_deferred", "update_groups");
++	undo_redo->add_undo_method(this, "call_deferred", "update_groups");
++
++	undo_redo->add_do_method(this, "emit_signal", group_changed);
++	undo_redo->add_undo_method(this, "emit_signal", group_changed);
++
++	undo_redo->commit_action();
++}
++
++void GroupSettingsEditor::show_message(const String &p_message) {
++	message->set_text(p_message);
++	message->popup_centered();
++}
++
++void GroupSettingsEditor::_show_remove_dialog() {
++	if (!remove_dialog) {
++		remove_dialog = memnew(ConfirmationDialog);
++		remove_dialog->connect("confirmed", callable_mp(this, &GroupSettingsEditor::_confirm_delete));
++
++		VBoxContainer *vbox = memnew(VBoxContainer);
++		remove_label = memnew(Label);
++		vbox->add_child(remove_label);
++
++		remove_check_box = memnew(CheckBox);
++		remove_check_box->set_text(TTR("Delete references from all scenes"));
++		vbox->add_child(remove_check_box);
++
++		remove_dialog->add_child(vbox);
++
++		add_child(remove_dialog);
++	}
++
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
++
++	remove_check_box->set_pressed(false);
++	remove_label->set_text(vformat(TTR("Delete group \"%s\"?"), ti->get_text(0)));
++
++	remove_dialog->reset_size();
++	remove_dialog->popup_centered();
++}
++
++void GroupSettingsEditor::_show_rename_dialog() {
++	if (!rename_group_dialog) {
++		rename_group_dialog = memnew(ConfirmationDialog);
++		rename_group_dialog->set_title(TTR("Rename Group"));
++		rename_group_dialog->connect("confirmed", callable_mp(this, &GroupSettingsEditor::_confirm_rename));
++
++		VBoxContainer *vbc = memnew(VBoxContainer);
++		rename_group_dialog->add_child(vbc);
++
++		HBoxContainer *hbc = memnew(HBoxContainer);
++		hbc->add_child(memnew(Label(TTR("Name:"))));
++
++		rename_group = memnew(LineEdit);
++		rename_group->set_custom_minimum_size(Size2(300 * EDSCALE, 1));
++		hbc->add_child(rename_group);
++		vbc->add_child(hbc);
++
++		rename_group_dialog->register_text_enter(rename_group);
++
++		rename_validation_panel = memnew(EditorValidationPanel);
++		rename_validation_panel->add_line(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group name is valid."));
++		rename_validation_panel->set_update_callback(callable_mp(this, &GroupSettingsEditor::_check_rename));
++		rename_validation_panel->set_accept_button(rename_group_dialog->get_ok_button());
++
++		rename_group->connect("text_changed", callable_mp(rename_validation_panel, &EditorValidationPanel::update).unbind(1));
++
++		vbc->add_child(rename_validation_panel);
++
++		rename_check_box = memnew(CheckBox);
++		rename_check_box->set_text(TTR("Rename references in all scenes"));
++		vbc->add_child(rename_check_box);
++
++		add_child(rename_group_dialog);
++	}
++
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
++
++	rename_check_box->set_pressed(false);
++
++	String name = ti->get_meta("__name");
++
++	rename_group->set_text(name);
++	rename_group_dialog->set_meta("__name", name);
++
++	rename_validation_panel->update();
++
++	rename_group_dialog->reset_size();
++	rename_group_dialog->popup_centered();
++	rename_group->select_all();
++	rename_group->grab_focus();
++}
++
++GroupSettingsEditor::GroupSettingsEditor() {
++	ProjectSettings::get_singleton()->add_hidden_prefix("global_group/");
++
++	HBoxContainer *hbc = memnew(HBoxContainer);
++	add_child(hbc);
++
++	Label *l = memnew(Label);
++	l->set_text(TTR("Name:"));
++	hbc->add_child(l);
++
++	group_name = memnew(LineEdit);
++	group_name->set_h_size_flags(SIZE_EXPAND_FILL);
++	group_name->set_clear_button_enabled(true);
++	group_name->connect("text_changed", callable_mp(this, &GroupSettingsEditor::_group_name_text_changed));
++	group_name->connect("text_submitted", callable_mp(this, &GroupSettingsEditor::_text_submitted));
++	hbc->add_child(group_name);
++
++	l = memnew(Label);
++	l->set_text(TTR("Description:"));
++	hbc->add_child(l);
++
++	group_description = memnew(LineEdit);
++	group_description->set_clear_button_enabled(true);
++	group_description->set_h_size_flags(SIZE_EXPAND_FILL);
++	group_description->connect("text_submitted", callable_mp(this, &GroupSettingsEditor::_text_submitted));
++	hbc->add_child(group_description);
++
++	add_button = memnew(Button);
++	add_button->set_text(TTR("Add"));
++	add_button->set_disabled(true);
++	add_button->connect("pressed", callable_mp(this, &GroupSettingsEditor::_add_group));
++	hbc->add_child(add_button);
++
++	tree = memnew(Tree);
++	tree->set_hide_root(true);
++	tree->set_select_mode(Tree::SELECT_SINGLE);
++	tree->set_allow_reselect(true);
++
++	tree->set_columns(3);
++	tree->set_column_titles_visible(true);
++
++	tree->set_column_title(0, TTR("Name"));
++	tree->set_column_title(1, TTR("Description"));
++	tree->set_column_expand(2, false);
++
++	tree->connect("item_edited", callable_mp(this, &GroupSettingsEditor::_item_edited));
++	tree->connect("item_activated", callable_mp(this, &GroupSettingsEditor::_show_rename_dialog));
++	tree->connect("button_clicked", callable_mp(this, &GroupSettingsEditor::_item_button_pressed));
++	tree->set_v_size_flags(SIZE_EXPAND_FILL);
++
++	add_child(tree, true);
++
++	message = memnew(AcceptDialog);
++	add_child(message);
++}
+diff --git a/editor/group_settings_editor.h b/editor/group_settings_editor.h
+new file mode 100644
+index 0000000000..660c15865e
+--- /dev/null
++++ b/editor/group_settings_editor.h
+@@ -0,0 +1,107 @@
++/**************************************************************************/
++/*  group_settings_editor.h                                               */
++/**************************************************************************/
++/*                         This file is part of:                          */
++/*                             GODOT ENGINE                               */
++/*                        https://godotengine.org                         */
++/**************************************************************************/
++/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
++/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
++/*                                                                        */
++/* Permission is hereby granted, free of charge, to any person obtaining  */
++/* a copy of this software and associated documentation files (the        */
++/* "Software"), to deal in the Software without restriction, including    */
++/* without limitation the rights to use, copy, modify, merge, publish,    */
++/* distribute, sublicense, and/or sell copies of the Software, and to     */
++/* permit persons to whom the Software is furnished to do so, subject to  */
++/* the following conditions:                                              */
++/*                                                                        */
++/* The above copyright notice and this permission notice shall be         */
++/* included in all copies or substantial portions of the Software.        */
++/*                                                                        */
++/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
++/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
++/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
++/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
++/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
++/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
++/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
++/**************************************************************************/
++
++#ifndef GROUP_SETTINGS_EDITOR_H
++#define GROUP_SETTINGS_EDITOR_H
++
++#include "scene/gui/dialogs.h"
++
++class CheckBox;
++class EditorFileSystemDirectory;
++class EditorValidationPanel;
++class FileSystemDock;
++class Label;
++class Tree;
++
++class GroupSettingsEditor : public VBoxContainer {
++	GDCLASS(GroupSettingsEditor, VBoxContainer);
++
++	const String GLOBAL_GROUP_PREFIX = "global_group/";
++	const StringName group_changed = "group_changed";
++
++	HashMap<StringName, String> groups_cache;
++
++	bool updating_groups = false;
++
++	AcceptDialog *message = nullptr;
++	Tree *tree = nullptr;
++	LineEdit *group_name = nullptr;
++	LineEdit *group_description = nullptr;
++	Button *add_button = nullptr;
++
++	ConfirmationDialog *remove_dialog = nullptr;
++	CheckBox *remove_check_box = nullptr;
++	Label *remove_label = nullptr;
++
++	ConfirmationDialog *rename_group_dialog = nullptr;
++	LineEdit *rename_group = nullptr;
++	CheckBox *rename_check_box = nullptr;
++	EditorValidationPanel *rename_validation_panel = nullptr;
++
++	void _show_remove_dialog();
++	void _show_rename_dialog();
++
++	String _check_new_group_name(const String &p_name);
++	void _check_rename();
++
++	void _add_group();
++	void _add_group(const String &p_name, const String &p_description);
++
++	void _modify_references(const StringName &p_name, const StringName &p_new_name, bool p_is_rename);
++
++	void _confirm_rename();
++	void _confirm_delete();
++
++	void _text_submitted(const String &p_text);
++	void _group_name_text_changed(const String &p_name);
++
++	void _item_edited();
++	void _item_button_pressed(Object *p_item, int p_column, int p_id, MouseButton p_button);
++
++protected:
++	void _notification(int p_what);
++	static void _bind_methods();
++
++public:
++	void show_message(const String &p_message);
++
++	void remove_references(const StringName &p_name);
++	void rename_references(const StringName &p_old_name, const StringName &p_new_name);
++
++	bool remove_node_references(Node *p_node, const StringName &p_name);
++	bool rename_node_references(Node *p_node, const StringName &p_old_name, const StringName &p_new_name);
++
++	void update_groups();
++	void connect_filesystem_dock_signals(FileSystemDock *p_fs_dock);
++
++	GroupSettingsEditor();
++};
++
++#endif // GROUP_SETTINGS_EDITOR_H
+diff --git a/editor/groups_editor.cpp b/editor/groups_editor.cpp
+index d083bc294a..9fa9fe5a9d 100644
+--- a/editor/groups_editor.cpp
++++ b/editor/groups_editor.cpp
+@@ -32,17 +32,18 @@
+ 
+ #include "editor/editor_node.h"
+ #include "editor/editor_scale.h"
+-#include "editor/editor_string_names.h"
++#include "editor/editor_settings.h"
+ #include "editor/editor_undo_redo_manager.h"
+-#include "editor/gui/scene_tree_editor.h"
++#include "editor/gui/editor_validation_panel.h"
++#include "editor/project_settings_editor.h"
+ #include "editor/scene_tree_dock.h"
+-#include "scene/gui/button.h"
++#include "scene/gui/box_container.h"
++#include "scene/gui/check_button.h"
++#include "scene/gui/grid_container.h"
+ #include "scene/gui/label.h"
+-#include "scene/gui/line_edit.h"
+-#include "scene/gui/tree.h"
+ #include "scene/resources/packed_scene.h"
+ 
+-static bool can_edit(Node *p_node, String p_group) {
++static bool can_edit(Node *p_node, const String &p_group) {
+ 	Node *n = p_node;
+ 	bool can_edit = true;
+ 	while (n) {
+@@ -52,6 +53,7 @@ static bool can_edit(Node *p_node, String p_group) {
+ 			if (path != -1) {
+ 				if (ss->is_node_in_group(path, p_group)) {
+ 					can_edit = false;
++					break;
+ 				}
+ 			}
+ 		}
+@@ -60,775 +62,795 @@ static bool can_edit(Node *p_node, String p_group) {
+ 	return can_edit;
+ }
+ 
+-void GroupDialog::_group_selected() {
+-	nodes_to_add->clear();
+-	add_node_root = nodes_to_add->create_item();
+-
+-	nodes_to_remove->clear();
+-	remove_node_root = nodes_to_remove->create_item();
+-
+-	if (!groups->is_anything_selected()) {
+-		group_empty->hide();
+-		return;
++struct _GroupInfoComparator {
++	bool operator()(const Node::GroupInfo &p_a, const Node::GroupInfo &p_b) const {
++		return p_a.name.operator String() < p_b.name.operator String();
+ 	}
++};
+ 
+-	selected_group = groups->get_selected()->get_text(0);
+-	_load_nodes(scene_tree->get_edited_scene_root());
+-
+-	group_empty->set_visible(!remove_node_root->get_first_child());
++void GroupsEditor::_add_scene_group(const String &p_name) {
++	scene_groups[p_name] = true;
+ }
+ 
+-void GroupDialog::_load_nodes(Node *p_current) {
+-	String item_name = p_current->get_name();
+-	if (p_current != scene_tree->get_edited_scene_root()) {
+-		item_name = String(p_current->get_parent()->get_name()) + "/" + item_name;
+-	}
++void GroupsEditor::_remove_scene_group(const String &p_name) {
++	scene_groups.erase(p_name);
++	ProjectSettingsEditor::get_singleton()->get_group_settings()->remove_node_references(scene_root_node, p_name);
++}
+ 
+-	bool keep = true;
+-	Node *root = scene_tree->get_edited_scene_root();
+-	Node *owner = p_current->get_owner();
+-	if (owner != root && p_current != root && !owner && !root->is_editable_instance(owner)) {
+-		keep = false;
+-	}
++void GroupsEditor::_rename_scene_group(const String &p_old_name, const String &p_new_name) {
++	scene_groups[p_new_name] = scene_groups[p_old_name];
++	scene_groups.erase(p_old_name);
++	ProjectSettingsEditor::get_singleton()->get_group_settings()->rename_node_references(scene_root_node, p_old_name, p_new_name);
++}
+ 
+-	TreeItem *node = nullptr;
+-	NodePath path = scene_tree->get_edited_scene_root()->get_path_to(p_current);
+-	if (keep && p_current->is_in_group(selected_group)) {
+-		if (remove_filter->get_text().is_subsequence_ofn(String(p_current->get_name()))) {
+-			node = nodes_to_remove->create_item(remove_node_root);
+-			keep = true;
+-		} else {
+-			keep = false;
+-		}
+-	} else if (keep && add_filter->get_text().is_subsequence_ofn(String(p_current->get_name()))) {
+-		node = nodes_to_add->create_item(add_node_root);
+-		keep = true;
+-	} else {
+-		keep = false;
++void GroupsEditor::_set_group_checked(const String &p_name, bool p_checked) {
++	TreeItem *ti = tree->get_item_with_text(p_name);
++	if (!ti) {
++		return;
+ 	}
+ 
+-	if (keep) {
+-		node->set_text(0, item_name);
+-		node->set_metadata(0, path);
+-		node->set_tooltip_text(0, path);
++	ti->set_checked(0, p_checked);
++}
+ 
+-		Ref<Texture2D> icon = EditorNode::get_singleton()->get_object_icon(p_current, "Node");
+-		node->set_icon(0, icon);
++bool GroupsEditor::_has_group(const String &p_name) {
++	return global_groups.has(p_name) || scene_groups.has(p_name);
++}
+ 
+-		if (!can_edit(p_current, selected_group)) {
+-			node->set_selectable(0, false);
+-			node->set_custom_color(0, get_theme_color(SNAME("disabled_font_color"), EditorStringName(Editor)));
+-		}
++void GroupsEditor::_modify_group(Object *p_item, int p_column, int p_id, MouseButton p_mouse_button) {
++	if (p_mouse_button != MouseButton::LEFT) {
++		return;
+ 	}
+ 
+-	for (int i = 0; i < p_current->get_child_count(); i++) {
+-		_load_nodes(p_current->get_child(i));
++	if (!node) {
++		return;
+ 	}
+-}
+ 
+-void GroupDialog::_add_pressed() {
+-	TreeItem *selected = nodes_to_add->get_next_selected(nullptr);
+-
+-	if (!selected) {
++	TreeItem *ti = Object::cast_to<TreeItem>(p_item);
++	if (!ti) {
+ 		return;
+ 	}
+ 
+-	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-	undo_redo->create_action(TTR("Add to Group"));
++	if (p_id == COPY_GROUP) {
++		DisplayServer::get_singleton()->clipboard_set(ti->get_text(p_column));
++	}
++}
+ 
+-	while (selected) {
+-		Node *node = scene_tree->get_edited_scene_root()->get_node(selected->get_metadata(0));
+-		undo_redo->add_do_method(node, "add_to_group", selected_group, true);
+-		undo_redo->add_undo_method(node, "remove_from_group", selected_group);
++void GroupsEditor::_load_scene_groups(Node *p_node) {
++	List<Node::GroupInfo> groups;
++	p_node->get_groups(&groups);
+ 
+-		selected = nodes_to_add->get_next_selected(selected);
+-	}
++	for (const GroupInfo &gi : groups) {
++		if (!gi.persistent) {
++			continue;
++		}
+ 
+-	undo_redo->add_do_method(this, "_group_selected");
+-	undo_redo->add_undo_method(this, "_group_selected");
+-	undo_redo->add_do_method(this, "emit_signal", "group_edited");
+-	undo_redo->add_undo_method(this, "emit_signal", "group_edited");
++		if (global_groups.has(gi.name)) {
++			continue;
++		}
+ 
+-	// To force redraw of scene tree.
+-	undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+-	undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++		bool is_editable = can_edit(p_node, gi.name);
++		if (scene_groups.has(gi.name)) {
++			scene_groups[gi.name] = scene_groups[gi.name] && is_editable;
++		} else {
++			scene_groups[gi.name] = is_editable;
++		}
++	}
+ 
+-	undo_redo->commit_action();
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		_load_scene_groups(p_node->get_child(i));
++	}
+ }
+ 
+-void GroupDialog::_removed_pressed() {
+-	TreeItem *selected = nodes_to_remove->get_next_selected(nullptr);
+-
+-	if (!selected) {
++void GroupsEditor::_update_groups() {
++	if (!is_visible_in_tree()) {
++		groups_dirty = true;
+ 		return;
+ 	}
+ 
+-	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-	undo_redo->create_action(TTR("Remove from Group"));
+-
+-	while (selected) {
+-		Node *node = scene_tree->get_edited_scene_root()->get_node(selected->get_metadata(0));
+-		undo_redo->add_do_method(node, "remove_from_group", selected_group);
+-		undo_redo->add_undo_method(node, "add_to_group", selected_group, true);
+-
+-		selected = nodes_to_add->get_next_selected(selected);
++	if (updating_groups) {
++		return;
+ 	}
+ 
+-	undo_redo->add_do_method(this, "_group_selected");
+-	undo_redo->add_undo_method(this, "_group_selected");
+-	undo_redo->add_do_method(this, "emit_signal", "group_edited");
+-	undo_redo->add_undo_method(this, "emit_signal", "group_edited");
++	updating_groups = true;
+ 
+-	// To force redraw of scene tree.
+-	undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+-	undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++	global_groups = ProjectSettings::get_singleton()->get_global_groups_list();
+ 
+-	undo_redo->commit_action();
+-}
++	_load_scene_groups(scene_root_node);
+ 
+-void GroupDialog::_remove_filter_changed(const String &p_filter) {
+-	_group_selected();
+-}
++	for (const KeyValue<StringName, bool> &E : scene_groups) {
++		if (global_groups.has(E.key)) {
++			scene_groups.erase(E.key);
++		}
++	}
+ 
+-void GroupDialog::_add_filter_changed(const String &p_filter) {
+-	_group_selected();
++	updating_groups = false;
+ }
+ 
+-void GroupDialog::_add_group_pressed(const String &p_name) {
+-	_add_group(add_group_text->get_text());
+-	add_group_text->clear();
+-}
++void GroupsEditor::_update_tree() {
++	if (!is_visible_in_tree()) {
++		groups_dirty = true;
++		return;
++	}
+ 
+-void GroupDialog::_add_group(String p_name) {
+-	if (!is_visible()) {
+-		return; // No need to edit the dialog if it's not being used.
++	if (!node) {
++		return;
+ 	}
+ 
+-	String name = p_name.strip_edges();
+-	if (name.is_empty() || groups->get_item_with_text(name)) {
++	if (updating_tree) {
+ 		return;
+ 	}
+ 
+-	TreeItem *new_group = groups->create_item(groups_root);
+-	new_group->set_text(0, name);
+-	new_group->add_button(0, get_editor_theme_icon(SNAME("Remove")), DELETE_GROUP);
+-	new_group->add_button(0, get_editor_theme_icon(SNAME("ActionCopy")), COPY_GROUP);
+-	new_group->set_editable(0, true);
+-	new_group->select(0);
+-	groups->ensure_cursor_is_visible();
+-}
++	updating_tree = true;
+ 
+-void GroupDialog::_add_group_text_changed(const String &p_new_text) {
+-	add_group_button->set_disabled(p_new_text.strip_edges().is_empty());
+-}
++	tree->clear();
+ 
+-void GroupDialog::_group_renamed() {
+-	TreeItem *renamed_group = groups->get_selected();
+-	if (!renamed_group) {
+-		return;
+-	}
++	List<Node::GroupInfo> groups;
++	node->get_groups(&groups);
++	groups.sort_custom<_GroupInfoComparator>();
+ 
+-	const String name = renamed_group->get_text(0).strip_edges();
+-	if (name == selected_group) {
+-		return;
++	List<StringName> current_groups;
++	for (const Node::GroupInfo &gi : groups) {
++		current_groups.push_back(gi.name);
+ 	}
+ 
+-	if (name.is_empty()) {
+-		renamed_group->set_text(0, selected_group);
+-		error->set_text(TTR("Invalid group name."));
+-		error->popup_centered();
+-		return;
++	TreeItem *root = tree->create_item();
++
++	TreeItem *local_root = tree->create_item(root);
++	local_root->set_text(0, "Scene Groups");
++	local_root->set_icon(0, get_editor_theme_icon(SNAME("PackedScene")));
++	local_root->set_custom_bg_color(0, get_theme_color(SNAME("prop_subsection"), SNAME("Editor")));
++	local_root->set_selectable(0, false);
++
++	List<StringName> scene_keys;
++	for (const KeyValue<StringName, bool> &E : scene_groups) {
++		scene_keys.push_back(E.key);
+ 	}
++	scene_keys.sort_custom<NoCaseComparator>();
+ 
+-	for (TreeItem *E = groups_root->get_first_child(); E; E = E->get_next()) {
+-		if (E != renamed_group && E->get_text(0) == name) {
+-			renamed_group->set_text(0, selected_group);
+-			error->set_text(TTR("Group name already exists."));
+-			error->popup_centered();
+-			return;
++	for (const StringName &E : scene_keys) {
++		if (!filter->get_text().is_subsequence_ofn(E)) {
++			continue;
++		}
++
++		TreeItem *item = tree->create_item(local_root);
++		item->set_cell_mode(0, TreeItem::CELL_MODE_CHECK);
++		item->set_editable(0, can_edit(node, E));
++		item->set_checked(0, current_groups.find(E) != nullptr);
++		item->set_text(0, E);
++		item->set_meta("__local", true);
++		item->set_meta("__name", E);
++		item->set_meta("__description", "");
++		if (!scene_groups[E]) {
++			item->add_button(0, get_editor_theme_icon(SNAME("Lock")), -1, true, TTR("This group belongs to another scene and can't be edited."));
+ 		}
++		item->add_button(0, get_editor_theme_icon(SNAME("ActionCopy")), COPY_GROUP, false, TTR("Copy group name to clipboard."));
+ 	}
+ 
+-	renamed_group->set_text(0, name); // Spaces trimmed.
++	List<StringName> keys;
++	for (const KeyValue<StringName, String> &E : global_groups) {
++		keys.push_back(E.key);
++	}
++	keys.sort_custom<NoCaseComparator>();
+ 
+-	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-	undo_redo->create_action(TTR("Rename Group"));
++	TreeItem *global_root = tree->create_item(root);
++	global_root->set_text(0, "Global Groups");
++	global_root->set_icon(0, get_editor_theme_icon(SNAME("Environment")));
++	global_root->set_custom_bg_color(0, get_theme_color(SNAME("prop_subsection"), SNAME("Editor")));
++	global_root->set_selectable(0, false);
+ 
+-	List<Node *> nodes;
+-	scene_tree->get_nodes_in_group(selected_group, &nodes);
+-	bool removed_all = true;
+-	for (Node *node : nodes) {
+-		if (can_edit(node, selected_group)) {
+-			undo_redo->add_do_method(node, "remove_from_group", selected_group);
+-			undo_redo->add_undo_method(node, "remove_from_group", name);
+-			undo_redo->add_do_method(node, "add_to_group", name, true);
+-			undo_redo->add_undo_method(node, "add_to_group", selected_group, true);
+-		} else {
+-			removed_all = false;
++	for (const StringName &E : keys) {
++		if (!filter->get_text().is_subsequence_ofn(E)) {
++			continue;
+ 		}
+-	}
+ 
+-	if (!removed_all) {
+-		undo_redo->add_do_method(this, "_add_group", selected_group);
+-		undo_redo->add_undo_method(this, "_delete_group_item", selected_group);
++		TreeItem *item = tree->create_item(global_root);
++		item->set_cell_mode(0, TreeItem::CELL_MODE_CHECK);
++		item->set_editable(0, can_edit(node, E));
++		item->set_checked(0, current_groups.find(E) != nullptr);
++		item->set_text(0, E);
++		item->set_meta("__local", false);
++		item->set_meta("__name", E);
++		item->set_meta("__description", global_groups[E]);
++		if (!global_groups[E].is_empty()) {
++			item->set_tooltip_text(0, vformat("%s\n\n%s", E, global_groups[E]));
++		}
++		item->add_button(0, get_editor_theme_icon(SNAME("ActionCopy")), COPY_GROUP, false, TTR("Copy group name to clipboard."));
+ 	}
+ 
+-	undo_redo->add_do_method(this, "_rename_group_item", selected_group, name);
+-	undo_redo->add_undo_method(this, "_rename_group_item", name, selected_group);
+-	undo_redo->add_do_method(this, "_group_selected");
+-	undo_redo->add_undo_method(this, "_group_selected");
+-	undo_redo->add_do_method(this, "emit_signal", "group_edited");
+-	undo_redo->add_undo_method(this, "emit_signal", "group_edited");
+-
+-	undo_redo->commit_action();
++	updating_tree = false;
+ }
+ 
+-void GroupDialog::_rename_group_item(const String &p_old_name, const String &p_new_name) {
+-	if (!is_visible()) {
+-		return; // No need to edit the dialog if it's not being used.
++void GroupsEditor::_queue_update_groups_and_tree() {
++	if (update_groups_and_tree_queued) {
++		return;
+ 	}
++	update_groups_and_tree_queued = true;
++	callable_mp(this, &GroupsEditor::_update_groups_and_tree).call_deferred();
++}
+ 
+-	selected_group = p_new_name;
++void GroupsEditor::_update_groups_and_tree() {
++	update_groups_and_tree_queued = false;
++	_update_groups();
++	_update_tree();
++}
+ 
+-	for (TreeItem *E = groups_root->get_first_child(); E; E = E->get_next()) {
+-		if (E->get_text(0) == p_old_name) {
+-			E->set_text(0, p_new_name);
+-			return;
+-		}
++void GroupsEditor::_update_scene_groups(Node *p_node) {
++	if (scene_groups_cache.has(p_node)) {
++		scene_groups = scene_groups_cache[p_node];
++		scene_groups_cache.erase(p_node);
++	} else {
++		scene_groups = HashMap<StringName, bool>();
+ 	}
+ }
+ 
+-void GroupDialog::_load_groups(Node *p_current) {
+-	List<Node::GroupInfo> gi;
+-	p_current->get_groups(&gi);
+-
+-	for (const Node::GroupInfo &E : gi) {
+-		if (!E.persistent) {
+-			continue;
++void GroupsEditor::_cache_scene_groups(Node *p_node) {
++	const int edited_scene_count = EditorNode::get_editor_data().get_edited_scene_count();
++	for (int i = 0; i < edited_scene_count; i++) {
++		if (p_node == EditorNode::get_editor_data().get_edited_scene_root(i)) {
++			scene_groups_cache[p_node] = scene_groups_for_caching;
++			break;
+ 		}
+-		_add_group(E.name);
+ 	}
++}
+ 
+-	for (int i = 0; i < p_current->get_child_count(); i++) {
+-		_load_groups(p_current->get_child(i));
++void GroupsEditor::set_current(Node *p_node) {
++	if (node == p_node) {
++		return;
+ 	}
+-}
++	node = p_node;
+ 
+-void GroupDialog::_modify_group_pressed(Object *p_item, int p_column, int p_id, MouseButton p_button) {
+-	if (p_button != MouseButton::LEFT) {
++	if (!node) {
+ 		return;
+ 	}
+ 
+-	TreeItem *ti = Object::cast_to<TreeItem>(p_item);
++	if (scene_tree->get_edited_scene_root() != scene_root_node) {
++		scene_root_node = scene_tree->get_edited_scene_root();
++		_update_scene_groups(scene_root_node);
++		_update_groups();
++	}
++
++	_update_tree();
++}
++
++void GroupsEditor::_item_edited() {
++	TreeItem *ti = tree->get_edited();
+ 	if (!ti) {
+ 		return;
+ 	}
+ 
+-	switch (p_id) {
+-		case DELETE_GROUP: {
+-			String name = ti->get_text(0);
++	String name = ti->get_text(0);
+ 
+-			EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-			undo_redo->create_action(TTR("Delete Group"));
+-
+-			List<Node *> nodes;
+-			scene_tree->get_nodes_in_group(name, &nodes);
+-			bool removed_all = true;
+-			for (Node *E : nodes) {
+-				if (can_edit(E, name)) {
+-					undo_redo->add_do_method(E, "remove_from_group", name);
+-					undo_redo->add_undo_method(E, "add_to_group", name, true);
+-				} else {
+-					removed_all = false;
+-				}
+-			}
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	if (ti->is_checked(0)) {
++		undo_redo->create_action(TTR("Add to Group"));
+ 
+-			if (removed_all) {
+-				undo_redo->add_do_method(this, "_delete_group_item", name);
+-				undo_redo->add_undo_method(this, "_add_group", name);
+-			}
++		undo_redo->add_do_method(node, "add_to_group", name, true);
++		undo_redo->add_undo_method(node, "remove_from_group", name);
+ 
+-			undo_redo->add_do_method(this, "_group_selected");
+-			undo_redo->add_undo_method(this, "_group_selected");
+-			undo_redo->add_do_method(this, "emit_signal", "group_edited");
+-			undo_redo->add_undo_method(this, "emit_signal", "group_edited");
++		undo_redo->add_do_method(this, "_set_group_checked", name, true);
++		undo_redo->add_undo_method(this, "_set_group_checked", name, false);
+ 
+-			// To force redraw of scene tree.
+-			undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+-			undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++		// To force redraw of scene tree.
++		undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++		undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+ 
+-			undo_redo->commit_action();
+-		} break;
+-		case COPY_GROUP: {
+-			DisplayServer::get_singleton()->clipboard_set(ti->get_text(p_column));
+-		} break;
+-	}
+-}
++		undo_redo->commit_action();
+ 
+-void GroupDialog::_delete_group_item(const String &p_name) {
+-	if (!is_visible()) {
+-		return; // No need to edit the dialog if it's not being used.
+-	}
++	} else {
++		undo_redo->create_action(TTR("Remove from Group"));
+ 
+-	if (selected_group == p_name) {
+-		add_filter->clear();
+-		remove_filter->clear();
+-		nodes_to_remove->clear();
+-		nodes_to_add->clear();
+-		groups->deselect_all();
+-		selected_group = "";
+-	}
++		undo_redo->add_do_method(node, "remove_from_group", name);
++		undo_redo->add_undo_method(node, "add_to_group", name, true);
+ 
+-	for (TreeItem *E = groups_root->get_first_child(); E; E = E->get_next()) {
+-		if (E->get_text(0) == p_name) {
+-			groups_root->remove_child(E);
+-			return;
+-		}
++		undo_redo->add_do_method(this, "_set_group_checked", name, false);
++		undo_redo->add_undo_method(this, "_set_group_checked", name, true);
++
++		// To force redraw of scene tree.
++		undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++		undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++
++		undo_redo->commit_action();
+ 	}
+ }
+ 
+-void GroupDialog::_notification(int p_what) {
++void GroupsEditor::_notification(int p_what) {
+ 	switch (p_what) {
+-		case NOTIFICATION_TRANSLATION_CHANGED:
+-		case Control::NOTIFICATION_LAYOUT_DIRECTION_CHANGED:
++		case NOTIFICATION_READY: {
++			get_tree()->connect("node_added", callable_mp(this, &GroupsEditor::_load_scene_groups));
++			get_tree()->connect("node_removed", callable_mp(this, &GroupsEditor::_node_removed));
++		} break;
+ 		case NOTIFICATION_THEME_CHANGED: {
+-			if (is_layout_rtl()) {
+-				add_button->set_icon(get_editor_theme_icon(SNAME("Back")));
+-				remove_button->set_icon(get_editor_theme_icon(SNAME("Forward")));
+-			} else {
+-				add_button->set_icon(get_editor_theme_icon(SNAME("Forward")));
+-				remove_button->set_icon(get_editor_theme_icon(SNAME("Back")));
++			filter->set_right_icon(get_editor_theme_icon("Search"));
++			add->set_icon(get_editor_theme_icon("Add"));
++		} break;
++		case NOTIFICATION_VISIBILITY_CHANGED: {
++			if (groups_dirty && is_visible_in_tree()) {
++				groups_dirty = false;
++				_update_groups_and_tree();
+ 			}
+-
+-			add_filter->set_right_icon(get_editor_theme_icon(SNAME("Search")));
+-			remove_filter->set_right_icon(get_editor_theme_icon(SNAME("Search")));
+ 		} break;
+ 	}
+ }
+ 
+-void GroupDialog::edit() {
+-	popup_centered();
++void GroupsEditor::_menu_id_pressed(int p_id) {
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
+ 
+-	groups->clear();
+-	groups_root = groups->create_item();
++	bool is_local = ti->get_meta("__local");
++	String group_name = ti->get_meta("__name");
+ 
+-	nodes_to_add->clear();
+-	nodes_to_remove->clear();
++	switch (p_id) {
++		case DELETE_GROUP: {
++			if (!is_local || scene_groups[group_name]) {
++				_show_remove_group_dialog();
++			}
++		} break;
++		case RENAME_GROUP: {
++			if (!is_local || scene_groups[group_name]) {
++				_show_rename_group_dialog();
++			}
++		} break;
++		case CONVERT_GROUP: {
++			String description = ti->get_meta("__description");
++			String property_name = GLOBAL_GROUP_PREFIX + group_name;
+ 
+-	add_group_text->clear();
+-	add_filter->clear();
+-	remove_filter->clear();
++			EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++			if (is_local) {
++				undo_redo->create_action(TTR("Convert to Global Group"));
+ 
+-	_load_groups(scene_tree->get_edited_scene_root());
+-}
++				undo_redo->add_do_property(ProjectSettings::get_singleton(), property_name, "");
++				undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_name, Variant());
+ 
+-void GroupDialog::_bind_methods() {
+-	ClassDB::bind_method("_delete_group_item", &GroupDialog::_delete_group_item);
++				undo_redo->add_do_method(ProjectSettings::get_singleton(), "save");
++				undo_redo->add_undo_method(ProjectSettings::get_singleton(), "save");
+ 
+-	ClassDB::bind_method("_add_group", &GroupDialog::_add_group);
++				undo_redo->add_undo_method(this, "_add_scene_group", group_name);
+ 
+-	ClassDB::bind_method("_rename_group_item", &GroupDialog::_rename_group_item);
++				undo_redo->add_do_method(this, "_update_groups_and_tree");
++				undo_redo->add_undo_method(this, "_update_groups_and_tree");
+ 
+-	ClassDB::bind_method("_group_selected", &GroupDialog::_group_selected);
++				undo_redo->commit_action();
++			} else {
++				undo_redo->create_action(TTR("Convert to Scene Group"));
+ 
+-	ADD_SIGNAL(MethodInfo("group_edited"));
+-}
++				undo_redo->add_do_property(ProjectSettings::get_singleton(), property_name, Variant());
++				undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_name, description);
+ 
+-GroupDialog::GroupDialog() {
+-	set_min_size(Size2(600, 400) * EDSCALE);
++				undo_redo->add_do_method(ProjectSettings::get_singleton(), "save");
++				undo_redo->add_undo_method(ProjectSettings::get_singleton(), "save");
+ 
+-	scene_tree = SceneTree::get_singleton();
++				undo_redo->add_do_method(this, "_add_scene_group", group_name);
+ 
+-	VBoxContainer *vbc = memnew(VBoxContainer);
+-	add_child(vbc);
+-	vbc->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT, Control::PRESET_MODE_KEEP_SIZE, 8 * EDSCALE);
++				undo_redo->add_do_method(this, "_update_groups_and_tree");
++				undo_redo->add_undo_method(this, "_update_groups_and_tree");
+ 
+-	HBoxContainer *hbc = memnew(HBoxContainer);
+-	vbc->add_child(hbc);
+-	hbc->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+-
+-	VBoxContainer *vbc_left = memnew(VBoxContainer);
+-	hbc->add_child(vbc_left);
+-	vbc_left->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-
+-	Label *group_title = memnew(Label);
+-	group_title->set_theme_type_variation("HeaderSmall");
+-
+-	group_title->set_text(TTR("Groups"));
+-	vbc_left->add_child(group_title);
+-
+-	groups = memnew(Tree);
+-	vbc_left->add_child(groups);
+-	groups->set_hide_root(true);
+-	groups->set_select_mode(Tree::SELECT_SINGLE);
+-	groups->set_allow_reselect(true);
+-	groups->set_allow_rmb_select(true);
+-	groups->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+-	groups->add_theme_constant_override("draw_guides", 1);
+-	groups->connect("item_selected", callable_mp(this, &GroupDialog::_group_selected));
+-	groups->connect("button_clicked", callable_mp(this, &GroupDialog::_modify_group_pressed));
+-	groups->connect("item_edited", callable_mp(this, &GroupDialog::_group_renamed));
+-
+-	HBoxContainer *chbc = memnew(HBoxContainer);
+-	vbc_left->add_child(chbc);
+-	chbc->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-
+-	add_group_text = memnew(LineEdit);
+-	chbc->add_child(add_group_text);
+-	add_group_text->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-	add_group_text->connect("text_submitted", callable_mp(this, &GroupDialog::_add_group_pressed));
+-	add_group_text->connect("text_changed", callable_mp(this, &GroupDialog::_add_group_text_changed));
+-
+-	add_group_button = memnew(Button);
+-	add_group_button->set_text(TTR("Add"));
+-	chbc->add_child(add_group_button);
+-	add_group_button->connect("pressed", callable_mp(this, &GroupDialog::_add_group_pressed).bind(String()));
+-
+-	VBoxContainer *vbc_add = memnew(VBoxContainer);
+-	hbc->add_child(vbc_add);
+-	vbc_add->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-
+-	Label *out_of_group_title = memnew(Label);
+-	out_of_group_title->set_theme_type_variation("HeaderSmall");
+-
+-	out_of_group_title->set_text(TTR("Nodes Not in Group"));
+-	vbc_add->add_child(out_of_group_title);
+-
+-	nodes_to_add = memnew(Tree);
+-	vbc_add->add_child(nodes_to_add);
+-	nodes_to_add->set_hide_root(true);
+-	nodes_to_add->set_hide_folding(true);
+-	nodes_to_add->set_select_mode(Tree::SELECT_MULTI);
+-	nodes_to_add->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+-	nodes_to_add->add_theme_constant_override("draw_guides", 1);
+-
+-	HBoxContainer *add_filter_hbc = memnew(HBoxContainer);
+-	add_filter_hbc->add_theme_constant_override("separate", 0);
+-	vbc_add->add_child(add_filter_hbc);
+-
+-	add_filter = memnew(LineEdit);
+-	add_filter->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-	add_filter->set_placeholder(TTR("Filter Nodes"));
+-	add_filter->set_clear_button_enabled(true);
+-	add_filter_hbc->add_child(add_filter);
+-	add_filter->connect("text_changed", callable_mp(this, &GroupDialog::_add_filter_changed));
+-
+-	VBoxContainer *vbc_buttons = memnew(VBoxContainer);
+-	hbc->add_child(vbc_buttons);
+-	vbc_buttons->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
+-	vbc_buttons->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
+-
+-	add_button = memnew(Button);
+-	add_button->set_flat(true);
+-	add_button->set_text(TTR("Add"));
+-	add_button->connect("pressed", callable_mp(this, &GroupDialog::_add_pressed));
+-
+-	vbc_buttons->add_child(add_button);
+-	vbc_buttons->add_spacer();
+-	vbc_buttons->add_spacer();
+-	vbc_buttons->add_spacer();
+-
+-	remove_button = memnew(Button);
+-	remove_button->set_flat(true);
+-	remove_button->set_text(TTR("Remove"));
+-	remove_button->connect("pressed", callable_mp(this, &GroupDialog::_removed_pressed));
+-
+-	vbc_buttons->add_child(remove_button);
+-
+-	VBoxContainer *vbc_remove = memnew(VBoxContainer);
+-	hbc->add_child(vbc_remove);
+-	vbc_remove->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-
+-	Label *in_group_title = memnew(Label);
+-	in_group_title->set_theme_type_variation("HeaderSmall");
+-
+-	in_group_title->set_text(TTR("Nodes in Group"));
+-	vbc_remove->add_child(in_group_title);
+-
+-	nodes_to_remove = memnew(Tree);
+-	vbc_remove->add_child(nodes_to_remove);
+-	nodes_to_remove->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+-	nodes_to_remove->set_hide_root(true);
+-	nodes_to_remove->set_hide_folding(true);
+-	nodes_to_remove->set_select_mode(Tree::SELECT_MULTI);
+-	nodes_to_remove->add_theme_constant_override("draw_guides", 1);
+-
+-	HBoxContainer *remove_filter_hbc = memnew(HBoxContainer);
+-	remove_filter_hbc->add_theme_constant_override("separate", 0);
+-	vbc_remove->add_child(remove_filter_hbc);
+-
+-	remove_filter = memnew(LineEdit);
+-	remove_filter->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-	remove_filter->set_placeholder(TTR("Filter Nodes"));
+-	remove_filter->set_clear_button_enabled(true);
+-	remove_filter_hbc->add_child(remove_filter);
+-	remove_filter->connect("text_changed", callable_mp(this, &GroupDialog::_remove_filter_changed));
+-
+-	group_empty = memnew(Label());
+-	group_empty->set_theme_type_variation("HeaderSmall");
+-
+-	group_empty->set_text(TTR("Empty groups will be automatically removed."));
+-	group_empty->set_vertical_alignment(VERTICAL_ALIGNMENT_CENTER);
+-	group_empty->set_horizontal_alignment(HORIZONTAL_ALIGNMENT_CENTER);
+-	group_empty->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+-	group_empty->set_custom_minimum_size(Size2(100 * EDSCALE, 0));
+-	nodes_to_remove->add_child(group_empty);
+-	group_empty->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT, Control::PRESET_MODE_KEEP_SIZE, 8 * EDSCALE);
+-
+-	set_title(TTR("Group Editor"));
+-
+-	error = memnew(AcceptDialog);
+-	add_child(error);
+-	error->set_ok_button_text(TTR("Close"));
+-
+-	_add_group_text_changed("");
+-}
+-
+-////////////////////////////////////////////////////////////////////////////////
+-
+-void GroupsEditor::_add_group(const String &p_group) {
+-	if (!node) {
+-		return;
++				undo_redo->commit_action();
++			}
++		} break;
+ 	}
+-	const String name = group_name->get_text().strip_edges();
++}
+ 
+-	group_name->clear();
+-	if (node->is_in_group(name)) {
+-		error->set_text(TTR("Group name already exists."));
+-		error->popup_centered();
++void GroupsEditor::_item_mouse_selected(const Vector2 &p_pos, MouseButton p_mouse_button) {
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
+ 		return;
+ 	}
+ 
++	if (p_mouse_button == MouseButton::LEFT) {
++		callable_mp(this, &GroupsEditor::_item_edited).call_deferred();
++	} else if (p_mouse_button == MouseButton::RIGHT) {
++		// Restore the previous state after clicking RMB.
++		if (ti->is_editable(0)) {
++			ti->set_checked(0, !ti->is_checked(0));
++		}
++
++		menu->clear();
++		if (ti->get_meta("__local")) {
++			menu->add_icon_item(get_editor_theme_icon(SNAME("Environment")), TTR("Convert to Global Group"), CONVERT_GROUP);
++		} else {
++			menu->add_icon_item(get_editor_theme_icon(SNAME("PackedScene")), TTR("Convert to Scene Group"), CONVERT_GROUP);
++		}
++
++		String group_name = ti->get_meta("__name");
++		if (global_groups.has(group_name) || scene_groups[group_name]) {
++			menu->add_separator();
++			menu->add_icon_shortcut(get_editor_theme_icon(SNAME("Rename")), ED_GET_SHORTCUT("groups_editor/rename"), RENAME_GROUP);
++			menu->add_icon_shortcut(get_editor_theme_icon(SNAME("Remove")), ED_GET_SHORTCUT("groups_editor/delete"), DELETE_GROUP);
++		}
++
++		menu->set_position(tree->get_screen_position() + p_pos);
++		menu->reset_size();
++		menu->popup();
++	}
++}
++
++void GroupsEditor::_confirm_add() {
++	String name = add_group_name->get_text().strip_edges();
++
++	String description = add_group_description->get_text();
++
+ 	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+ 	undo_redo->create_action(TTR("Add to Group"));
+ 
+ 	undo_redo->add_do_method(node, "add_to_group", name, true);
+ 	undo_redo->add_undo_method(node, "remove_from_group", name);
+-	undo_redo->add_do_method(this, "update_tree");
+-	undo_redo->add_undo_method(this, "update_tree");
++
++	bool is_local = !global_group_button->is_pressed();
++	if (is_local) {
++		undo_redo->add_do_method(this, "_add_scene_group", name);
++		undo_redo->add_undo_method(this, "_remove_scene_group", name);
++	} else {
++		String property_name = GLOBAL_GROUP_PREFIX + name;
++
++		undo_redo->add_do_property(ProjectSettings::get_singleton(), property_name, description);
++		undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_name, Variant());
++
++		undo_redo->add_do_method(ProjectSettings::get_singleton(), "save");
++		undo_redo->add_undo_method(ProjectSettings::get_singleton(), "save");
++
++		undo_redo->add_do_method(this, "_update_groups");
++		undo_redo->add_undo_method(this, "_update_groups");
++	}
++
++	undo_redo->add_do_method(this, "_update_tree");
++	undo_redo->add_undo_method(this, "_update_tree");
+ 
+ 	// To force redraw of scene tree.
+ 	undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+ 	undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+ 
+ 	undo_redo->commit_action();
++	tree->grab_focus();
+ }
+ 
+-void GroupsEditor::_group_selected() {
+-	if (!tree->is_anything_selected()) {
++void GroupsEditor::_confirm_rename() {
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
+ 		return;
+ 	}
+-	selected_group = tree->get_selected()->get_text(0);
+-}
+ 
+-void GroupsEditor::_group_renamed() {
+-	if (!node || !can_edit(node, selected_group)) {
++	String old_name = ti->get_meta("__name");
++	String new_name = rename_group->get_text().strip_edges();
++
++	if (old_name == new_name) {
+ 		return;
+ 	}
+ 
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Rename Group"));
++
++	if (!global_groups.has(old_name)) {
++		undo_redo->add_do_method(this, "_rename_scene_group", old_name, new_name);
++		undo_redo->add_undo_method(this, "_rename_scene_group", new_name, old_name);
++	} else {
++		String property_new_name = GLOBAL_GROUP_PREFIX + new_name;
++		String property_old_name = GLOBAL_GROUP_PREFIX + old_name;
++
++		String description = ti->get_meta("__description");
++
++		undo_redo->add_do_property(ProjectSettings::get_singleton(), property_new_name, description);
++		undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_new_name, Variant());
++
++		undo_redo->add_do_property(ProjectSettings::get_singleton(), property_old_name, Variant());
++		undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_old_name, description);
++
++		if (rename_check_box->is_pressed()) {
++			undo_redo->add_do_method(ProjectSettingsEditor::get_singleton()->get_group_settings(), "rename_references", old_name, new_name);
++			undo_redo->add_undo_method(ProjectSettingsEditor::get_singleton()->get_group_settings(), "rename_references", new_name, old_name);
++		}
++
++		undo_redo->add_do_method(ProjectSettings::get_singleton(), "save");
++		undo_redo->add_undo_method(ProjectSettings::get_singleton(), "save");
++
++		undo_redo->add_do_method(this, "_update_groups");
++		undo_redo->add_undo_method(this, "_update_groups");
++	}
++
++	undo_redo->add_do_method(this, "_update_tree");
++	undo_redo->add_undo_method(this, "_update_tree");
++
++	undo_redo->commit_action();
++
++	tree->grab_focus();
++}
++
++void GroupsEditor::_confirm_delete() {
+ 	TreeItem *ti = tree->get_selected();
+ 	if (!ti) {
+ 		return;
+ 	}
+ 
+-	const String name = ti->get_text(0).strip_edges();
+-	if (name == selected_group) {
+-		return;
+-	}
++	String name = ti->get_meta("__name");
++	bool is_local = ti->get_meta("__local");
+ 
+-	if (name.is_empty()) {
+-		ti->set_text(0, selected_group);
+-		error->set_text(TTR("Invalid group name."));
+-		error->popup_centered();
+-		return;
+-	}
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Remove Group"));
+ 
+-	for (TreeItem *E = groups_root->get_first_child(); E; E = E->get_next()) {
+-		if (E != ti && E->get_text(0) == name) {
+-			ti->set_text(0, selected_group);
+-			error->set_text(TTR("Group name already exists."));
+-			error->popup_centered();
+-			return;
+-		}
+-	}
++	if (is_local) {
++		undo_redo->add_do_method(this, "_remove_scene_group", name);
++		undo_redo->add_undo_method(this, "_add_scene_group", name);
++	} else {
++		String property_name = GLOBAL_GROUP_PREFIX + name;
++		String description = ti->get_meta("__description");
+ 
+-	ti->set_text(0, name); // Spaces trimmed.
++		undo_redo->add_do_property(ProjectSettings::get_singleton(), property_name, Variant());
++		undo_redo->add_undo_property(ProjectSettings::get_singleton(), property_name, description);
+ 
+-	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-	undo_redo->create_action(TTR("Rename Group"));
++		if (remove_check_box->is_pressed()) {
++			undo_redo->add_do_method(ProjectSettingsEditor::get_singleton()->get_group_settings(), "remove_references", name);
++		}
+ 
+-	undo_redo->add_do_method(node, "remove_from_group", selected_group);
+-	undo_redo->add_undo_method(node, "remove_from_group", name);
+-	undo_redo->add_do_method(node, "add_to_group", name, true);
+-	undo_redo->add_undo_method(node, "add_to_group", selected_group, true);
++		undo_redo->add_do_method(ProjectSettings::get_singleton(), "save");
++		undo_redo->add_undo_method(ProjectSettings::get_singleton(), "save");
+ 
+-	undo_redo->add_do_method(this, "_group_selected");
+-	undo_redo->add_undo_method(this, "_group_selected");
+-	undo_redo->add_do_method(this, "update_tree");
+-	undo_redo->add_undo_method(this, "update_tree");
++		undo_redo->add_do_method(this, "_update_groups");
++		undo_redo->add_undo_method(this, "_update_groups");
++	}
+ 
+-	// To force redraw of scene tree.
+-	undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+-	undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++	undo_redo->add_do_method(this, "_update_tree");
++	undo_redo->add_undo_method(this, "_update_tree");
+ 
+ 	undo_redo->commit_action();
++	tree->grab_focus();
+ }
+ 
+-void GroupsEditor::_modify_group(Object *p_item, int p_column, int p_id, MouseButton p_button) {
+-	if (p_button != MouseButton::LEFT) {
+-		return;
++void GroupsEditor::_show_add_group_dialog() {
++	if (!add_group_dialog) {
++		add_group_dialog = memnew(ConfirmationDialog);
++		add_group_dialog->set_title(TTR("Create New Group"));
++		add_group_dialog->connect("confirmed", callable_mp(this, &GroupsEditor::_confirm_add));
++
++		VBoxContainer *vbc = memnew(VBoxContainer);
++		add_group_dialog->add_child(vbc);
++
++		GridContainer *gc = memnew(GridContainer);
++		gc->set_columns(2);
++		vbc->add_child(gc);
++
++		Label *label_name = memnew(Label(TTR("Name:")));
++		label_name->set_h_size_flags(SIZE_SHRINK_BEGIN);
++		gc->add_child(label_name);
++
++		HBoxContainer *hbc = memnew(HBoxContainer);
++		hbc->set_h_size_flags(SIZE_EXPAND_FILL);
++		gc->add_child(hbc);
++
++		add_group_name = memnew(LineEdit);
++		add_group_name->set_custom_minimum_size(Size2(200 * EDSCALE, 0));
++		add_group_name->set_h_size_flags(SIZE_EXPAND_FILL);
++		hbc->add_child(add_group_name);
++
++		global_group_button = memnew(CheckButton);
++		global_group_button->set_text(TTR("Global"));
++		hbc->add_child(global_group_button);
++
++		Label *label_description = memnew(Label(TTR("Description:")));
++		label_name->set_h_size_flags(SIZE_SHRINK_BEGIN);
++		gc->add_child(label_description);
++
++		add_group_description = memnew(LineEdit);
++		add_group_description->set_h_size_flags(SIZE_EXPAND_FILL);
++		add_group_description->set_editable(false);
++		gc->add_child(add_group_description);
++
++		global_group_button->connect("toggled", callable_mp(add_group_description, &LineEdit::set_editable));
++
++		add_group_dialog->register_text_enter(add_group_name);
++		add_group_dialog->register_text_enter(add_group_description);
++
++		add_validation_panel = memnew(EditorValidationPanel);
++		add_validation_panel->add_line(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group name is valid."));
++		add_validation_panel->set_update_callback(callable_mp(this, &GroupsEditor::_check_add));
++		add_validation_panel->set_accept_button(add_group_dialog->get_ok_button());
++
++		add_group_name->connect("text_changed", callable_mp(add_validation_panel, &EditorValidationPanel::update).unbind(1));
++
++		vbc->add_child(add_validation_panel);
++
++		add_child(add_group_dialog);
+ 	}
++	add_group_name->clear();
++	add_group_description->clear();
+ 
+-	if (!node) {
+-		return;
++	global_group_button->set_pressed(false);
++
++	add_validation_panel->update();
++
++	add_group_dialog->popup_centered();
++	add_group_name->grab_focus();
++}
++
++void GroupsEditor::_show_rename_group_dialog() {
++	if (!rename_group_dialog) {
++		rename_group_dialog = memnew(ConfirmationDialog);
++		rename_group_dialog->set_title(TTR("Rename Group"));
++		rename_group_dialog->connect("confirmed", callable_mp(this, &GroupsEditor::_confirm_rename));
++
++		VBoxContainer *vbc = memnew(VBoxContainer);
++		rename_group_dialog->add_child(vbc);
++
++		HBoxContainer *hbc = memnew(HBoxContainer);
++		hbc->add_child(memnew(Label(TTR("Name:"))));
++
++		rename_group = memnew(LineEdit);
++		rename_group->set_custom_minimum_size(Size2(300 * EDSCALE, 1));
++		hbc->add_child(rename_group);
++		vbc->add_child(hbc);
++
++		rename_group_dialog->register_text_enter(rename_group);
++
++		rename_validation_panel = memnew(EditorValidationPanel);
++		rename_validation_panel->add_line(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group name is valid."));
++		rename_validation_panel->set_update_callback(callable_mp(this, &GroupsEditor::_check_rename));
++		rename_validation_panel->set_accept_button(rename_group_dialog->get_ok_button());
++
++		rename_group->connect("text_changed", callable_mp(rename_validation_panel, &EditorValidationPanel::update).unbind(1));
++
++		vbc->add_child(rename_validation_panel);
++
++		rename_check_box = memnew(CheckBox);
++		rename_check_box->set_text(TTR("Rename references in all scenes"));
++		vbc->add_child(rename_check_box);
++
++		add_child(rename_group_dialog);
+ 	}
+ 
+-	TreeItem *ti = Object::cast_to<TreeItem>(p_item);
++	TreeItem *ti = tree->get_selected();
+ 	if (!ti) {
+ 		return;
+ 	}
+-	switch (p_id) {
+-		case DELETE_GROUP: {
+-			const String name = ti->get_text(0);
+-			EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
+-			undo_redo->create_action(TTR("Remove from Group"));
+ 
+-			undo_redo->add_do_method(node, "remove_from_group", name);
+-			undo_redo->add_undo_method(node, "add_to_group", name, true);
+-			undo_redo->add_do_method(this, "update_tree");
+-			undo_redo->add_undo_method(this, "update_tree");
++	bool is_global = !ti->get_meta("__local");
++	rename_check_box->set_visible(is_global);
++	rename_check_box->set_pressed(false);
+ 
+-			// To force redraw of scene tree.
+-			undo_redo->add_do_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
+-			undo_redo->add_undo_method(SceneTreeDock::get_singleton()->get_tree_editor(), "update_tree");
++	String name = ti->get_meta("__name");
+ 
+-			undo_redo->commit_action();
+-		} break;
+-		case COPY_GROUP: {
+-			DisplayServer::get_singleton()->clipboard_set(ti->get_text(p_column));
+-		} break;
+-	}
+-}
++	rename_group->set_text(name);
++	rename_group_dialog->set_meta("__name", name);
+ 
+-void GroupsEditor::_group_name_changed(const String &p_new_text) {
+-	add->set_disabled(p_new_text.strip_edges().is_empty());
++	rename_validation_panel->update();
++
++	rename_group_dialog->reset_size();
++	rename_group_dialog->popup_centered();
++	rename_group->select_all();
++	rename_group->grab_focus();
+ }
+ 
+-struct _GroupInfoComparator {
+-	bool operator()(const Node::GroupInfo &p_a, const Node::GroupInfo &p_b) const {
+-		return p_a.name.operator String() < p_b.name.operator String();
+-	}
+-};
++void GroupsEditor::_show_remove_group_dialog() {
++	if (!remove_group_dialog) {
++		remove_group_dialog = memnew(ConfirmationDialog);
++		remove_group_dialog->connect("confirmed", callable_mp(this, &GroupsEditor::_confirm_delete));
+ 
+-void GroupsEditor::update_tree() {
+-	tree->clear();
++		VBoxContainer *vbox = memnew(VBoxContainer);
++		remove_label = memnew(Label);
++		vbox->add_child(remove_label);
+ 
+-	if (!node) {
+-		return;
++		remove_check_box = memnew(CheckBox);
++		remove_check_box->set_text(TTR("Delete references from all scenes"));
++		vbox->add_child(remove_check_box);
++
++		remove_group_dialog->add_child(vbox);
++
++		add_child(remove_group_dialog);
+ 	}
+ 
+-	List<Node::GroupInfo> groups;
+-	node->get_groups(&groups);
+-	groups.sort_custom<_GroupInfoComparator>();
++	TreeItem *ti = tree->get_selected();
++	if (!ti) {
++		return;
++	}
+ 
+-	TreeItem *root = tree->create_item();
+-	groups_root = root;
++	bool is_global = !ti->get_meta("__local");
++	remove_check_box->set_visible(is_global);
++	remove_check_box->set_pressed(false);
++	remove_label->set_text(vformat(TTR("Delete group \"%s\" and all its references?"), ti->get_text(0)));
+ 
+-	for (const GroupInfo &gi : groups) {
+-		if (!gi.persistent) {
+-			continue;
+-		}
++	remove_group_dialog->reset_size();
++	remove_group_dialog->popup_centered();
++}
+ 
+-		Node *n = node;
+-		bool can_be_deleted = true;
++void GroupsEditor::_check_add() {
++	String group_name = add_group_name->get_text().strip_edges();
++	_validate_name(group_name, add_validation_panel);
++}
+ 
+-		while (n) {
+-			Ref<SceneState> ss = (n == EditorNode::get_singleton()->get_edited_scene()) ? n->get_scene_inherited_state() : n->get_scene_instance_state();
++void GroupsEditor::_check_rename() {
++	String group_name = rename_group->get_text().strip_edges();
++	String old_name = rename_group_dialog->get_meta("__name");
+ 
+-			if (ss.is_valid()) {
+-				int path = ss->find_node_by_path(n->get_path_to(node));
+-				if (path != -1) {
+-					if (ss->is_node_in_group(path, gi.name)) {
+-						can_be_deleted = false;
+-					}
+-				}
+-			}
++	if (group_name == old_name) {
++		return;
++	}
++	_validate_name(group_name, rename_validation_panel);
++}
+ 
+-			n = n->get_owner();
+-		}
++void GroupsEditor::_validate_name(const String &p_name, EditorValidationPanel *p_validation_panel) {
++	if (p_name.is_empty()) {
++		p_validation_panel->set_message(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group can't be empty."), EditorValidationPanel::MSG_ERROR);
++	} else if (_has_group(p_name)) {
++		p_validation_panel->set_message(EditorValidationPanel::MSG_ID_DEFAULT, TTR("Group already exists."), EditorValidationPanel::MSG_ERROR);
++	}
++}
+ 
+-		TreeItem *item = tree->create_item(root);
+-		item->set_text(0, gi.name);
+-		item->set_editable(0, true);
+-		if (can_be_deleted) {
+-			item->add_button(0, get_editor_theme_icon(SNAME("Remove")), DELETE_GROUP);
+-			item->add_button(0, get_editor_theme_icon(SNAME("ActionCopy")), COPY_GROUP);
++void GroupsEditor::_groups_gui_input(Ref<InputEvent> p_event) {
++	Ref<InputEventKey> key = p_event;
++	if (key.is_valid() && key->is_pressed() && !key->is_echo()) {
++		if (ED_IS_SHORTCUT("groups_editor/delete", p_event)) {
++			_menu_id_pressed(DELETE_GROUP);
++		} else if (ED_IS_SHORTCUT("groups_editor/rename", p_event)) {
++			_menu_id_pressed(RENAME_GROUP);
+ 		} else {
+-			item->set_selectable(0, false);
++			return;
+ 		}
++
++		accept_event();
+ 	}
+ }
+ 
+-void GroupsEditor::set_current(Node *p_node) {
+-	node = p_node;
+-	update_tree();
++void GroupsEditor::_bind_methods() {
++	ClassDB::bind_method("_update_tree", &GroupsEditor::_update_tree);
++	ClassDB::bind_method("_update_groups", &GroupsEditor::_update_groups);
++	ClassDB::bind_method("_update_groups_and_tree", &GroupsEditor::_update_groups_and_tree);
++
++	ClassDB::bind_method("_add_scene_group", &GroupsEditor::_add_scene_group);
++	ClassDB::bind_method("_rename_scene_group", &GroupsEditor::_rename_scene_group);
++	ClassDB::bind_method("_remove_scene_group", &GroupsEditor::_remove_scene_group);
++	ClassDB::bind_method("_set_group_checked", &GroupsEditor::_set_group_checked);
+ }
+ 
+-void GroupsEditor::_show_group_dialog() {
+-	group_dialog->edit();
+-}
++void GroupsEditor::_node_removed(Node *p_node) {
++	if (scene_root_node == p_node) {
++		scene_groups_for_caching = scene_groups;
++		callable_mp(this, &GroupsEditor::_cache_scene_groups).call_deferred(p_node);
++		scene_root_node = nullptr;
++	}
+ 
+-void GroupsEditor::_bind_methods() {
+-	ClassDB::bind_method("update_tree", &GroupsEditor::update_tree);
+-	ClassDB::bind_method("_group_selected", &GroupsEditor::_group_selected);
++	if (scene_root_node && scene_root_node == p_node->get_owner()) {
++		_queue_update_groups_and_tree();
++	}
+ }
+ 
+ GroupsEditor::GroupsEditor() {
+ 	node = nullptr;
++	scene_tree = SceneTree::get_singleton();
+ 
+-	VBoxContainer *vbc = this;
+-
+-	group_dialog = memnew(GroupDialog);
+-
+-	add_child(group_dialog);
+-	group_dialog->connect("group_edited", callable_mp(this, &GroupsEditor::update_tree));
+-
+-	Button *group_dialog_button = memnew(Button);
+-	group_dialog_button->set_text(TTR("Manage Groups"));
+-	vbc->add_child(group_dialog_button);
+-	group_dialog_button->connect("pressed", callable_mp(this, &GroupsEditor::_show_group_dialog));
++	ED_SHORTCUT("groups_editor/delete", TTR("Delete"), Key::KEY_DELETE);
++	ED_SHORTCUT("groups_editor/rename", TTR("Rename"), Key::F2);
++	ED_SHORTCUT_OVERRIDE("groups_editor/rename", "macos", Key::ENTER);
+ 
+ 	HBoxContainer *hbc = memnew(HBoxContainer);
+-	vbc->add_child(hbc);
+-
+-	group_name = memnew(LineEdit);
+-	group_name->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+-	hbc->add_child(group_name);
+-	group_name->connect("text_submitted", callable_mp(this, &GroupsEditor::_add_group));
+-	group_name->connect("text_changed", callable_mp(this, &GroupsEditor::_group_name_changed));
++	add_child(hbc);
+ 
+ 	add = memnew(Button);
+-	add->set_text(TTR("Add"));
++	add->set_flat(true);
++	add->set_tooltip_text(TTR("Add a new group."));
++	add->connect("pressed", callable_mp(this, &GroupsEditor::_show_add_group_dialog));
+ 	hbc->add_child(add);
+-	add->connect("pressed", callable_mp(this, &GroupsEditor::_add_group).bind(String()));
++
++	filter = memnew(LineEdit);
++	filter->set_clear_button_enabled(true);
++	filter->set_placeholder(TTR("Filter Groups"));
++	filter->set_h_size_flags(SIZE_EXPAND_FILL);
++	filter->connect("text_changed", callable_mp(this, &GroupsEditor::_update_tree).unbind(1));
++	hbc->add_child(filter);
+ 
+ 	tree = memnew(Tree);
+-	vbc->add_child(tree);
+ 	tree->set_hide_root(true);
+-	tree->set_allow_reselect(true);
++	tree->set_v_size_flags(SIZE_EXPAND_FILL);
+ 	tree->set_allow_rmb_select(true);
+-	tree->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+-	tree->connect("item_selected", callable_mp(this, &GroupsEditor::_group_selected));
++	tree->set_select_mode(Tree::SelectMode::SELECT_SINGLE);
+ 	tree->connect("button_clicked", callable_mp(this, &GroupsEditor::_modify_group));
+-	tree->connect("item_edited", callable_mp(this, &GroupsEditor::_group_renamed));
+-	tree->add_theme_constant_override("draw_guides", 1);
+-	add_theme_constant_override("separation", 3 * EDSCALE);
++	tree->connect("item_mouse_selected", callable_mp(this, &GroupsEditor::_item_mouse_selected));
++	tree->connect("gui_input", callable_mp(this, &GroupsEditor::_groups_gui_input));
++	add_child(tree);
+ 
+-	error = memnew(AcceptDialog);
+-	add_child(error);
+-	error->get_ok_button()->set_text(TTR("Close"));
++	menu = memnew(PopupMenu);
++	menu->connect("id_pressed", callable_mp(this, &GroupsEditor::_menu_id_pressed));
++	tree->add_child(menu);
+ 
+-	_group_name_changed("");
++	ProjectSettingsEditor::get_singleton()->get_group_settings()->connect("group_changed", callable_mp(this, &GroupsEditor::_update_groups_and_tree));
+ }
+ 
+ GroupsEditor::~GroupsEditor() {
+diff --git a/editor/groups_editor.h b/editor/groups_editor.h
+index 27322b63da..cf74470b1b 100644
+--- a/editor/groups_editor.h
++++ b/editor/groups_editor.h
+@@ -34,105 +34,105 @@
+ #include "scene/gui/dialogs.h"
+ 
+ class Button;
++class CheckBox;
++class CheckButton;
++class EditorValidationPanel;
++class Label;
+ class LineEdit;
++class PopupMenu;
+ class Tree;
+ class TreeItem;
+ 
+-class GroupDialog : public AcceptDialog {
+-	GDCLASS(GroupDialog, AcceptDialog);
++class GroupsEditor : public VBoxContainer {
++	GDCLASS(GroupsEditor, VBoxContainer);
+ 
+-	AcceptDialog *error = nullptr;
++	const String GLOBAL_GROUP_PREFIX = "global_group/";
+ 
++	bool updating_tree = false;
++	bool updating_groups = false;
++	bool groups_dirty = false;
++	bool update_groups_and_tree_queued = false;
++
++	Node *node = nullptr;
++	Node *scene_root_node = nullptr;
+ 	SceneTree *scene_tree = nullptr;
+-	TreeItem *groups_root = nullptr;
+ 
+-	LineEdit *add_group_text = nullptr;
+-	Button *add_group_button = nullptr;
++	ConfirmationDialog *add_group_dialog = nullptr;
++	LineEdit *add_group_name = nullptr;
++	LineEdit *add_group_description = nullptr;
++	CheckButton *global_group_button = nullptr;
++	EditorValidationPanel *add_validation_panel = nullptr;
+ 
+-	Tree *groups = nullptr;
++	ConfirmationDialog *rename_group_dialog = nullptr;
++	LineEdit *rename_group = nullptr;
++	CheckBox *rename_check_box = nullptr;
++	EditorValidationPanel *rename_validation_panel = nullptr;
+ 
+-	Tree *nodes_to_add = nullptr;
+-	TreeItem *add_node_root = nullptr;
+-	LineEdit *add_filter = nullptr;
++	ConfirmationDialog *remove_group_dialog = nullptr;
++	CheckBox *remove_check_box = nullptr;
++	Label *remove_label = nullptr;
+ 
+-	Tree *nodes_to_remove = nullptr;
+-	TreeItem *remove_node_root = nullptr;
+-	LineEdit *remove_filter = nullptr;
++	PopupMenu *menu = nullptr;
+ 
+-	Label *group_empty = nullptr;
++	LineEdit *filter = nullptr;
++	Button *add = nullptr;
++	Tree *tree = nullptr;
+ 
+-	Button *add_button = nullptr;
+-	Button *remove_button = nullptr;
++	HashMap<Node *, HashMap<StringName, bool>> scene_groups_cache;
++	HashMap<StringName, bool> scene_groups_for_caching;
+ 
+-	String selected_group;
++	HashMap<StringName, bool> scene_groups;
++	HashMap<StringName, String> global_groups;
+ 
+-	void _group_selected();
++	void _update_scene_groups(Node *p_node);
++	void _cache_scene_groups(Node *p_node);
+ 
+-	void _remove_filter_changed(const String &p_filter);
+-	void _add_filter_changed(const String &p_filter);
++	void _show_add_group_dialog();
++	void _show_rename_group_dialog();
++	void _show_remove_group_dialog();
+ 
+-	void _add_pressed();
+-	void _removed_pressed();
+-	void _add_group_pressed(const String &p_name);
+-	void _add_group_text_changed(const String &p_new_text);
++	void _check_add();
++	void _check_rename();
++	void _validate_name(const String &p_name, EditorValidationPanel *p_validation_panel);
+ 
+-	void _group_renamed();
+-	void _rename_group_item(const String &p_old_name, const String &p_new_name);
++	void _update_tree();
+ 
+-	void _add_group(String p_name);
+-	void _modify_group_pressed(Object *p_item, int p_column, int p_id, MouseButton p_button);
+-	void _delete_group_item(const String &p_name);
++	void _update_groups();
++	void _load_scene_groups(Node *p_node);
+ 
+-	void _load_groups(Node *p_current);
+-	void _load_nodes(Node *p_current);
++	void _add_scene_group(const String &p_name);
++	void _rename_scene_group(const String &p_old_name, const String &p_new_name);
++	void _remove_scene_group(const String &p_name);
+ 
+-protected:
+-	void _notification(int p_what);
+-	static void _bind_methods();
++	bool _has_group(const String &p_name);
++	void _set_group_checked(const String &p_name, bool p_checked);
+ 
+-public:
+-	enum ModifyButton {
+-		DELETE_GROUP,
+-		COPY_GROUP,
+-	};
++	void _confirm_add();
++	void _confirm_rename();
++	void _confirm_delete();
+ 
+-	void edit();
++	void _item_edited();
++	void _item_mouse_selected(const Vector2 &p_pos, MouseButton p_mouse_button);
++	void _modify_group(Object *p_item, int p_column, int p_id, MouseButton p_mouse_button);
++	void _menu_id_pressed(int p_id);
+ 
+-	GroupDialog();
+-};
++	void _update_groups_and_tree();
++	void _queue_update_groups_and_tree();
+ 
+-class GroupsEditor : public VBoxContainer {
+-	GDCLASS(GroupsEditor, VBoxContainer);
++	void _groups_gui_input(Ref<InputEvent> p_event);
+ 
+-	Node *node = nullptr;
+-	TreeItem *groups_root = nullptr;
+-
+-	GroupDialog *group_dialog = nullptr;
+-	AcceptDialog *error = nullptr;
+-
+-	LineEdit *group_name = nullptr;
+-	Button *add = nullptr;
+-	Tree *tree = nullptr;
+-
+-	String selected_group;
+-
+-	void update_tree();
+-	void _add_group(const String &p_group = "");
+-	void _modify_group(Object *p_item, int p_column, int p_id, MouseButton p_button);
+-	void _group_name_changed(const String &p_new_text);
+-
+-	void _group_selected();
+-	void _group_renamed();
+-
+-	void _show_group_dialog();
++	void _node_removed(Node *p_node);
+ 
+ protected:
++	void _notification(int p_what);
+ 	static void _bind_methods();
+ 
+ public:
+ 	enum ModifyButton {
+ 		DELETE_GROUP,
+ 		COPY_GROUP,
++		RENAME_GROUP,
++		CONVERT_GROUP,
+ 	};
+ 
+ 	void set_current(Node *p_node);
+diff --git a/editor/project_settings_editor.cpp b/editor/project_settings_editor.cpp
+index 09de9cda49..d587737ed4 100644
+--- a/editor/project_settings_editor.cpp
++++ b/editor/project_settings_editor.cpp
+@@ -45,6 +45,7 @@ ProjectSettingsEditor *ProjectSettingsEditor::singleton = nullptr;
+ 
+ void ProjectSettingsEditor::connect_filesystem_dock_signals(FileSystemDock *p_fs_dock) {
+ 	localization_editor->connect_filesystem_dock_signals(p_fs_dock);
++	group_settings->connect_filesystem_dock_signals(p_fs_dock);
+ }
+ 
+ void ProjectSettingsEditor::popup_project_settings(bool p_clear_filter) {
+@@ -62,6 +63,7 @@ void ProjectSettingsEditor::popup_project_settings(bool p_clear_filter) {
+ 
+ 	localization_editor->update_translations();
+ 	autoload_settings->update_autoload();
++	group_settings->update_groups();
+ 	plugin_settings->update_plugins();
+ 	import_defaults_editor->clear();
+ 
+@@ -709,6 +711,11 @@ ProjectSettingsEditor::ProjectSettingsEditor(EditorData *p_data) {
+ 	shaders_global_shader_uniforms_editor->connect("globals_changed", callable_mp(this, &ProjectSettingsEditor::queue_save));
+ 	tab_container->add_child(shaders_global_shader_uniforms_editor);
+ 
++	group_settings = memnew(GroupSettingsEditor);
++	group_settings->set_name(TTR("Global Groups"));
++	group_settings->connect("group_changed", callable_mp(this, &ProjectSettingsEditor::queue_save));
++	tab_container->add_child(group_settings);
++
+ 	plugin_settings = memnew(EditorPluginSettings);
+ 	plugin_settings->set_name(TTR("Plugins"));
+ 	tab_container->add_child(plugin_settings);
+diff --git a/editor/project_settings_editor.h b/editor/project_settings_editor.h
+index eaac7e8c5a..1f18c68acc 100644
+--- a/editor/project_settings_editor.h
++++ b/editor/project_settings_editor.h
+@@ -37,6 +37,7 @@
+ #include "editor/editor_data.h"
+ #include "editor/editor_plugin_settings.h"
+ #include "editor/editor_sectioned_inspector.h"
++#include "editor/group_settings_editor.h"
+ #include "editor/import_defaults_editor.h"
+ #include "editor/localization_editor.h"
+ #include "editor/shader_globals_editor.h"
+@@ -58,6 +59,7 @@ class ProjectSettingsEditor : public AcceptDialog {
+ 	LocalizationEditor *localization_editor = nullptr;
+ 	EditorAutoloadSettings *autoload_settings = nullptr;
+ 	ShaderGlobalsEditor *shaders_global_shader_uniforms_editor = nullptr;
++	GroupSettingsEditor *group_settings = nullptr;
+ 	EditorPluginSettings *plugin_settings = nullptr;
+ 
+ 	LineEdit *search_box = nullptr;
+@@ -122,6 +124,7 @@ public:
+ 	void update_plugins();
+ 
+ 	EditorAutoloadSettings *get_autoload_settings() { return autoload_settings; }
++	GroupSettingsEditor *get_group_settings() { return group_settings; }
+ 	TabContainer *get_tabs() { return tab_container; }
+ 
+ 	void queue_save();
+diff --git a/scene/main/node.cpp b/scene/main/node.cpp
+index 820cb7571f..3cb06e769f 100644
+--- a/scene/main/node.cpp
++++ b/scene/main/node.cpp
+@@ -3069,8 +3069,13 @@ static void _add_nodes_to_options(const Node *p_base, const Node *p_node, List<S
+ 
+ void Node::get_argument_options(const StringName &p_function, int p_idx, List<String> *r_options) const {
+ 	String pf = p_function;
+-	if ((pf == "has_node" || pf == "get_node") && p_idx == 0) {
++	if (p_idx == 0 && (pf == "has_node" || pf == "get_node")) {
+ 		_add_nodes_to_options(this, this, r_options);
++	} else if (p_idx == 0 && (pf == "add_to_group" || pf == "remove_from_group" || pf == "is_in_group")) {
++		HashMap<StringName, String> global_groups = ProjectSettings::get_singleton()->get_global_groups_list();
++		for (const KeyValue<StringName, String> &E : global_groups) {
++			r_options->push_back(E.key.operator String().quote());
++		}
+ 	}
+ 	Object::get_argument_options(p_function, p_idx, r_options);
+ }
+diff --git a/scene/main/scene_tree.cpp b/scene/main/scene_tree.cpp
+index 4417007b9d..b6fbd70e14 100644
+--- a/scene/main/scene_tree.cpp
++++ b/scene/main/scene_tree.cpp
+@@ -1714,6 +1714,19 @@ void SceneTree::get_argument_options(const StringName &p_function, int p_idx, Li
+ 				filename = dir_access->get_next();
+ 			}
+ 		}
++	} else {
++		bool add_options = false;
++		if (p_idx == 0) {
++			add_options = p_function == "get_nodes_in_group" || p_function == "has_group" || p_function == "get_first_node_in_group" || p_function == "set_group" || p_function == "notify_group" || p_function == "call_group" || p_function == "add_to_group";
++		} else if (p_idx == 1) {
++			add_options = p_function == "set_group_flags" || p_function == "call_group_flags" || p_function == "notify_group_flags";
++		}
++		if (add_options) {
++			HashMap<StringName, String> global_groups = ProjectSettings::get_singleton()->get_global_groups_list();
++			for (const KeyValue<StringName, String> &E : global_groups) {
++				r_options->push_back(E.key.operator String().quote());
++			}
++		}
+ 	}
+ }
+ 
+diff --git a/scene/resources/packed_scene.cpp b/scene/resources/packed_scene.cpp
+index 1f6e453e88..de81b9d785 100644
+--- a/scene/resources/packed_scene.cpp
++++ b/scene/resources/packed_scene.cpp
+@@ -1849,6 +1849,44 @@ void SceneState::add_editable_instance(const NodePath &p_path) {
+ 	editable_instances.push_back(p_path);
+ }
+ 
++bool SceneState::remove_group_references(const StringName &p_name) {
++	bool edited = false;
++	for (NodeData &node : nodes) {
++		for (const int &group : node.groups) {
++			if (names[group] == p_name) {
++				node.groups.erase(group);
++				edited = true;
++				break;
++			}
++		}
++	}
++	return edited;
++}
++
++bool SceneState::rename_group_references(const StringName &p_old_name, const StringName &p_new_name) {
++	bool edited = false;
++	for (const NodeData &node : nodes) {
++		for (const int &group : node.groups) {
++			if (names[group] == p_old_name) {
++				names.write[group] = p_new_name;
++				edited = true;
++				break;
++			}
++		}
++	}
++	return edited;
++}
++
++HashSet<StringName> SceneState::get_all_groups() {
++	HashSet<StringName> ret;
++	for (const NodeData &node : nodes) {
++		for (const int &group : node.groups) {
++			ret.insert(names[group]);
++		}
++	}
++	return ret;
++}
++
+ Vector<String> SceneState::_get_node_groups(int p_idx) const {
+ 	Vector<StringName> groups = get_node_groups(p_idx);
+ 	Vector<String> ret;
+diff --git a/scene/resources/packed_scene.h b/scene/resources/packed_scene.h
+index 4b436a8385..e6cbc3e16b 100644
+--- a/scene/resources/packed_scene.h
++++ b/scene/resources/packed_scene.h
+@@ -204,6 +204,10 @@ public:
+ 	void add_connection(int p_from, int p_to, int p_signal, int p_method, int p_flags, int p_unbinds, const Vector<int> &p_binds);
+ 	void add_editable_instance(const NodePath &p_path);
+ 
++	bool remove_group_references(const StringName &p_name);
++	bool rename_group_references(const StringName &p_old_name, const StringName &p_new_name);
++	HashSet<StringName> get_all_groups();
++
+ 	virtual void set_last_modified_time(uint64_t p_time) { last_modified_time = p_time; }
+ 	uint64_t get_last_modified_time() const { return last_modified_time; }
+ 

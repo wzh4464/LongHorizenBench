@@ -1,0 +1,3645 @@
+diff --git a/src/hotspot/share/gc/g1/g1CollectedHeap.cpp b/src/hotspot/share/gc/g1/g1CollectedHeap.cpp
+index 6b2adcc8ff8..e9032d915a2 100644
+--- a/src/hotspot/share/gc/g1/g1CollectedHeap.cpp
++++ b/src/hotspot/share/gc/g1/g1CollectedHeap.cpp
+@@ -78,7 +78,6 @@
+ #include "gc/shared/gcBehaviours.hpp"
+ #include "gc/shared/gcHeapSummary.hpp"
+ #include "gc/shared/gcId.hpp"
+-#include "gc/shared/gcLocker.inline.hpp"
+ #include "gc/shared/gcTimer.hpp"
+ #include "gc/shared/gcTraceTime.inline.hpp"
+ #include "gc/shared/isGCActiveMark.hpp"
+@@ -411,13 +410,11 @@ HeapWord* G1CollectedHeap::attempt_allocation_slow(size_t word_size) {
+   // We should only get here after the first-level allocation attempt
+   // (attempt_allocation()) failed to allocate.
+ 
+-  // We will loop until a) we manage to successfully perform the
+-  // allocation or b) we successfully schedule a collection which
+-  // fails to perform the allocation. b) is the only case when we'll
+-  // return null.
++  // We will loop until a) we manage to successfully perform the allocation or b)
++  // successfully schedule a collection which fails to perform the allocation.
++  // Case b) is the only case when we'll return null.
+   HeapWord* result = nullptr;
+-  for (uint try_count = 1, gclocker_retry_count = 0; /* we'll return */; try_count += 1) {
+-    bool should_try_gc;
++  for (uint try_count = 1; /* we'll return */; try_count++) {
+     uint gc_count_before;
+ 
+     {
+@@ -430,67 +427,26 @@ HeapWord* G1CollectedHeap::attempt_allocation_slow(size_t word_size) {
+         return result;
+       }
+ 
+-      // If the GCLocker is active and we are bound for a GC, try expanding young gen.
+-      // This is different to when only GCLocker::needs_gc() is set: try to avoid
+-      // waiting because the GCLocker is active to not wait too long.
+-      if (GCLocker::is_active_and_needs_gc() && policy()->can_expand_young_list()) {
+-        // No need for an ergo message here, can_expand_young_list() does this when
+-        // it returns true.
+-        result = _allocator->attempt_allocation_force(word_size);
+-        if (result != nullptr) {
+-          return result;
+-        }
+-      }
+-
+-      // Only try a GC if the GCLocker does not signal the need for a GC. Wait until
+-      // the GCLocker initiated GC has been performed and then retry. This includes
+-      // the case when the GC Locker is not active but has not been performed.
+-      should_try_gc = !GCLocker::needs_gc();
+       // Read the GC count while still holding the Heap_lock.
+       gc_count_before = total_collections();
+     }
+ 
+-    if (should_try_gc) {
+-      bool succeeded;
+-      result = do_collection_pause(word_size, gc_count_before, &succeeded, GCCause::_g1_inc_collection_pause);
+-      if (result != nullptr) {
+-        assert(succeeded, "only way to get back a non-null result");
+-        log_trace(gc, alloc)("%s: Successfully scheduled collection returning " PTR_FORMAT,
+-                             Thread::current()->name(), p2i(result));
+-        return result;
+-      }
+-
+-      if (succeeded) {
+-        // We successfully scheduled a collection which failed to allocate. No
+-        // point in trying to allocate further. We'll just return null.
+-        log_trace(gc, alloc)("%s: Successfully scheduled collection failing to allocate "
+-                             SIZE_FORMAT " words", Thread::current()->name(), word_size);
+-        return nullptr;
+-      }
+-      log_trace(gc, alloc)("%s: Unsuccessfully scheduled collection allocating " SIZE_FORMAT " words",
+-                           Thread::current()->name(), word_size);
+-    } else {
+-      // Failed to schedule a collection.
+-      if (gclocker_retry_count > GCLockerRetryAllocationCount) {
+-        log_warning(gc, alloc)("%s: Retried waiting for GCLocker too often allocating "
+-                               SIZE_FORMAT " words", Thread::current()->name(), word_size);
+-        return nullptr;
+-      }
+-      log_trace(gc, alloc)("%s: Stall until clear", Thread::current()->name());
+-      // The GCLocker is either active or the GCLocker initiated
+-      // GC has not yet been performed. Stall until it is and
+-      // then retry the allocation.
+-      GCLocker::stall_until_clear();
+-      gclocker_retry_count += 1;
++    bool succeeded;
++    result = do_collection_pause(word_size, gc_count_before, &succeeded, GCCause::_g1_inc_collection_pause);
++    if (succeeded) {
++      log_trace(gc, alloc)("%s: Successfully scheduled collection returning " PTR_FORMAT,
++                           Thread::current()->name(), p2i(result));
++      return result;
+     }
+ 
+-    // We can reach here if we were unsuccessful in scheduling a
+-    // collection (because another thread beat us to it) or if we were
+-    // stalled due to the GC locker. In either can we should retry the
+-    // allocation attempt in case another thread successfully
+-    // performed a collection and reclaimed enough space. We do the
+-    // first attempt (without holding the Heap_lock) here and the
+-    // follow-on attempt will be at the start of the next loop
++    log_trace(gc, alloc)("%s: Unsuccessfully scheduled collection allocating " SIZE_FORMAT " words",
++                         Thread::current()->name(), word_size);
++
++    // We can reach here if we were unsuccessful in scheduling a collection (because
++    // another thread beat us to it). In this case immeditealy retry the allocation
++    // attempt because another thread successfully performed a collection and possibly
++    // reclaimed enough space. The first attempt (without holding the Heap_lock) is
++    // here and the follow-on attempt will be at the start of the next loop
+     // iteration (after taking the Heap_lock).
+     size_t dummy = 0;
+     result = _allocator->attempt_allocation(word_size, word_size, &dummy);
+@@ -673,13 +629,11 @@ HeapWord* G1CollectedHeap::attempt_allocation_humongous(size_t word_size) {
+     collect(GCCause::_g1_humongous_allocation);
+   }
+ 
+-  // We will loop until a) we manage to successfully perform the
+-  // allocation or b) we successfully schedule a collection which
+-  // fails to perform the allocation. b) is the only case when we'll
+-  // return null.
++  // We will loop until a) we manage to successfully perform the allocation or b)
++  // successfully schedule a collection which fails to perform the allocation.
++  // Case b) is the only case when we'll return null.
+   HeapWord* result = nullptr;
+-  for (uint try_count = 1, gclocker_retry_count = 0; /* we'll return */; try_count += 1) {
+-    bool should_try_gc;
++  for (uint try_count = 1; /* we'll return */; try_count++) {
+     uint gc_count_before;
+ 
+ 
+@@ -697,64 +651,35 @@ HeapWord* G1CollectedHeap::attempt_allocation_humongous(size_t word_size) {
+         return result;
+       }
+ 
+-      // Only try a GC if the GCLocker does not signal the need for a GC. Wait until
+-      // the GCLocker initiated GC has been performed and then retry. This includes
+-      // the case when the GC Locker is not active but has not been performed.
+-      should_try_gc = !GCLocker::needs_gc();
+       // Read the GC count while still holding the Heap_lock.
+       gc_count_before = total_collections();
+     }
+ 
+-    if (should_try_gc) {
+-      bool succeeded;
+-      result = do_collection_pause(word_size, gc_count_before, &succeeded, GCCause::_g1_humongous_allocation);
++    bool succeeded;
++    result = do_collection_pause(word_size, gc_count_before, &succeeded, GCCause::_g1_humongous_allocation);
++    if (succeeded) {
++      log_trace(gc, alloc)("%s: Successfully scheduled collection returning " PTR_FORMAT,
++                           Thread::current()->name(), p2i(result));
+       if (result != nullptr) {
+-        assert(succeeded, "only way to get back a non-null result");
+-        log_trace(gc, alloc)("%s: Successfully scheduled collection returning " PTR_FORMAT,
+-                             Thread::current()->name(), p2i(result));
+         size_t size_in_regions = humongous_obj_size_in_regions(word_size);
+         policy()->old_gen_alloc_tracker()->
+           record_collection_pause_humongous_allocation(size_in_regions * HeapRegion::GrainBytes);
+-        return result;
+-      }
+-
+-      if (succeeded) {
+-        // We successfully scheduled a collection which failed to allocate. No
+-        // point in trying to allocate further. We'll just return null.
+-        log_trace(gc, alloc)("%s: Successfully scheduled collection failing to allocate "
+-                             SIZE_FORMAT " words", Thread::current()->name(), word_size);
+-        return nullptr;
+-      }
+-      log_trace(gc, alloc)("%s: Unsuccessfully scheduled collection allocating " SIZE_FORMAT "",
+-                           Thread::current()->name(), word_size);
+-    } else {
+-      // Failed to schedule a collection.
+-      if (gclocker_retry_count > GCLockerRetryAllocationCount) {
+-        log_warning(gc, alloc)("%s: Retried waiting for GCLocker too often allocating "
+-                               SIZE_FORMAT " words", Thread::current()->name(), word_size);
+-        return nullptr;
+       }
+-      log_trace(gc, alloc)("%s: Stall until clear", Thread::current()->name());
+-      // The GCLocker is either active or the GCLocker initiated
+-      // GC has not yet been performed. Stall until it is and
+-      // then retry the allocation.
+-      GCLocker::stall_until_clear();
+-      gclocker_retry_count += 1;
++      return result;
+     }
+ 
++    log_trace(gc, alloc)("%s: Unsuccessfully scheduled collection allocating " SIZE_FORMAT "",
++                         Thread::current()->name(), word_size);
+ 
+-    // We can reach here if we were unsuccessful in scheduling a
+-    // collection (because another thread beat us to it) or if we were
+-    // stalled due to the GC locker. In either can we should retry the
+-    // allocation attempt in case another thread successfully
+-    // performed a collection and reclaimed enough space.
++    // We can reach here if we were unsuccessful in scheduling a collection (because
++    // another thread beat us to it).
+     // Humongous object allocation always needs a lock, so we wait for the retry
+     // in the next iteration of the loop, unlike for the regular iteration case.
+     // Give a warning if we seem to be looping forever.
+ 
+     if ((QueuedAllocationWarningCount > 0) &&
+         (try_count % QueuedAllocationWarningCount == 0)) {
+-      log_warning(gc, alloc)("%s: Retried allocation %u times for " SIZE_FORMAT " words",
++      log_warning(gc, alloc)("%s: Retried allocation %u times for %zu words",
+                              Thread::current()->name(), try_count, word_size);
+     }
+   }
+@@ -908,11 +833,6 @@ bool G1CollectedHeap::do_full_collection(bool clear_all_soft_refs,
+                                          bool do_maximal_compaction) {
+   assert_at_safepoint_on_vm_thread();
+ 
+-  if (GCLocker::check_active_before_gc()) {
+-    // Full GC was not completed.
+-    return false;
+-  }
+-
+   const bool do_clear_all_soft_refs = clear_all_soft_refs ||
+       soft_ref_policy()->should_clear_all_soft_refs();
+ 
+@@ -1269,9 +1189,11 @@ G1CollectedHeap::G1CollectedHeap() :
+ 
+   _humongous_object_threshold_in_words = humongous_threshold_for(HeapRegion::GrainWords);
+ 
+-  // Override the default _filler_array_max_size so that no humongous filler
+-  // objects are created.
+-  _filler_array_max_size = _humongous_object_threshold_in_words;
++  // Since filler arrays are never referenced, we can make them region sized.
++  // This simplifies filling up the region in case we have some potentially
++  // unreferenced (by Java code, but still in use by native code) pinned objects
++  // in there.
++  _filler_array_max_size = HeapRegion::GrainWords;
+ 
+   // Override the default _stack_chunk_max_size so that no humongous stack chunks are created
+   _stack_chunk_max_size = _humongous_object_threshold_in_words;
+@@ -1904,12 +1826,6 @@ bool G1CollectedHeap::try_collect_concurrently(GCCause::Cause cause,
+     // Collection failed and should be retried.
+     assert(op.transient_failure(), "invariant");
+ 
+-    if (GCLocker::is_active_and_needs_gc()) {
+-      // If GCLocker is active, wait until clear before retrying.
+-      LOG_COLLECT_CONCURRENTLY(cause, "gc-locker stall");
+-      GCLocker::stall_until_clear();
+-    }
+-
+     LOG_COLLECT_CONCURRENTLY(cause, "retry");
+   }
+ }
+@@ -1935,11 +1851,6 @@ bool G1CollectedHeap::try_collect_fullgc(GCCause::Cause cause,
+         return true;
+       }
+     }
+-
+-    if (GCLocker::is_active_and_needs_gc()) {
+-      // If GCLocker is active, wait until clear before retrying.
+-      GCLocker::stall_until_clear();
+-    }
+   }
+ }
+ 
+@@ -1949,11 +1860,6 @@ bool G1CollectedHeap::try_collect(GCCause::Cause cause,
+     return try_collect_concurrently(cause,
+                                     counters_before.total_collections(),
+                                     counters_before.old_marking_cycles_started());
+-  } else if (GCLocker::should_discard(cause, counters_before.total_collections())) {
+-    // Indicate failure to be consistent with VMOp failure due to
+-    // another collection slipping in after our gc_count but before
+-    // our request is processed.
+-    return false;
+   } else if (cause == GCCause::_gc_locker || cause == GCCause::_wb_young_gc
+              DEBUG_ONLY(|| cause == GCCause::_scavenge_alot)) {
+ 
+@@ -2179,14 +2085,6 @@ bool G1CollectedHeap::is_obj_dead_cond(const oop obj,
+   return false; // keep some compilers happy
+ }
+ 
+-void G1CollectedHeap::pin_object(JavaThread* thread, oop obj) {
+-  GCLocker::lock_critical(thread);
+-}
+-
+-void G1CollectedHeap::unpin_object(JavaThread* thread, oop obj) {
+-  GCLocker::unlock_critical(thread);
+-}
+-
+ void G1CollectedHeap::print_heap_regions() const {
+   LogTarget(Trace, gc, heap, region) lt;
+   if (lt.is_enabled()) {
+@@ -2489,10 +2387,6 @@ bool G1CollectedHeap::do_collection_pause_at_safepoint() {
+   assert_at_safepoint_on_vm_thread();
+   guarantee(!is_gc_active(), "collection is not reentrant");
+ 
+-  if (GCLocker::check_active_before_gc()) {
+-    return false;
+-  }
+-
+   do_collection_pause_at_safepoint_helper();
+   return true;
+ }
+@@ -2647,6 +2541,8 @@ void G1CollectedHeap::free_region(HeapRegion* hr, FreeRegionList* free_list) {
+   assert(!hr->is_free(), "the region should not be free");
+   assert(!hr->is_empty(), "the region should not be empty");
+   assert(_hrm.is_available(hr->hrm_index()), "region should be committed");
++  assert(!hr->has_pinned_objects(),
++         "must not free a region which contains pinned objects");
+ 
+   // Reset region metadata to allow reuse.
+   hr->hr_clear(true /* clear_space */);
+diff --git a/src/hotspot/share/gc/g1/g1CollectedHeap.hpp b/src/hotspot/share/gc/g1/g1CollectedHeap.hpp
+index 96cb75777a6..d8b0f6cc8d9 100644
+--- a/src/hotspot/share/gc/g1/g1CollectedHeap.hpp
++++ b/src/hotspot/share/gc/g1/g1CollectedHeap.hpp
+@@ -560,6 +560,9 @@ public:
+     return _monitoring_support;
+   }
+ 
++  void pin_object(JavaThread* thread, oop obj) override;
++  void unpin_object(JavaThread* thread, oop obj) override;
++
+   void resize_heap_if_necessary();
+ 
+   // Check if there is memory to uncommit and if so schedule a task to do it.
+@@ -613,7 +616,7 @@ public:
+   // We register a region with the fast "in collection set" test. We
+   // simply set to true the array slot corresponding to this region.
+   void register_young_region_with_region_attr(HeapRegion* r) {
+-    _region_attr.set_in_young(r->hrm_index());
++    _region_attr.set_in_young(r->hrm_index(), r->has_pinned_objects());
+   }
+   inline void register_new_survivor_region_with_region_attr(HeapRegion* r);
+   inline void register_region_with_region_attr(HeapRegion* r);
+@@ -1292,9 +1295,6 @@ public:
+   G1HeapSummary create_g1_heap_summary();
+   G1EvacSummary create_g1_evac_summary(G1EvacStats* stats);
+ 
+-  void pin_object(JavaThread* thread, oop obj) override;
+-  void unpin_object(JavaThread* thread, oop obj) override;
+-
+   // Printing
+ private:
+   void print_heap_regions() const;
+diff --git a/src/hotspot/share/gc/g1/g1CollectedHeap.inline.hpp b/src/hotspot/share/gc/g1/g1CollectedHeap.inline.hpp
+index 05d3a65fd59..7b81a93abe1 100644
+--- a/src/hotspot/share/gc/g1/g1CollectedHeap.inline.hpp
++++ b/src/hotspot/share/gc/g1/g1CollectedHeap.inline.hpp
+@@ -209,6 +209,8 @@ G1HeapRegionAttr G1CollectedHeap::region_attr(uint idx) const {
+ }
+ 
+ void G1CollectedHeap::register_humongous_candidate_region_with_region_attr(uint index) {
++  assert(!region_at(index)->has_pinned_objects(), "must be");
++  assert(region_at(index)->rem_set()->is_complete(), "must be");
+   _region_attr.set_humongous_candidate(index);
+ }
+ 
+@@ -218,9 +220,12 @@ void G1CollectedHeap::register_new_survivor_region_with_region_attr(HeapRegion*
+ 
+ void G1CollectedHeap::register_region_with_region_attr(HeapRegion* r) {
+   _region_attr.set_remset_is_tracked(r->hrm_index(), r->rem_set()->is_tracked());
++  _region_attr.set_is_pinned(r->hrm_index(), r->has_pinned_objects());
+ }
+ 
+ void G1CollectedHeap::register_old_region_with_region_attr(HeapRegion* r) {
++  assert(!r->has_pinned_objects(), "must be");
++  assert(r->rem_set()->is_complete(), "must be");
+   _region_attr.set_in_old(r->hrm_index(), r->rem_set()->is_tracked());
+   _rem_set->exclude_region_from_scan(r->hrm_index());
+ }
+@@ -257,6 +262,21 @@ inline bool G1CollectedHeap::is_obj_dead(const oop obj, const HeapRegion* hr) co
+   }
+ }
+ 
++inline void G1CollectedHeap::pin_object(JavaThread* thread, oop obj) {
++  assert(obj != nullptr, "obj must not be null");
++  assert(!is_gc_active(), "must not pin objects during a GC");
++  assert(obj->is_typeArray(), "must be typeArray");
++  HeapRegion *r = heap_region_containing(obj);
++  r->increment_pinned_object_count();
++}
++
++inline void G1CollectedHeap::unpin_object(JavaThread* thread, oop obj) {
++  assert(obj != nullptr, "obj must not be null");
++  assert(!is_gc_active(), "must not unpin objects during a GC");
++  HeapRegion *r = heap_region_containing(obj);
++  r->decrement_pinned_object_count();
++}
++
+ inline bool G1CollectedHeap::is_obj_dead(const oop obj) const {
+   assert(obj != nullptr, "precondition");
+ 
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSet.cpp b/src/hotspot/share/gc/g1/g1CollectionSet.cpp
+index 3c43d6ec100..30787adbe54 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSet.cpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSet.cpp
+@@ -270,6 +270,9 @@ void G1CollectionSet::print(outputStream* st) {
+ }
+ #endif // !PRODUCT
+ 
++// Always evacuate out pinned regions (apart from object types that can actually be
++// pinned by JNI) to allow faster future evacuation. We already "paid" for this work
++// when sizing the young generation.
+ double G1CollectionSet::finalize_young_part(double target_pause_time_ms, G1SurvivorRegions* survivors) {
+   Ticks start_time = Ticks::now();
+ 
+@@ -317,6 +320,19 @@ static int compare_region_idx(const uint a, const uint b) {
+   return static_cast<int>(a-b);
+ }
+ 
++// The current mechanism skips evacuation of pinned old regions like g1 does for
++// young regions:
++// * evacuating pinned marking collection set candidate regions (available during mixed
++//   gc) like young regions would not result in any memory gain but only take additional
++//   time away from processing regions that would actually result in memory being freed.
++//   To advance mixed gc progress (we committed to evacuate all marking collection set
++//   candidate regions within the maximum number of mixed gcs in the phase), move them
++//   to the optional collection set candidates to reclaim them asap as time permits.
++// * evacuating out retained collection set candidates would also just take up time with
++//   no actual space freed in old gen. Better to concentrate on others.
++//   Retained collection set candidates are aged out, ie. made to regular old regions
++//   without remembered sets after a few attempts to save computation costs of keeping
++//   them candidates for very long living pinned regions.
+ void G1CollectionSet::finalize_old_part(double time_remaining_ms) {
+   double non_young_start_time_sec = os::elapsedTime();
+ 
+@@ -325,12 +341,15 @@ void G1CollectionSet::finalize_old_part(double time_remaining_ms) {
+ 
+     G1CollectionCandidateRegionList initial_old_regions;
+     assert(_optional_old_regions.length() == 0, "must be");
++    G1CollectionCandidateRegionList pinned_marking_regions;
++    G1CollectionCandidateRegionList pinned_retained_regions;
+ 
+     if (collector_state()->in_mixed_phase()) {
+       time_remaining_ms = _policy->select_candidates_from_marking(&candidates()->marking_regions(),
+                                                                   time_remaining_ms,
+                                                                   &initial_old_regions,
+-                                                                  &_optional_old_regions);
++                                                                  &_optional_old_regions,
++                                                                  &pinned_marking_regions);
+     } else {
+       log_debug(gc, ergo, cset)("Do not add marking candidates to collection set due to pause type.");
+     }
+@@ -338,12 +357,20 @@ void G1CollectionSet::finalize_old_part(double time_remaining_ms) {
+     _policy->select_candidates_from_retained(&candidates()->retained_regions(),
+                                              time_remaining_ms,
+                                              &initial_old_regions,
+-                                             &_optional_old_regions);
++                                             &_optional_old_regions,
++                                             &pinned_retained_regions);
+ 
+     // Move initially selected old regions to collection set directly.
+     move_candidates_to_collection_set(&initial_old_regions);
+     // Only prepare selected optional regions for now.
+     prepare_optional_regions(&_optional_old_regions);
++    // Move pinned marking regions we came across to retained candidates so that
++    // there is progress in the mixed gc phase.
++    move_pinned_marking_to_retained(&pinned_marking_regions);
++    // Drop pinned retained regions to make progress with retained regions. Regions
++    // in that list must have been pinned for at least G1NumCollectionsKeepPinned
++    // GCs and hence are considered "long lived".
++    drop_pinned_retained_regions(&pinned_retained_regions);
+ 
+     candidates()->verify();
+   } else {
+@@ -378,6 +405,32 @@ void G1CollectionSet::prepare_optional_regions(G1CollectionCandidateRegionList*
+   }
+ }
+ 
++void G1CollectionSet::move_pinned_marking_to_retained(G1CollectionCandidateRegionList* regions) {
++  if (regions->length() == 0) {
++    return;
++  }
++  candidates()->remove(regions);
++
++  for (HeapRegion* r : *regions) {
++    assert(r->has_pinned_objects(), "must be pinned");
++    assert(r->rem_set()->is_complete(), "must be complete");
++    candidates()->add_retained_region_unsorted(r);
++  }
++  candidates()->sort_by_efficiency();
++}
++
++void G1CollectionSet::drop_pinned_retained_regions(G1CollectionCandidateRegionList* regions) {
++  if (regions->length() == 0) {
++    return;
++  }
++  candidates()->remove(regions);
++
++  // We can now drop these region's remembered sets.
++  for (HeapRegion* r : *regions) {
++    r->rem_set()->clear(true /* only_cardset */);
++  }
++}
++
+ void G1CollectionSet::finalize_initial_collection_set(double target_pause_time_ms, G1SurvivorRegions* survivor) {
+   double time_remaining_ms = finalize_young_part(target_pause_time_ms, survivor);
+   finalize_old_part(time_remaining_ms);
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSet.hpp b/src/hotspot/share/gc/g1/g1CollectionSet.hpp
+index 133246a5208..fba166e9c75 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSet.hpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSet.hpp
+@@ -177,6 +177,12 @@ class G1CollectionSet {
+   // Prepares old regions in the given set for optional collection later. Does not
+   // add the region to collection set yet.
+   void prepare_optional_regions(G1CollectionCandidateRegionList* regions);
++  // Moves given old regions from the marking candidates to the retained candidates.
++  // This makes sure that marking candidates will not remain there to unnecessarily
++  // prolong the mixed phase.
++  void move_pinned_marking_to_retained(G1CollectionCandidateRegionList* regions);
++  // Removes the given list of regions from the retained candidates.
++  void drop_pinned_retained_regions(G1CollectionCandidateRegionList* regions);
+ 
+   // Finalize the young part of the initial collection set. Relabel survivor regions
+   // as Eden and calculate a prediction on how long the evacuation of all young regions
+@@ -186,8 +192,8 @@ class G1CollectionSet {
+   // can use them.
+   void finalize_incremental_building();
+ 
+-  // Select the old regions of the initial collection set and determine how many optional
+-  // regions we might be able to evacuate in this pause.
++  // Select the regions comprising the initial and optional collection set from marking
++  // and retained collection set candidates.
+   void finalize_old_part(double time_remaining_ms);
+ 
+   // Iterate the part of the collection set given by the offset and length applying the given
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.cpp b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.cpp
+index 426e96ea779..9f903bc924f 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.cpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.cpp
+@@ -31,15 +31,15 @@
+ 
+ G1CollectionCandidateList::G1CollectionCandidateList() : _candidates(2, mtGC) { }
+ 
+-void G1CollectionCandidateList::set(G1CollectionCandidateList::CandidateInfo* candidate_infos, uint num_infos) {
++void G1CollectionCandidateList::set(G1CollectionSetCandidateInfo* candidate_infos, uint num_infos) {
+   assert(_candidates.is_empty(), "must be");
+ 
+-  GrowableArrayFromArray<G1CollectionCandidateList::CandidateInfo> a(candidate_infos, (int)num_infos);
++  GrowableArrayFromArray<G1CollectionSetCandidateInfo> a(candidate_infos, (int)num_infos);
+   _candidates.appendAll(&a);
+ }
+ 
+ void G1CollectionCandidateList::append_unsorted(HeapRegion* r) {
+-  CandidateInfo c(r, r->calc_gc_efficiency());
++  G1CollectionSetCandidateInfo c(r, r->calc_gc_efficiency());
+   _candidates.append(c);
+ }
+ 
+@@ -58,7 +58,7 @@ void G1CollectionCandidateList::remove(G1CollectionCandidateRegionList* other) {
+   // Create a list from scratch, copying over the elements from the candidate
+   // list not in the other list. Finally deallocate and overwrite the old list.
+   int new_length = _candidates.length() - other->length();
+-  GrowableArray<CandidateInfo> new_list(new_length, mtGC);
++  GrowableArray<G1CollectionSetCandidateInfo> new_list(new_length, mtGC);
+ 
+   uint other_idx = 0;
+ 
+@@ -81,10 +81,10 @@ void G1CollectionCandidateList::clear() {
+ 
+ #ifndef PRODUCT
+ void G1CollectionCandidateList::verify() {
+-  CandidateInfo* prev = nullptr;
++  G1CollectionSetCandidateInfo* prev = nullptr;
+ 
+   for (uint i = 0; i < (uint)_candidates.length(); i++) {
+-    CandidateInfo& ci = _candidates.at(i);
++    G1CollectionSetCandidateInfo& ci = _candidates.at(i);
+     assert(prev == nullptr || prev->_gc_efficiency >= ci._gc_efficiency,
+            "Stored gc efficiency must be descending from region %u to %u",
+            prev->_r->hrm_index(), ci._r->hrm_index());
+@@ -94,7 +94,7 @@ void G1CollectionCandidateList::verify() {
+ }
+ #endif
+ 
+-int G1CollectionCandidateList::compare(CandidateInfo* ci1, CandidateInfo* ci2) {
++int G1CollectionCandidateList::compare(G1CollectionSetCandidateInfo* ci1, G1CollectionSetCandidateInfo* ci2) {
+   // Make sure that null entries are moved to the end.
+   if (ci1->_r == nullptr) {
+     if (ci2->_r == nullptr) {
+@@ -182,7 +182,7 @@ void G1CollectionSetCandidates::clear() {
+   _last_marking_candidates_length = 0;
+ }
+ 
+-void G1CollectionSetCandidates::set_candidates_from_marking(G1CollectionCandidateList::CandidateInfo* candidate_infos,
++void G1CollectionSetCandidates::set_candidates_from_marking(G1CollectionSetCandidateInfo* candidate_infos,
+                                                             uint num_infos) {
+   assert(_marking_regions.length() == 0, "must be empty before adding new ones");
+ 
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.hpp b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.hpp
+index 4b0ec643aa9..4eb5523d039 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.hpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.hpp
+@@ -26,6 +26,8 @@
+ #define SHARE_GC_G1_G1COLLECTIONSETCANDIDATES_HPP
+ 
+ #include "gc/g1/g1CollectionSetCandidates.hpp"
++#include "gc/g1/g1_globals.hpp"
++#include "gc/shared/gc_globals.hpp"
+ #include "gc/shared/workerThread.hpp"
+ #include "memory/allocation.hpp"
+ #include "runtime/globals.hpp"
+@@ -64,6 +66,20 @@ public:
+   G1CollectionCandidateRegionListIterator end() const { return _regions.end(); }
+ };
+ 
++struct G1CollectionSetCandidateInfo {
++  HeapRegion* _r;
++  double _gc_efficiency;
++  uint _num_unreclaimed;          // Number of GCs this region has been found unreclaimable.
++
++  G1CollectionSetCandidateInfo() : G1CollectionSetCandidateInfo(nullptr, 0.0) { }
++  G1CollectionSetCandidateInfo(HeapRegion* r, double gc_efficiency) : _r(r), _gc_efficiency(gc_efficiency), _num_unreclaimed(0) { }
++
++  bool update_num_unreclaimed() {
++    ++_num_unreclaimed;
++    return _num_unreclaimed < G1NumCollectionsKeepPinned;
++  }
++};
++
+ class G1CollectionCandidateListIterator : public StackObj {
+   G1CollectionCandidateList* _which;
+   uint _position;
+@@ -72,7 +88,7 @@ public:
+   G1CollectionCandidateListIterator(G1CollectionCandidateList* which, uint position);
+ 
+   G1CollectionCandidateListIterator& operator++();
+-  HeapRegion* operator*();
++  G1CollectionSetCandidateInfo* operator*();
+ 
+   bool operator==(const G1CollectionCandidateListIterator& rhs);
+   bool operator!=(const G1CollectionCandidateListIterator& rhs);
+@@ -83,23 +99,13 @@ public:
+ class G1CollectionCandidateList : public CHeapObj<mtGC> {
+   friend class G1CollectionCandidateListIterator;
+ 
+-public:
+-  struct CandidateInfo {
+-    HeapRegion* _r;
+-    double _gc_efficiency;
+-
+-    CandidateInfo() : CandidateInfo(nullptr, 0.0) { }
+-    CandidateInfo(HeapRegion* r, double gc_efficiency) : _r(r), _gc_efficiency(gc_efficiency) { }
+-  };
+-
+-private:
+-  GrowableArray<CandidateInfo> _candidates;
++  GrowableArray<G1CollectionSetCandidateInfo> _candidates;
+ 
+ public:
+   G1CollectionCandidateList();
+ 
+   // Put the given set of candidates into this list, preserving the efficiency ordering.
+-  void set(CandidateInfo* candidate_infos, uint num_infos);
++  void set(G1CollectionSetCandidateInfo* candidate_infos, uint num_infos);
+   // Add the given HeapRegion to this list at the end, (potentially) making the list unsorted.
+   void append_unsorted(HeapRegion* r);
+   // Restore sorting order by decreasing gc efficiency, using the existing efficiency
+@@ -114,7 +120,7 @@ public:
+ 
+   void clear();
+ 
+-  CandidateInfo& at(uint position) { return _candidates.at(position); }
++  G1CollectionSetCandidateInfo& at(uint position) { return _candidates.at(position); }
+ 
+   uint length() const { return (uint)_candidates.length(); }
+ 
+@@ -123,7 +129,7 @@ public:
+   // Comparison function to order regions in decreasing GC efficiency order. This
+   // will cause regions with a lot of live objects and large remembered sets to end
+   // up at the end of the list.
+-  static int compare(CandidateInfo* ci1, CandidateInfo* ci2);
++  static int compare(G1CollectionSetCandidateInfo* ci1, G1CollectionSetCandidateInfo* ci2);
+ 
+   G1CollectionCandidateListIterator begin() {
+     return G1CollectionCandidateListIterator(this, 0);
+@@ -138,9 +144,9 @@ public:
+ // of the regions returned.
+ class G1CollectionSetCandidatesIterator : public StackObj {
+   G1CollectionSetCandidates* _which;
+-  uint _position;
++    uint _position;
+ 
+-public:
++  public:
+   G1CollectionSetCandidatesIterator(G1CollectionSetCandidates* which, uint position);
+ 
+   G1CollectionSetCandidatesIterator& operator++();
+@@ -198,7 +204,7 @@ public:
+ 
+   // Merge collection set candidates from marking into the current marking list
+   // (which needs to be empty).
+-  void set_candidates_from_marking(G1CollectionCandidateList::CandidateInfo* candidate_infos,
++  void set_candidates_from_marking(G1CollectionSetCandidateInfo* candidate_infos,
+                                    uint num_infos);
+   // The most recent length of the list that had been merged last via
+   // set_candidates_from_marking(). Used for calculating minimum collection set
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.inline.hpp b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.inline.hpp
+index 0d391e6bebf..638a50b4745 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSetCandidates.inline.hpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSetCandidates.inline.hpp
+@@ -38,8 +38,8 @@ inline G1CollectionCandidateListIterator& G1CollectionCandidateListIterator::ope
+   return *this;
+ }
+ 
+-inline HeapRegion* G1CollectionCandidateListIterator::operator*() {
+-  return _which->_candidates.at(_position)._r;
++inline G1CollectionSetCandidateInfo* G1CollectionCandidateListIterator::operator*() {
++  return &_which->_candidates.at(_position);
+ }
+ 
+ inline bool G1CollectionCandidateListIterator::operator==(const G1CollectionCandidateListIterator& rhs) {
+diff --git a/src/hotspot/share/gc/g1/g1CollectionSetChooser.cpp b/src/hotspot/share/gc/g1/g1CollectionSetChooser.cpp
+index 28132ea172b..f19488a49a8 100644
+--- a/src/hotspot/share/gc/g1/g1CollectionSetChooser.cpp
++++ b/src/hotspot/share/gc/g1/g1CollectionSetChooser.cpp
+@@ -39,7 +39,7 @@
+ // moved to the destination.
+ class G1BuildCandidateRegionsTask : public WorkerTask {
+ 
+-  using CandidateInfo = G1CollectionCandidateList::CandidateInfo;
++  using CandidateInfo = G1CollectionSetCandidateInfo;
+ 
+   // Work area for building the set of collection set candidates. Contains references
+   // to heap regions with their GC efficiencies calculated. To reduce contention
+diff --git a/src/hotspot/share/gc/g1/g1ConcurrentMark.cpp b/src/hotspot/share/gc/g1/g1ConcurrentMark.cpp
+index a9bafa44664..fb99e028c62 100644
+--- a/src/hotspot/share/gc/g1/g1ConcurrentMark.cpp
++++ b/src/hotspot/share/gc/g1/g1ConcurrentMark.cpp
+@@ -1363,7 +1363,10 @@ class G1ReclaimEmptyRegionsTask : public WorkerTask {
+     uint humongous_regions_removed() { return _humongous_regions_removed; }
+ 
+     bool do_heap_region(HeapRegion *hr) {
+-      if (hr->used() > 0 && hr->live_bytes() == 0 && !hr->is_young()) {
++      bool can_reclaim = hr->used() > 0 && hr->live_bytes() == 0 &&
++                         !hr->is_young() && !hr->has_pinned_objects();
++
++      if (can_reclaim) {
+         log_trace(gc, marking)("Reclaimed empty old gen region %u (%s) bot " PTR_FORMAT,
+                                hr->hrm_index(), hr->get_short_type_str(), p2i(hr->bottom()));
+         _freed_bytes += hr->used();
+diff --git a/src/hotspot/share/gc/g1/g1EvacFailureRegions.cpp b/src/hotspot/share/gc/g1/g1EvacFailureRegions.cpp
+index 6964028d1f8..a308fe7a393 100644
+--- a/src/hotspot/share/gc/g1/g1EvacFailureRegions.cpp
++++ b/src/hotspot/share/gc/g1/g1EvacFailureRegions.cpp
+@@ -33,29 +33,35 @@
+ #include "utilities/bitMap.inline.hpp"
+ 
+ G1EvacFailureRegions::G1EvacFailureRegions() :
+-  _regions_failed_evacuation(mtGC),
+-  _evac_failure_regions(nullptr),
+-  _evac_failure_regions_cur_length(0) { }
++  _regions_evac_failed(mtGC),
++  _regions_pinned(mtGC),
++  _regions_alloc_failed(mtGC),
++  _evac_failed_regions(nullptr),
++  _num_regions_evac_failed(0) { }
+ 
+ G1EvacFailureRegions::~G1EvacFailureRegions() {
+-  assert(_evac_failure_regions == nullptr, "not cleaned up");
++  assert(_evac_failed_regions == nullptr, "not cleaned up");
+ }
+ 
+ void G1EvacFailureRegions::pre_collection(uint max_regions) {
+-  Atomic::store(&_evac_failure_regions_cur_length, 0u);
+-  _regions_failed_evacuation.resize(max_regions);
+-  _evac_failure_regions = NEW_C_HEAP_ARRAY(uint, max_regions, mtGC);
++  Atomic::store(&_num_regions_evac_failed, 0u);
++  _regions_evac_failed.resize(max_regions);
++  _regions_pinned.resize(max_regions);
++  _regions_alloc_failed.resize(max_regions);
++  _evac_failed_regions = NEW_C_HEAP_ARRAY(uint, max_regions, mtGC);
+ }
+ 
+ void G1EvacFailureRegions::post_collection() {
+-  _regions_failed_evacuation.resize(0);
++  _regions_evac_failed.resize(0);
++  _regions_pinned.resize(0);
++  _regions_alloc_failed.resize(0);
+ 
+-  FREE_C_HEAP_ARRAY(uint, _evac_failure_regions);
+-  _evac_failure_regions = nullptr;
++  FREE_C_HEAP_ARRAY(uint, _evac_failed_regions);
++  _evac_failed_regions = nullptr;
+ }
+ 
+ bool G1EvacFailureRegions::contains(uint region_idx) const {
+-  return _regions_failed_evacuation.par_at(region_idx, memory_order_relaxed);
++  return _regions_evac_failed.par_at(region_idx, memory_order_relaxed);
+ }
+ 
+ void G1EvacFailureRegions::par_iterate(HeapRegionClosure* closure,
+@@ -63,7 +69,7 @@ void G1EvacFailureRegions::par_iterate(HeapRegionClosure* closure,
+                                        uint worker_id) const {
+   G1CollectedHeap::heap()->par_iterate_regions_array(closure,
+                                                      hrclaimer,
+-                                                     _evac_failure_regions,
+-                                                     Atomic::load(&_evac_failure_regions_cur_length),
++                                                     _evac_failed_regions,
++                                                     Atomic::load(&_num_regions_evac_failed),
+                                                      worker_id);
+ }
+diff --git a/src/hotspot/share/gc/g1/g1EvacFailureRegions.hpp b/src/hotspot/share/gc/g1/g1EvacFailureRegions.hpp
+index 043d69ff143..b8f9ea80038 100644
+--- a/src/hotspot/share/gc/g1/g1EvacFailureRegions.hpp
++++ b/src/hotspot/share/gc/g1/g1EvacFailureRegions.hpp
+@@ -25,32 +25,43 @@
+ #ifndef SHARE_GC_G1_G1EVACFAILUREREGIONS_HPP
+ #define SHARE_GC_G1_G1EVACFAILUREREGIONS_HPP
+ 
+-#include "runtime/atomic.hpp"
+ #include "utilities/bitMap.hpp"
+ 
+ class G1AbstractSubTask;
+-class G1HeapRegionChunkClosure;
+ class HeapRegionClosure;
+ class HeapRegionClaimer;
+ 
+-// This class records for every region on the heap whether evacuation failed for it,
+-// and records for every evacuation failure region to speed up iteration of these
+-// regions in post evacuation phase.
++// This class records for every region on the heap whether it had experienced an
++// evacuation failure.
++// An evacuation failure may occur due to pinning or due to allocation failure
++// (not enough to-space). For every such occurrence the class records region
++// information to speed up iteration of these regions in various gc phases.
++//
++// Pinned regions may experience an allocation failure at the same time as G1
++// tries to evacuate anything but objects that are possible to be pinned. So
++//
++//   _num_regions_pinned + _num_regions_alloc_failed >= _num_regions_evac_failed
++//
+ class G1EvacFailureRegions {
+-  // Records for every region on the heap whether evacuation failed for it.
+-  CHeapBitMap _regions_failed_evacuation;
+-  // Regions (index) of evacuation failed in the current collection.
+-  uint* _evac_failure_regions;
++  // Records for every region on the heap whether the region has experienced an
++  // evacuation failure.
++  CHeapBitMap _regions_evac_failed;
++  // Records for every region on the heap whether the evacuation failure cause
++  // has been allocation failure or region pinning.
++  CHeapBitMap _regions_pinned;
++  CHeapBitMap _regions_alloc_failed;
++  // Evacuation failed regions (indexes) in the current collection.
++  uint* _evac_failed_regions;
+   // Number of regions evacuation failed in the current collection.
+-  volatile uint _evac_failure_regions_cur_length;
++  volatile uint _num_regions_evac_failed;
+ 
+ public:
+   G1EvacFailureRegions();
+   ~G1EvacFailureRegions();
+ 
+   uint get_region_idx(uint idx) const {
+-    assert(idx < _evac_failure_regions_cur_length, "precondition");
+-    return _evac_failure_regions[idx];
++    assert(idx < _num_regions_evac_failed, "precondition");
++    return _evac_failed_regions[idx];
+   }
+ 
+   // Sets up the bitmap and failed regions array for addition.
+@@ -66,18 +77,16 @@ public:
+   // Return a G1AbstractSubTask which does necessary preparation for evacuation failed regions
+   G1AbstractSubTask* create_prepare_regions_task();
+ 
+-  uint num_regions_failed_evacuation() const {
+-    return Atomic::load(&_evac_failure_regions_cur_length);
+-  }
++  inline uint num_regions_evac_failed() const;
+ 
+-  bool evacuation_failed() const {
+-    return num_regions_failed_evacuation() > 0;
+-  }
++  inline bool has_regions_evac_failed() const;
++  inline bool has_regions_evac_pinned() const;
++  inline bool has_regions_alloc_failed() const;
+ 
+   // Record that the garbage collection encountered an evacuation failure in the
+   // given region. Returns whether this has been the first occurrence of an evacuation
+   // failure in that region.
+-  inline bool record(uint region_idx);
++  inline bool record(uint worker_id, uint region_idx, bool cause_pinned);
+ };
+ 
+ #endif //SHARE_GC_G1_G1EVACFAILUREREGIONS_HPP
+diff --git a/src/hotspot/share/gc/g1/g1EvacFailureRegions.inline.hpp b/src/hotspot/share/gc/g1/g1EvacFailureRegions.inline.hpp
+index 48d9eb6deaa..28be8562b52 100644
+--- a/src/hotspot/share/gc/g1/g1EvacFailureRegions.inline.hpp
++++ b/src/hotspot/share/gc/g1/g1EvacFailureRegions.inline.hpp
+@@ -27,19 +27,60 @@
+ 
+ #include "gc/g1/g1CollectedHeap.inline.hpp"
+ #include "gc/g1/g1EvacFailureRegions.hpp"
++#include "gc/g1/g1GCPhaseTimes.hpp"
+ #include "runtime/atomic.hpp"
+ 
+-bool G1EvacFailureRegions::record(uint region_idx) {
+-  bool success = _regions_failed_evacuation.par_set_bit(region_idx,
+-                                                        memory_order_relaxed);
++uint G1EvacFailureRegions::num_regions_evac_failed() const {
++  return Atomic::load(&_num_regions_evac_failed);
++}
++
++bool G1EvacFailureRegions::has_regions_evac_failed() const {
++  return num_regions_evac_failed() > 0;
++}
++
++bool G1EvacFailureRegions::has_regions_evac_pinned() const {
++  G1GCPhaseTimes* p = G1CollectedHeap::heap()->phase_times();
++  size_t count = p->sum_thread_work_items(G1GCPhaseTimes::RestoreEvacuationFailedRegions,
++                                          G1GCPhaseTimes::RestoreEvacFailureRegionsPinnedNum);
++  return count != 0;
++}
++
++bool G1EvacFailureRegions::has_regions_alloc_failed() const {
++  G1GCPhaseTimes* p = G1CollectedHeap::heap()->phase_times();
++  size_t count = p->sum_thread_work_items(G1GCPhaseTimes::RestoreEvacuationFailedRegions,
++                                          G1GCPhaseTimes::RestoreEvacFailureRegionsAllocFailedNum);
++  return count != 0;
++}
++
++bool G1EvacFailureRegions::record(uint worker_id, uint region_idx, bool cause_pinned) {
++  bool success = _regions_evac_failed.par_set_bit(region_idx,
++                                                  memory_order_relaxed);
+   if (success) {
+-    size_t offset = Atomic::fetch_then_add(&_evac_failure_regions_cur_length, 1u);
+-    _evac_failure_regions[offset] = region_idx;
++    size_t offset = Atomic::fetch_then_add(&_num_regions_evac_failed, 1u);
++    _evac_failed_regions[offset] = region_idx;
+ 
+     G1CollectedHeap* g1h = G1CollectedHeap::heap();
+     HeapRegion* hr = g1h->region_at(region_idx);
+     hr->note_evacuation_failure();
+   }
++
++  if (cause_pinned) {
++    if (_regions_pinned.par_set_bit(region_idx, memory_order_relaxed)) {
++      G1GCPhaseTimes* p = G1CollectedHeap::heap()->phase_times();
++      p->record_or_add_thread_work_item(G1GCPhaseTimes::RestoreEvacuationFailedRegions,
++                                        worker_id,
++                                        1,
++                                        G1GCPhaseTimes::RestoreEvacFailureRegionsPinnedNum);
++    }
++  } else {
++    if (_regions_alloc_failed.par_set_bit(region_idx, memory_order_relaxed)) {
++      G1GCPhaseTimes* p = G1CollectedHeap::heap()->phase_times();
++      p->record_or_add_thread_work_item(G1GCPhaseTimes::RestoreEvacuationFailedRegions,
++                                        worker_id,
++                                        1,
++                                        G1GCPhaseTimes::RestoreEvacFailureRegionsAllocFailedNum);
++    }
++  }
+   return success;
+ }
+ 
+diff --git a/src/hotspot/share/gc/g1/g1FullCollector.cpp b/src/hotspot/share/gc/g1/g1FullCollector.cpp
+index 62e7cdfabd4..e4abb69cace 100644
+--- a/src/hotspot/share/gc/g1/g1FullCollector.cpp
++++ b/src/hotspot/share/gc/g1/g1FullCollector.cpp
+@@ -257,9 +257,9 @@ void G1FullCollector::complete_collection() {
+ void G1FullCollector::before_marking_update_attribute_table(HeapRegion* hr) {
+   if (hr->is_free()) {
+     _region_attr_table.set_free(hr->hrm_index());
+-  } else if (hr->is_humongous()) {
+-    // Humongous objects will never be moved in the "main" compaction phase, but
+-    // afterwards in a special phase if needed.
++  } else if (hr->is_humongous() || hr->has_pinned_objects()) {
++    // Humongous objects or pinned regions will never be moved in the "main"
++    // compaction phase, but non-pinned regions might afterwards in a special phase.
+     _region_attr_table.set_skip_compacting(hr->hrm_index());
+   } else {
+     // Everything else should be compacted.
+@@ -454,10 +454,16 @@ void G1FullCollector::phase2d_prepare_humongous_compaction() {
+       region_index++;
+       continue;
+     } else if (hr->is_starts_humongous()) {
+-      uint num_regions = humongous_cp->forward_humongous(hr);
+-      region_index += num_regions; // Skip over the continues humongous regions.
++      size_t obj_size = cast_to_oop(hr->bottom())->size();
++      uint num_regions = (uint)G1CollectedHeap::humongous_obj_size_in_regions(obj_size);
++      // Even during last-ditch compaction we should not move pinned humongous objects.
++      if (!hr->has_pinned_objects()) {
++        humongous_cp->forward_humongous(hr);
++      }
++      region_index += num_regions; // Advance over all humongous regions.
+       continue;
+     } else if (is_compaction_target(region_index)) {
++      assert(!hr->has_pinned_objects(), "pinned regions should not be compaction targets");
+       // Add the region to the humongous compaction point.
+       humongous_cp->add(hr);
+     }
+diff --git a/src/hotspot/share/gc/g1/g1FullGCCompactTask.cpp b/src/hotspot/share/gc/g1/g1FullGCCompactTask.cpp
+index 8c4fa4eb2e0..2ed6ccd4735 100644
+--- a/src/hotspot/share/gc/g1/g1FullGCCompactTask.cpp
++++ b/src/hotspot/share/gc/g1/g1FullGCCompactTask.cpp
+@@ -67,6 +67,7 @@ void G1FullGCCompactTask::copy_object_to_new_location(oop obj) {
+ }
+ 
+ void G1FullGCCompactTask::compact_region(HeapRegion* hr) {
++  assert(!hr->has_pinned_objects(), "Should be no region with pinned objects in compaction queue");
+   assert(!hr->is_humongous(), "Should be no humongous regions in compaction queue");
+ 
+   if (!collector()->is_free(hr->hrm_index())) {
+diff --git a/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.cpp b/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.cpp
+index dabff2bc9fb..7669771eb6c 100644
+--- a/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.cpp
++++ b/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.cpp
+@@ -145,7 +145,7 @@ void G1FullGCCompactionPoint::add_humongous(HeapRegion* hr) {
+                                      });
+ }
+ 
+-uint G1FullGCCompactionPoint::forward_humongous(HeapRegion* hr) {
++void G1FullGCCompactionPoint::forward_humongous(HeapRegion* hr) {
+   assert(hr->is_starts_humongous(), "Sanity!");
+ 
+   oop obj = cast_to_oop(hr->bottom());
+@@ -153,7 +153,7 @@ uint G1FullGCCompactionPoint::forward_humongous(HeapRegion* hr) {
+   uint num_regions = (uint)G1CollectedHeap::humongous_obj_size_in_regions(obj_size);
+ 
+   if (!has_regions()) {
+-    return num_regions;
++    return;
+   }
+ 
+   // Find contiguous compaction target regions for the humongous object.
+@@ -161,7 +161,7 @@ uint G1FullGCCompactionPoint::forward_humongous(HeapRegion* hr) {
+ 
+   if (range_begin == UINT_MAX) {
+     // No contiguous compaction target regions found, so the object cannot be moved.
+-    return num_regions;
++    return;
+   }
+ 
+   // Preserve the mark for the humongous object as the region was initially not compacting.
+@@ -177,7 +177,7 @@ uint G1FullGCCompactionPoint::forward_humongous(HeapRegion* hr) {
+   // Remove covered regions from compaction target candidates.
+   _compaction_regions->remove_range(range_begin, (range_begin + num_regions));
+ 
+-  return num_regions;
++  return;
+ }
+ 
+ uint G1FullGCCompactionPoint::find_contiguous_before(HeapRegion* hr, uint num_regions) {
+diff --git a/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.hpp b/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.hpp
+index ea8351f1299..ca76f7e6b94 100644
+--- a/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.hpp
++++ b/src/hotspot/share/gc/g1/g1FullGCCompactionPoint.hpp
+@@ -55,7 +55,7 @@ public:
+   void initialize(HeapRegion* hr);
+   void update();
+   void forward(oop object, size_t size);
+-  uint forward_humongous(HeapRegion* hr);
++  void forward_humongous(HeapRegion* hr);
+   void add(HeapRegion* hr);
+   void add_humongous(HeapRegion* hr);
+ 
+diff --git a/src/hotspot/share/gc/g1/g1FullGCPrepareTask.inline.hpp b/src/hotspot/share/gc/g1/g1FullGCPrepareTask.inline.hpp
+index 76a647a3da3..2a2add76f48 100644
+--- a/src/hotspot/share/gc/g1/g1FullGCPrepareTask.inline.hpp
++++ b/src/hotspot/share/gc/g1/g1FullGCPrepareTask.inline.hpp
+@@ -42,7 +42,7 @@ void G1DetermineCompactionQueueClosure::free_empty_humongous_region(HeapRegion*
+ inline bool G1DetermineCompactionQueueClosure::should_compact(HeapRegion* hr) const {
+   // There is no need to iterate and forward objects in non-movable regions ie.
+   // prepare them for compaction.
+-  if (hr->is_humongous()) {
++  if (hr->is_humongous() || hr->has_pinned_objects()) {
+     return false;
+   }
+   size_t live_words = _collector->live_words(hr->hrm_index());
+@@ -73,29 +73,41 @@ inline void G1DetermineCompactionQueueClosure::add_to_compaction_queue(HeapRegio
+   cp->add(hr);
+ }
+ 
++static bool has_pinned_objects(HeapRegion* hr) {
++  return hr->has_pinned_objects() ||
++      (hr->is_humongous() && hr->humongous_start_region()->has_pinned_objects());
++}
++
+ inline bool G1DetermineCompactionQueueClosure::do_heap_region(HeapRegion* hr) {
+   if (should_compact(hr)) {
+     assert(!hr->is_humongous(), "moving humongous objects not supported.");
+     add_to_compaction_queue(hr);
+-  } else {
+-    assert(hr->containing_set() == nullptr, "already cleared by PrepareRegionsClosure");
+-    if (hr->is_humongous()) {
+-      oop obj = cast_to_oop(hr->humongous_start_region()->bottom());
+-      bool is_empty = !_collector->mark_bitmap()->is_marked(obj);
+-      if (is_empty) {
+-        free_empty_humongous_region(hr);
+-      } else {
+-        _collector->set_has_humongous();
+-      }
++    return false;
++  }
++
++  assert(hr->containing_set() == nullptr, "already cleared by PrepareRegionsClosure");
++  if (has_pinned_objects(hr)) {
++    // First check regions with pinned objects: they need to be skipped regardless
++    // of region type and never be considered for reclamation.
++    assert(_collector->is_skip_compacting(hr->hrm_index()), "pinned region %u must be skip_compacting", hr->hrm_index());
++    log_trace(gc, phases)("Phase 2: skip compaction region index: %u (%s), has pinned objects",
++                          hr->hrm_index(), hr->get_short_type_str());
++  } else if (hr->is_humongous()) {
++    oop obj = cast_to_oop(hr->humongous_start_region()->bottom());
++    bool is_empty = !_collector->mark_bitmap()->is_marked(obj);
++    if (is_empty) {
++      free_empty_humongous_region(hr);
+     } else {
+-      assert(MarkSweepDeadRatio > 0,
+-             "only skip compaction for other regions when MarkSweepDeadRatio > 0");
++      _collector->set_has_humongous();
++    }
++  } else {
++    assert(MarkSweepDeadRatio > 0,
++           "only skip compaction for other regions when MarkSweepDeadRatio > 0");
+ 
+-      // Too many live objects in the region; skip compacting it.
+-      _collector->update_from_compacting_to_skip_compacting(hr->hrm_index());
+-      log_trace(gc, phases)("Phase 2: skip compaction region index: %u, live words: " SIZE_FORMAT,
++    // Too many live objects in the region; skip compacting it.
++    _collector->update_from_compacting_to_skip_compacting(hr->hrm_index());
++    log_trace(gc, phases)("Phase 2: skip compaction region index: %u, live words: " SIZE_FORMAT,
+                             hr->hrm_index(), _collector->live_words(hr->hrm_index()));
+-    }
+   }
+ 
+   return false;
+diff --git a/src/hotspot/share/gc/g1/g1FullGCResetMetadataTask.cpp b/src/hotspot/share/gc/g1/g1FullGCResetMetadataTask.cpp
+index 003cc2b3f2b..ddbaaa0b75e 100644
+--- a/src/hotspot/share/gc/g1/g1FullGCResetMetadataTask.cpp
++++ b/src/hotspot/share/gc/g1/g1FullGCResetMetadataTask.cpp
+@@ -89,10 +89,11 @@ void G1FullGCResetMetadataTask::G1ResetMetadataClosure::reset_skip_compacting(He
+ 
+   if (hr->is_humongous()) {
+     oop obj = cast_to_oop(hr->humongous_start_region()->bottom());
+-    assert(_collector->mark_bitmap()->is_marked(obj), "must be live");
++    assert(hr->humongous_start_region()->has_pinned_objects() ||
++           _collector->mark_bitmap()->is_marked(obj), "must be live");
+   } else {
+-    assert(_collector->live_words(region_index) > _collector->scope()->region_compaction_threshold(),
+-           "should be quite full");
++    assert(hr->has_pinned_objects() || _collector->live_words(region_index) > _collector->scope()->region_compaction_threshold(),
++           "should be quite full or pinned %u", region_index);
+   }
+ 
+   assert(_collector->compaction_top(hr) == nullptr,
+diff --git a/src/hotspot/share/gc/g1/g1GCPhaseTimes.cpp b/src/hotspot/share/gc/g1/g1GCPhaseTimes.cpp
+index 83824c48656..43b582b7dd9 100644
+--- a/src/hotspot/share/gc/g1/g1GCPhaseTimes.cpp
++++ b/src/hotspot/share/gc/g1/g1GCPhaseTimes.cpp
+@@ -97,7 +97,7 @@ G1GCPhaseTimes::G1GCPhaseTimes(STWGCTimer* gc_timer, uint max_gc_threads) :
+   _gc_par_phases[GCWorkerEnd] = new WorkerDataArray<double>("GCWorkerEnd", "GC Worker End (ms):", max_gc_threads);
+   _gc_par_phases[Other] = new WorkerDataArray<double>("Other", "GC Worker Other (ms):", max_gc_threads);
+   _gc_par_phases[MergePSS] = new WorkerDataArray<double>("MergePSS", "Merge Per-Thread State (ms):", max_gc_threads);
+-  _gc_par_phases[RestoreRetainedRegions] = new WorkerDataArray<double>("RestoreRetainedRegions", "Restore Retained Regions (ms):", max_gc_threads);
++  _gc_par_phases[RestoreEvacuationFailedRegions] = new WorkerDataArray<double>("RestoreEvacuationFailedRegions", "Restore Evacuation Failed Regions (ms):", max_gc_threads);
+   _gc_par_phases[RemoveSelfForwards] = new WorkerDataArray<double>("RemoveSelfForwards", "Remove Self Forwards (ms):", max_gc_threads);
+   _gc_par_phases[ClearCardTable] = new WorkerDataArray<double>("ClearLoggedCards", "Clear Logged Cards (ms):", max_gc_threads);
+   _gc_par_phases[RecalculateUsed] = new WorkerDataArray<double>("RecalculateUsed", "Recalculate Used Memory (ms):", max_gc_threads);
+@@ -132,8 +132,9 @@ G1GCPhaseTimes::G1GCPhaseTimes(STWGCTimer* gc_timer, uint max_gc_threads) :
+   _gc_par_phases[MergePSS]->create_thread_work_items("LAB Undo Waste", MergePSSLABUndoWasteBytes);
+   _gc_par_phases[MergePSS]->create_thread_work_items("Evac Fail Extra Cards", MergePSSEvacFailExtra);
+ 
+-  _gc_par_phases[RestoreRetainedRegions]->create_thread_work_items("Evacuation Failed Regions:", RestoreRetainedRegionsFailedNum);
+-  _gc_par_phases[RestoreRetainedRegions]->create_thread_work_items("New Retained Regions:", RestoreRetainedRegionsRetainedNum);
++  _gc_par_phases[RestoreEvacuationFailedRegions]->create_thread_work_items("Evacuation Failed Regions:", RestoreEvacFailureRegionsEvacFailedNum);
++  _gc_par_phases[RestoreEvacuationFailedRegions]->create_thread_work_items("Pinned Regions:", RestoreEvacFailureRegionsPinnedNum);
++  _gc_par_phases[RestoreEvacuationFailedRegions]->create_thread_work_items("Allocation Failed Regions:", RestoreEvacFailureRegionsAllocFailedNum);
+ 
+   _gc_par_phases[RemoveSelfForwards]->create_thread_work_items("Forward Chunks:", RemoveSelfForwardChunksNum);
+   _gc_par_phases[RemoveSelfForwards]->create_thread_work_items("Empty Forward Chunks:", RemoveSelfForwardEmptyChunksNum);
+@@ -502,7 +503,7 @@ double G1GCPhaseTimes::print_post_evacuate_collection_set(bool evacuation_failed
+   debug_phase(_gc_par_phases[ClearCardTable], 1);
+   debug_phase(_gc_par_phases[RecalculateUsed], 1);
+   if (evacuation_failed) {
+-    debug_phase(_gc_par_phases[RestoreRetainedRegions], 1);
++    debug_phase(_gc_par_phases[RestoreEvacuationFailedRegions], 1);
+     debug_phase(_gc_par_phases[RemoveSelfForwards], 2);
+   }
+ 
+diff --git a/src/hotspot/share/gc/g1/g1GCPhaseTimes.hpp b/src/hotspot/share/gc/g1/g1GCPhaseTimes.hpp
+index de03ecab99f..713b411bda1 100644
+--- a/src/hotspot/share/gc/g1/g1GCPhaseTimes.hpp
++++ b/src/hotspot/share/gc/g1/g1GCPhaseTimes.hpp
+@@ -79,7 +79,7 @@ class G1GCPhaseTimes : public CHeapObj<mtGC> {
+     RebuildFreeList,
+     SampleCollectionSetCandidates,
+     MergePSS,
+-    RestoreRetainedRegions,
++    RestoreEvacuationFailedRegions,
+     RemoveSelfForwards,
+     ClearCardTable,
+     RecalculateUsed,
+@@ -146,9 +146,10 @@ class G1GCPhaseTimes : public CHeapObj<mtGC> {
+     MergePSSEvacFailExtra
+   };
+ 
+-  enum RestoreRetainedRegionsWorkItems {
+-    RestoreRetainedRegionsFailedNum,
+-    RestoreRetainedRegionsRetainedNum
++  enum RestoreEvacFailureRegionsWorkItems {
++    RestoreEvacFailureRegionsEvacFailedNum,       // How many regions experienced an evacuation failure (pinned or allocation failure)
++    RestoreEvacFailureRegionsPinnedNum,           // How many regions were found as pinned.
++    RestoreEvacFailureRegionsAllocFailedNum       // How many regions were found experiencing an allocation failure.
+   };
+ 
+   enum RemoveSelfForwardsWorkItems {
+diff --git a/src/hotspot/share/gc/g1/g1HeapRegionAttr.hpp b/src/hotspot/share/gc/g1/g1HeapRegionAttr.hpp
+index 7d2ab4f26ea..e5a10858ed1 100644
+--- a/src/hotspot/share/gc/g1/g1HeapRegionAttr.hpp
++++ b/src/hotspot/share/gc/g1/g1HeapRegionAttr.hpp
+@@ -36,10 +36,14 @@ public:
+   // remset_is_tracked_t is essentially bool, but we need precise control
+   // on the size, and sizeof(bool) is implementation specific.
+   typedef uint8_t remset_is_tracked_t;
++  // _is_pinned_t is essentially bool, but we want precise control
++  // on the size, and sizeof(bool) is implementation specific.
++  typedef uint8_t is_pinned_t;
+ 
+ private:
+   remset_is_tracked_t _remset_is_tracked;
+   region_type_t _type;
++  is_pinned_t _is_pinned;
+ 
+ public:
+   // Selection of the values for the _type field were driven to micro-optimize the
+@@ -59,9 +63,8 @@ public:
+   static const region_type_t Old          =   1;    // The region is in the collection set and an old region.
+   static const region_type_t Num          =   2;
+ 
+-  G1HeapRegionAttr(region_type_t type = NotInCSet, bool remset_is_tracked = false) :
+-    _remset_is_tracked(remset_is_tracked), _type(type) {
+-
++  G1HeapRegionAttr(region_type_t type = NotInCSet, bool remset_is_tracked = false, bool is_pinned = false) :
++    _remset_is_tracked(remset_is_tracked ? 1 : 0), _type(type), _is_pinned(is_pinned ? 1 : 0) {
+     assert(is_valid(), "Invalid type %d", _type);
+   }
+ 
+@@ -82,12 +85,16 @@ public:
+   bool remset_is_tracked() const     { return _remset_is_tracked != 0; }
+ 
+   void set_new_survivor()              { _type = NewSurvivor; }
++  bool is_pinned() const               { return _is_pinned != 0; }
++
+   void set_old()                       { _type = Old; }
+   void clear_humongous_candidate()               {
+     assert(is_humongous_candidate() || !is_in_cset(), "must be");
+     _type = NotInCSet;
+   }
++
+   void set_remset_is_tracked(bool value)      { _remset_is_tracked = value ? 1 : 0; }
++  void set_is_pinned(bool value)       { _is_pinned = value ? 1 : 0; }
+ 
+   bool is_in_cset_or_humongous_candidate() const { return is_in_cset() || is_humongous_candidate(); }
+   bool is_in_cset() const              { return type() >= Young; }
+@@ -136,7 +143,9 @@ class G1HeapRegionAttrBiasedMappedArray : public G1BiasedMappedArray<G1HeapRegio
+            "Region attributes at index " INTPTR_FORMAT " should be default but is %s", index, get_by_index(index).get_type_str());
+     // Humongous candidates must have complete remset.
+     const bool remset_is_tracked = true;
+-    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::HumongousCandidate, remset_is_tracked));
++    // Humongous candidates can not be pinned.
++    const bool region_is_pinned = false;
++    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::HumongousCandidate, remset_is_tracked, region_is_pinned));
+   }
+ 
+   void clear_humongous_candidate(uintptr_t index) {
+@@ -151,16 +160,22 @@ class G1HeapRegionAttrBiasedMappedArray : public G1BiasedMappedArray<G1HeapRegio
+     get_ref_by_index(index)->set_remset_is_tracked(remset_is_tracked);
+   }
+ 
+-  void set_in_young(uintptr_t index) {
++  void set_is_pinned(uintptr_t index, bool is_pinned) {
++    get_ref_by_index(index)->set_is_pinned(is_pinned);
++  }
++
++  void set_in_young(uintptr_t index, bool is_pinned) {
+     assert(get_by_index(index).is_default(),
+            "Region attributes at index " INTPTR_FORMAT " should be default but is %s", index, get_by_index(index).get_type_str());
+-    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::Young, true));
++    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::Young, true, is_pinned));
+   }
+ 
+   void set_in_old(uintptr_t index, bool remset_is_tracked) {
+     assert(get_by_index(index).is_default(),
+            "Region attributes at index " INTPTR_FORMAT " should be default but is %s", index, get_by_index(index).get_type_str());
+-    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::Old, remset_is_tracked));
++    // We do not select regions with pinned objects into the collection set.
++    const bool region_is_pinned = false;
++    set_by_index(index, G1HeapRegionAttr(G1HeapRegionAttr::Old, remset_is_tracked, region_is_pinned));
+   }
+ 
+   bool is_in_cset_or_humongous_candidate(HeapWord* addr) const { return at(addr).is_in_cset_or_humongous_candidate(); }
+diff --git a/src/hotspot/share/gc/g1/g1MonitoringSupport.cpp b/src/hotspot/share/gc/g1/g1MonitoringSupport.cpp
+index c4f2c128403..4e0a7dcfc3d 100644
+--- a/src/hotspot/share/gc/g1/g1MonitoringSupport.cpp
++++ b/src/hotspot/share/gc/g1/g1MonitoringSupport.cpp
+@@ -247,11 +247,10 @@ void G1MonitoringSupport::recalculate_sizes() {
+   _old_gen_used = _overall_used - MIN2(_overall_used, _eden_space_used + _survivor_space_used);
+ 
+   uint survivor_list_length = _g1h->survivor_regions_count();
+-  // Max length includes any potential extensions to the young gen
+-  // we'll do when the GC locker is active.
+-  uint young_list_max_length = _g1h->policy()->young_list_max_length();
+-  assert(young_list_max_length >= survivor_list_length, "invariant");
+-  uint eden_list_max_length = young_list_max_length - survivor_list_length;
++
++  uint young_list_target_length = _g1h->policy()->young_list_target_length();
++  assert(young_list_target_length >= survivor_list_length, "invariant");
++  uint eden_list_max_length = young_list_target_length - survivor_list_length;
+ 
+   // First calculate the committed sizes that can be calculated independently.
+   _survivor_space_committed = survivor_list_length * HeapRegion::GrainBytes;
+diff --git a/src/hotspot/share/gc/g1/g1ParScanThreadState.cpp b/src/hotspot/share/gc/g1/g1ParScanThreadState.cpp
+index f9fc1fd0198..d011516fba1 100644
+--- a/src/hotspot/share/gc/g1/g1ParScanThreadState.cpp
++++ b/src/hotspot/share/gc/g1/g1ParScanThreadState.cpp
+@@ -428,7 +428,7 @@ HeapWord* G1ParScanThreadState::allocate_copy_slow(G1HeapRegionAttr* dest_attr,
+ }
+ 
+ #if EVAC_FAILURE_INJECTOR
+-bool G1ParScanThreadState::inject_evacuation_failure(uint region_idx) {
++bool G1ParScanThreadState::inject_allocation_failure(uint region_idx) {
+   return _g1h->evac_failure_injector()->evacuation_should_fail(_evac_failure_inject_counter, region_idx);
+ }
+ #endif
+@@ -461,6 +461,11 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
+   Klass* klass = old->klass();
+   const size_t word_sz = old->size_given_klass(klass);
+ 
++  // JNI only allows pinning of typeArrays, so we only need to keep those in place.
++  if (region_attr.is_pinned() && klass->is_typeArray_klass()) {
++    return handle_evacuation_failure_par(old, old_mark, word_sz, true /* cause_pinned */);
++  }
++
+   uint age = 0;
+   G1HeapRegionAttr dest_attr = next_region_attr(region_attr, old_mark, age);
+   HeapRegion* const from_region = _g1h->heap_region_containing(old);
+@@ -475,7 +480,7 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
+     if (obj_ptr == nullptr) {
+       // This will either forward-to-self, or detect that someone else has
+       // installed a forwarding pointer.
+-      return handle_evacuation_failure_par(old, old_mark, word_sz);
++      return handle_evacuation_failure_par(old, old_mark, word_sz, false /* cause_pinned */);
+     }
+   }
+ 
+@@ -483,11 +488,11 @@ oop G1ParScanThreadState::do_copy_to_survivor_space(G1HeapRegionAttr const regio
+   assert(_g1h->is_in_reserved(obj_ptr), "Allocated memory should be in the heap");
+ 
+   // Should this evacuation fail?
+-  if (inject_evacuation_failure(from_region->hrm_index())) {
++  if (inject_allocation_failure(from_region->hrm_index())) {
+     // Doing this after all the allocation attempts also tests the
+     // undo_allocation() method too.
+     undo_allocation(dest_attr, obj_ptr, word_sz, node_index);
+-    return handle_evacuation_failure_par(old, old_mark, word_sz);
++    return handle_evacuation_failure_par(old, old_mark, word_sz, false /* cause_pinned */);
+   }
+ 
+   // We're going to allocate linearly, so might as well prefetch ahead.
+@@ -624,7 +629,7 @@ void G1ParScanThreadStateSet::record_unused_optional_region(HeapRegion* hr) {
+ }
+ 
+ NOINLINE
+-oop G1ParScanThreadState::handle_evacuation_failure_par(oop old, markWord m, size_t word_sz) {
++oop G1ParScanThreadState::handle_evacuation_failure_par(oop old, markWord m, size_t word_sz, bool cause_pinned) {
+   assert(_g1h->is_in_cset(old), "Object " PTR_FORMAT " should be in the CSet", p2i(old));
+ 
+   oop forward_ptr = old->forward_to_atomic(old, m, memory_order_relaxed);
+@@ -632,7 +637,7 @@ oop G1ParScanThreadState::handle_evacuation_failure_par(oop old, markWord m, siz
+     // Forward-to-self succeeded. We are the "owner" of the object.
+     HeapRegion* r = _g1h->heap_region_containing(old);
+ 
+-    if (_evac_failure_regions->record(r->hrm_index())) {
++    if (_evac_failure_regions->record(_worker_id, r->hrm_index(), cause_pinned)) {
+       _g1h->hr_printer()->evac_failure(r);
+     }
+ 
+diff --git a/src/hotspot/share/gc/g1/g1ParScanThreadState.hpp b/src/hotspot/share/gc/g1/g1ParScanThreadState.hpp
+index d1e8c0cb6d6..5347b6341f8 100644
+--- a/src/hotspot/share/gc/g1/g1ParScanThreadState.hpp
++++ b/src/hotspot/share/gc/g1/g1ParScanThreadState.hpp
+@@ -120,7 +120,7 @@ class G1ParScanThreadState : public CHeapObj<mtGC> {
+   // Enqueue the card of p into the (evacuation failed) region.
+   template <class T> void enqueue_card_into_evac_fail_region(T* p, oop obj);
+ 
+-  bool inject_evacuation_failure(uint region_idx) EVAC_FAILURE_INJECTOR_RETURN_( return false; );
++  bool inject_allocation_failure(uint region_idx) EVAC_FAILURE_INJECTOR_RETURN_( return false; );
+ 
+ public:
+   G1ParScanThreadState(G1CollectedHeap* g1h,
+@@ -231,7 +231,7 @@ public:
+   void reset_trim_ticks();
+ 
+   // An attempt to evacuate "obj" has failed; take necessary steps.
+-  oop handle_evacuation_failure_par(oop obj, markWord m, size_t word_sz);
++  oop handle_evacuation_failure_par(oop obj, markWord m, size_t word_sz, bool cause_pinned);
+ 
+   template <typename T>
+   inline void remember_root_into_optional_region(T* p);
+diff --git a/src/hotspot/share/gc/g1/g1Policy.cpp b/src/hotspot/share/gc/g1/g1Policy.cpp
+index 1bc1d44691b..9e22acc73ca 100644
+--- a/src/hotspot/share/gc/g1/g1Policy.cpp
++++ b/src/hotspot/share/gc/g1/g1Policy.cpp
+@@ -63,7 +63,6 @@ G1Policy::G1Policy(STWGCTimer* gc_timer) :
+   _full_collection_start_sec(0.0),
+   _young_list_desired_length(0),
+   _young_list_target_length(0),
+-  _young_list_max_length(0),
+   _eden_surv_rate_group(new G1SurvRateGroup()),
+   _survivor_surv_rate_group(new G1SurvRateGroup()),
+   _reserve_factor((double) G1ReservePercent / 100.0),
+@@ -198,15 +197,13 @@ void G1Policy::update_young_length_bounds(size_t pending_cards, size_t card_rs_l
+ 
+   uint new_young_list_desired_length = calculate_young_desired_length(pending_cards, card_rs_length, code_root_rs_length);
+   uint new_young_list_target_length = calculate_young_target_length(new_young_list_desired_length);
+-  uint new_young_list_max_length = calculate_young_max_length(new_young_list_target_length);
+ 
+-  log_trace(gc, ergo, heap)("Young list length update: pending cards %zu card_rs_length %zu old target %u desired: %u target: %u max: %u",
++  log_trace(gc, ergo, heap)("Young list length update: pending cards %zu card_rs_length %zu old target %u desired: %u target: %u",
+                             pending_cards,
+                             card_rs_length,
+                             old_young_list_target_length,
+                             new_young_list_desired_length,
+-                            new_young_list_target_length,
+-                            new_young_list_max_length);
++                            new_young_list_target_length);
+ 
+   // Write back. This is not an attempt to control visibility order to other threads
+   // here; all the revising of the young gen length are best effort to keep pause time.
+@@ -217,7 +214,6 @@ void G1Policy::update_young_length_bounds(size_t pending_cards, size_t card_rs_l
+   // early or too late.
+   Atomic::store(&_young_list_desired_length, new_young_list_desired_length);
+   Atomic::store(&_young_list_target_length, new_young_list_target_length);
+-  Atomic::store(&_young_list_max_length, new_young_list_max_length);
+ }
+ 
+ // Calculates desired young gen length. It is calculated from:
+@@ -321,8 +317,7 @@ uint G1Policy::calculate_young_target_length(uint desired_young_length) const {
+   uint receiving_additional_eden;
+   if (allocated_young_length >= desired_young_length) {
+     // Already used up all we actually want (may happen as G1 revises the
+-    // young list length concurrently, or caused by gclocker). Do not allow more,
+-    // potentially resulting in GC.
++    // young list length concurrently). Do not allow more, potentially resulting in GC.
+     receiving_additional_eden = 0;
+     log_trace(gc, ergo, heap)("Young target length: Already used up desired young %u allocated %u",
+                               desired_young_length,
+@@ -496,11 +491,13 @@ uint G1Policy::calculate_desired_eden_length_before_mixed(double base_time_ms,
+   uint min_marking_candidates = MIN2(calc_min_old_cset_length(candidates()->last_marking_candidates_length()),
+                                      candidates()->marking_regions_length());
+   double predicted_region_evac_time_ms = base_time_ms;
+-  for (HeapRegion* r : candidates()->marking_regions()) {
++  for (G1CollectionSetCandidateInfo* ci : candidates()->marking_regions()) {
++    // We optimistically assume that any of these marking candidate regions will
++    // not be pinned, so just consider them as normal.
+     if (min_marking_candidates == 0) {
+       break;
+     }
+-    predicted_region_evac_time_ms += predict_region_total_time_ms(r, false /* for_young_only_phase */);
++    predicted_region_evac_time_ms += predict_region_total_time_ms(ci->_r, false /* for_young_only_phase */);
+     min_marking_candidates--;
+   }
+ 
+@@ -523,13 +520,21 @@ double G1Policy::predict_survivor_regions_evac_time() const {
+ 
+ double G1Policy::predict_retained_regions_evac_time() const {
+   uint num_regions = 0;
++  uint num_pinned_regions = 0;
++
+   double result = 0.0;
+ 
+   G1CollectionCandidateList& list = candidates()->retained_regions();
+   uint min_regions_left = MIN2(min_retained_old_cset_length(),
+                                list.length());
+ 
+-  for (HeapRegion* r : list) {
++  for (G1CollectionSetCandidateInfo* ci : list) {
++    HeapRegion* r = ci->_r;
++    // We optimistically assume that any of these marking candidate regions will
++    // be reclaimable the next gc, so just consider them as normal.
++    if (r->has_pinned_objects()) {
++      num_pinned_regions++;
++    }
+     if (min_regions_left == 0) {
+       // Minimum amount of regions considered. Exit.
+       break;
+@@ -539,8 +544,8 @@ double G1Policy::predict_retained_regions_evac_time() const {
+     num_regions++;
+   }
+ 
+-  log_trace(gc, ergo, heap)("Selected %u of %u retained candidates taking %1.3fms additional time",
+-                            num_regions, list.length(), result);
++  log_trace(gc, ergo, heap)("Selected %u of %u retained candidates (pinned %u) taking %1.3fms additional time",
++                            num_regions, list.length(), num_pinned_regions, result);
+   return result;
+ }
+ 
+@@ -655,12 +660,14 @@ void G1Policy::record_concurrent_refinement_stats(size_t pending_cards,
+ }
+ 
+ bool G1Policy::should_retain_evac_failed_region(uint index) const {
+-  size_t live_bytes= _g1h->region_at(index)->live_bytes();
++  size_t live_bytes = _g1h->region_at(index)->live_bytes();
+ 
++#ifdef ASSERT
++  HeapRegion* r = _g1h->region_at(index);
+   assert(live_bytes != 0,
+-         "live bytes not set for %u used %zu garbage %zu cm-live %zu",
+-         index, _g1h->region_at(index)->used(), _g1h->region_at(index)->garbage_bytes(), live_bytes);
+-
++         "live bytes not set for %u used %zu garbage %zu cm-live %zu pinned %d",
++         index, r->used(), r->garbage_bytes(), live_bytes, r->has_pinned_objects());
++#endif
+   size_t threshold = G1RetainRegionLiveThresholdPercent * HeapRegion::GrainBytes / 100;
+   return live_bytes < threshold;
+ }
+@@ -784,7 +791,7 @@ double G1Policy::logged_cards_processing_time() const {
+ // Anything below that is considered to be zero
+ #define MIN_TIMER_GRANULARITY 0.0000001
+ 
+-void G1Policy::record_young_collection_end(bool concurrent_operation_is_full_mark, bool evacuation_failure) {
++void G1Policy::record_young_collection_end(bool concurrent_operation_is_full_mark, bool allocation_failure) {
+   G1GCPhaseTimes* p = phase_times();
+ 
+   double start_time_sec = phase_times()->cur_collection_start_sec();
+@@ -810,7 +817,7 @@ void G1Policy::record_young_collection_end(bool concurrent_operation_is_full_mar
+ 
+   // Evacuation failures skew the timing too much to be considered for some statistics updates.
+   // We make the assumption that these are rare.
+-  bool update_stats = !evacuation_failure;
++  bool update_stats = !allocation_failure;
+ 
+   if (update_stats) {
+     // We maintain the invariant that all objects allocated by mutator
+@@ -826,7 +833,7 @@ void G1Policy::record_young_collection_end(bool concurrent_operation_is_full_mar
+     _analytics->report_alloc_rate_ms(alloc_rate_ms);
+   }
+ 
+-  record_pause(this_pause, start_time_sec, end_time_sec, evacuation_failure);
++  record_pause(this_pause, start_time_sec, end_time_sec, allocation_failure);
+ 
+   if (G1GCPauseTypeHelper::is_last_young_pause(this_pause)) {
+     assert(!G1GCPauseTypeHelper::is_concurrent_start_pause(this_pause),
+@@ -1153,11 +1160,6 @@ bool G1Policy::should_allocate_mutator_region() const {
+   return young_list_length < young_list_target_length();
+ }
+ 
+-bool G1Policy::can_expand_young_list() const {
+-  uint young_list_length = _g1h->young_regions_count();
+-  return young_list_length < young_list_max_length();
+-}
+-
+ bool G1Policy::use_adaptive_young_list_length() const {
+   return _young_gen_sizer.use_adaptive_young_list_length();
+ }
+@@ -1181,20 +1183,6 @@ void G1Policy::print_age_table() {
+   _survivors_age_table.print_age_table(_tenuring_threshold);
+ }
+ 
+-uint G1Policy::calculate_young_max_length(uint target_young_length) const {
+-  uint expansion_region_num = 0;
+-  if (GCLockerEdenExpansionPercent > 0) {
+-    double perc = GCLockerEdenExpansionPercent / 100.0;
+-    double expansion_region_num_d = perc * young_list_target_length();
+-    // We use ceiling so that if expansion_region_num_d is > 0.0 (but
+-    // less than 1.0) we'll get 1.
+-    expansion_region_num = (uint) ceil(expansion_region_num_d);
+-  }
+-  uint max_length = target_young_length + expansion_region_num;
+-  assert(target_young_length <= max_length, "overflow");
+-  return max_length;
+-}
+-
+ // Calculates survivor space parameters.
+ void G1Policy::update_survivors_policy() {
+   double max_survivor_regions_d =
+@@ -1377,13 +1365,13 @@ void G1Policy::update_gc_pause_time_ratios(G1GCPauseType gc_type, double start_t
+ void G1Policy::record_pause(G1GCPauseType gc_type,
+                             double start,
+                             double end,
+-                            bool evacuation_failure) {
++                            bool allocation_failure) {
+   // Manage the MMU tracker. For some reason it ignores Full GCs.
+   if (gc_type != G1GCPauseType::FullGC) {
+     _mmu_tracker->add_pause(start, end);
+   }
+ 
+-  if (!evacuation_failure) {
++  if (!allocation_failure) {
+     update_gc_pause_time_ratios(gc_type, start, end);
+   }
+ 
+@@ -1477,13 +1465,15 @@ static void print_finish_message(const char* reason, bool from_marking) {
+ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marking_list,
+                                                 double time_remaining_ms,
+                                                 G1CollectionCandidateRegionList* initial_old_regions,
+-                                                G1CollectionCandidateRegionList* optional_old_regions) {
++                                                G1CollectionCandidateRegionList* optional_old_regions,
++                                                G1CollectionCandidateRegionList* pinned_old_regions) {
+   assert(marking_list != nullptr, "must be");
+ 
+   uint num_expensive_regions = 0;
+ 
+   uint num_initial_regions_selected = 0;
+   uint num_optional_regions_selected = 0;
++  uint num_pinned_regions = 0;
+ 
+   double predicted_initial_time_ms = 0.0;
+   double predicted_optional_time_ms = 0.0;
+@@ -1496,9 +1486,9 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
+   bool check_time_remaining = use_adaptive_young_list_length();
+ 
+   log_debug(gc, ergo, cset)("Start adding marking candidates to collection set. "
+-                            "Min %u regions, max %u regions, "
++                            "Min %u regions, max %u regions, available %u regions"
+                             "time remaining %1.2fms, optional threshold %1.2fms",
+-                            min_old_cset_length, max_old_cset_length, time_remaining_ms, optional_threshold_ms);
++                            min_old_cset_length, max_old_cset_length, marking_list->length(), time_remaining_ms, optional_threshold_ms);
+ 
+   G1CollectionCandidateListIterator iter = marking_list->begin();
+   for (; iter != marking_list->end(); ++iter) {
+@@ -1507,7 +1497,18 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
+       print_finish_message("Maximum number of regions reached", true);
+       break;
+     }
+-    HeapRegion* hr = *iter;
++    HeapRegion* hr = (*iter)->_r;
++    // Skip evacuating pinned marking regions because we are not getting any free
++    // space from them (and we expect to get free space from marking candidates).
++    // Also prepare to move them to retained regions to be evacuated optionally later
++    // to not impact the mixed phase too much.
++    if (hr->has_pinned_objects()) {
++      num_pinned_regions++;
++      (*iter)->update_num_unreclaimed();
++      log_trace(gc, ergo, cset)("Marking candidate %u can not be reclaimed currently. Skipping.", hr->hrm_index());
++      pinned_old_regions->append(hr);
++      continue;
++    }
+     double predicted_time_ms = predict_region_total_time_ms(hr, false);
+     time_remaining_ms = MAX2(time_remaining_ms - predicted_time_ms, 0.0);
+     // Add regions to old set until we reach the minimum amount
+@@ -1551,9 +1552,9 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
+                               num_expensive_regions);
+   }
+ 
+-  log_debug(gc, ergo, cset)("Finish adding marking candidates to collection set. Initial: %u, optional: %u, "
++  log_debug(gc, ergo, cset)("Finish adding marking candidates to collection set. Initial: %u, optional: %u, pinned: %u, "
+                             "predicted initial time: %1.2fms, predicted optional time: %1.2fms, time remaining: %1.2fms",
+-                            num_initial_regions_selected, num_optional_regions_selected,
++                            num_initial_regions_selected, num_optional_regions_selected, num_pinned_regions,
+                             predicted_initial_time_ms, predicted_optional_time_ms, time_remaining_ms);
+ 
+   assert(initial_old_regions->length() == num_initial_regions_selected, "must be");
+@@ -1564,13 +1565,15 @@ double G1Policy::select_candidates_from_marking(G1CollectionCandidateList* marki
+ void G1Policy::select_candidates_from_retained(G1CollectionCandidateList* retained_list,
+                                                double time_remaining_ms,
+                                                G1CollectionCandidateRegionList* initial_old_regions,
+-                                               G1CollectionCandidateRegionList* optional_old_regions) {
++                                               G1CollectionCandidateRegionList* optional_old_regions,
++                                               G1CollectionCandidateRegionList* pinned_old_regions) {
+ 
+   uint const min_regions = min_retained_old_cset_length();
+ 
+   uint num_initial_regions_selected = 0;
+   uint num_optional_regions_selected = 0;
+   uint num_expensive_regions_selected = 0;
++  uint num_pinned_regions = 0;
+ 
+   double predicted_initial_time_ms = 0.0;
+   double predicted_optional_time_ms = 0.0;
+@@ -1584,13 +1587,25 @@ void G1Policy::select_candidates_from_retained(G1CollectionCandidateList* retain
+   time_remaining_ms = MIN2(time_remaining_ms, optional_time_remaining_ms);
+ 
+   log_debug(gc, ergo, cset)("Start adding retained candidates to collection set. "
+-                            "Min %u regions, "
++                            "Min %u regions, available %u, "
+                             "time remaining %1.2fms, optional remaining %1.2fms",
+-                            min_regions, time_remaining_ms, optional_time_remaining_ms);
++                            min_regions, retained_list->length(), time_remaining_ms, optional_time_remaining_ms);
+ 
+-  for (HeapRegion* r : *retained_list) {
++  for (G1CollectionSetCandidateInfo* ci : *retained_list) {
++    HeapRegion* r = ci->_r;
+     double predicted_time_ms = predict_region_total_time_ms(r, collector_state()->in_young_only_phase());
+     bool fits_in_remaining_time = predicted_time_ms <= time_remaining_ms;
++    // If we can't reclaim that region ignore it for now.
++    if (r->has_pinned_objects()) {
++      num_pinned_regions++;
++      if (ci->update_num_unreclaimed()) {
++        log_trace(gc, ergo, cset)("Retained candidate %u can not be reclaimed currently. Skipping.", r->hrm_index());
++      } else {
++        log_trace(gc, ergo, cset)("Retained candidate %u can not be reclaimed currently. Dropping.", r->hrm_index());
++        pinned_old_regions->append(r);
++      }
++      continue;
++    }
+ 
+     if (fits_in_remaining_time || (num_expensive_regions_selected < min_regions)) {
+       predicted_initial_time_ms += predicted_time_ms;
+@@ -1620,10 +1635,10 @@ void G1Policy::select_candidates_from_retained(G1CollectionCandidateList* retain
+                               num_expensive_regions_selected);
+   }
+ 
+-  log_debug(gc, ergo, cset)("Finish adding retained candidates to collection set. Initial: %u, optional: %u, "
++  log_debug(gc, ergo, cset)("Finish adding retained candidates to collection set. Initial: %u, optional: %u, pinned: %u, "
+                             "predicted initial time: %1.2fms, predicted optional time: %1.2fms, "
+                             "time remaining: %1.2fms optional time remaining %1.2fms",
+-                            num_initial_regions_selected, num_optional_regions_selected,
++                            num_initial_regions_selected, num_optional_regions_selected, num_pinned_regions,
+                             predicted_initial_time_ms, predicted_optional_time_ms, time_remaining_ms, optional_time_remaining_ms);
+ }
+ 
+diff --git a/src/hotspot/share/gc/g1/g1Policy.hpp b/src/hotspot/share/gc/g1/g1Policy.hpp
+index c5ab4e9e1de..c951909788c 100644
+--- a/src/hotspot/share/gc/g1/g1Policy.hpp
++++ b/src/hotspot/share/gc/g1/g1Policy.hpp
+@@ -243,9 +243,6 @@ private:
+   uint calculate_young_desired_length(size_t pending_cards, size_t card_rs_length, size_t code_root_rs_length) const;
+   // Limit the given desired young length to available free regions.
+   uint calculate_young_target_length(uint desired_young_length) const;
+-  // The GCLocker might cause us to need more regions than the target. Calculate
+-  // the maximum number of regions to use in that case.
+-  uint calculate_young_max_length(uint target_young_length) const;
+ 
+   size_t predict_bytes_to_copy(HeapRegion* hr) const;
+   double predict_survivor_regions_evac_time() const;
+@@ -275,7 +272,7 @@ private:
+   void record_pause(G1GCPauseType gc_type,
+                     double start,
+                     double end,
+-                    bool evacuation_failure = false);
++                    bool allocation_failure = false);
+ 
+   void update_gc_pause_time_ratios(G1GCPauseType gc_type, double start_sec, double end_sec);
+ 
+@@ -314,7 +311,7 @@ public:
+ 
+   // Record the start and end of the actual collection part of the evacuation pause.
+   void record_young_collection_start();
+-  void record_young_collection_end(bool concurrent_operation_is_full_mark, bool evacuation_failure);
++  void record_young_collection_end(bool concurrent_operation_is_full_mark, bool allocation_failure);
+ 
+   // Record the start and end of a full collection.
+   void record_full_collection_start();
+@@ -335,18 +332,20 @@ public:
+ 
+   // Amount of allowed waste in bytes in the collection set.
+   size_t allowed_waste_in_collection_set() const;
+-  // Calculate and fill in the initial and optional old gen candidate regions from
++  // Calculate and fill in the initial, optional and pinned old gen candidate regions from
+   // the given candidate list and the remaining time.
+   // Returns the remaining time.
+   double select_candidates_from_marking(G1CollectionCandidateList* marking_list,
+                                         double time_remaining_ms,
+                                         G1CollectionCandidateRegionList* initial_old_regions,
+-                                        G1CollectionCandidateRegionList* optional_old_regions);
++                                        G1CollectionCandidateRegionList* optional_old_regions,
++                                        G1CollectionCandidateRegionList* pinned_old_regions);
+ 
+   void select_candidates_from_retained(G1CollectionCandidateList* retained_list,
+                                        double time_remaining_ms,
+                                        G1CollectionCandidateRegionList* initial_old_regions,
+-                                       G1CollectionCandidateRegionList* optional_old_regions);
++                                       G1CollectionCandidateRegionList* optional_old_regions,
++                                       G1CollectionCandidateRegionList* pinned_old_regions);
+ 
+   // Calculate the number of optional regions from the given collection set candidates,
+   // the remaining time and the maximum number of these regions and return the number
+@@ -383,12 +382,9 @@ public:
+ 
+   uint young_list_desired_length() const { return Atomic::load(&_young_list_desired_length); }
+   uint young_list_target_length() const { return Atomic::load(&_young_list_target_length); }
+-  uint young_list_max_length() const { return Atomic::load(&_young_list_max_length); }
+ 
+   bool should_allocate_mutator_region() const;
+ 
+-  bool can_expand_young_list() const;
+-
+   bool use_adaptive_young_list_length() const;
+ 
+   // Return an estimate of the number of bytes used in young gen.
+diff --git a/src/hotspot/share/gc/g1/g1VMOperations.cpp b/src/hotspot/share/gc/g1/g1VMOperations.cpp
+index 7820c9abff7..c2254e4287f 100644
+--- a/src/hotspot/share/gc/g1/g1VMOperations.cpp
++++ b/src/hotspot/share/gc/g1/g1VMOperations.cpp
+@@ -68,11 +68,9 @@ VM_G1TryInitiateConcMark::VM_G1TryInitiateConcMark(uint gc_count_before,
+ bool VM_G1TryInitiateConcMark::doit_prologue() {
+   bool result = VM_GC_Operation::doit_prologue();
+   // The prologue can fail for a couple of reasons. The first is that another GC
+-  // got scheduled and prevented the scheduling of the concurrent start GC. The
+-  // second is that the GC locker may be active and the heap can't be expanded.
+-  // In both cases we want to retry the GC so that the concurrent start pause is
+-  // actually scheduled. In the second case, however, we should stall until
+-  // until the GC locker is no longer active and then retry the concurrent start GC.
++  // got scheduled and prevented the scheduling of the concurrent start GC.
++  // In this case we want to retry the GC so that the concurrent start pause is
++  // actually scheduled.
+   if (!result) _transient_failure = true;
+   return result;
+ }
+@@ -103,16 +101,9 @@ void VM_G1TryInitiateConcMark::doit() {
+     // request will be remembered for a later partial collection, even though
+     // we've rejected this request.
+     _whitebox_attached = true;
+-  } else if (!g1h->do_collection_pause_at_safepoint()) {
+-    // Failure to perform the collection at all occurs because GCLocker is
+-    // active, and we have the bad luck to be the collection request that
+-    // makes a later _gc_locker collection needed.  (Else we would have hit
+-    // the GCLocker check in the prologue.)
+-    _transient_failure = true;
+-  } else if (g1h->should_upgrade_to_full_gc()) {
+-    _gc_succeeded = g1h->upgrade_to_full_collection();
+   } else {
+-    _gc_succeeded = true;
++    _gc_succeeded = g1h->do_collection_pause_at_safepoint();
++    assert(_gc_succeeded, "No reason to fail");
+   }
+ }
+ 
+@@ -125,37 +116,20 @@ VM_G1CollectForAllocation::VM_G1CollectForAllocation(size_t         word_size,
+ void VM_G1CollectForAllocation::doit() {
+   G1CollectedHeap* g1h = G1CollectedHeap::heap();
+ 
+-  if (_word_size > 0) {
+-    // An allocation has been requested. So, try to do that first.
+-    // During the execution of this VM operation, there may have been a concurrent active
+-    // GCLocker, potentially leading to expansion of the Eden space by other mutators.
+-    // If the Eden space were expanded, this allocation request might succeed without
+-    // the need for triggering a garbage collection.
+-    _result = g1h->attempt_allocation_at_safepoint(_word_size,
+-                                                   false /* expect_null_cur_alloc_region */);
+-    if (_result != nullptr) {
+-      // If we can successfully allocate before we actually do the
+-      // pause then we will consider this pause successful.
+-      _gc_succeeded = true;
+-      return;
+-    }
+-  }
+-
+   GCCauseSetter x(g1h, _gc_cause);
+   // Try a partial collection of some kind.
+   _gc_succeeded = g1h->do_collection_pause_at_safepoint();
++  assert(_gc_succeeded, "no reason to fail");
+ 
+-  if (_gc_succeeded) {
+-    if (_word_size > 0) {
+-      // An allocation had been requested. Do it, eventually trying a stronger
+-      // kind of GC.
+-      _result = g1h->satisfy_failed_allocation(_word_size, &_gc_succeeded);
+-    } else if (g1h->should_upgrade_to_full_gc()) {
+-      // There has been a request to perform a GC to free some space. We have no
+-      // information on how much memory has been asked for. In case there are
+-      // absolutely no regions left to allocate into, do a full compaction.
+-      _gc_succeeded = g1h->upgrade_to_full_collection();
+-    }
++  if (_word_size > 0) {
++    // An allocation had been requested. Do it, eventually trying a stronger
++    // kind of GC.
++    _result = g1h->satisfy_failed_allocation(_word_size, &_gc_succeeded);
++  } else if (g1h->should_upgrade_to_full_gc()) {
++    // There has been a request to perform a GC to free some space. We have no
++    // information on how much memory has been asked for. In case there are
++    // absolutely no regions left to allocate into, do a full compaction.
++    _gc_succeeded = g1h->upgrade_to_full_collection();
+   }
+ }
+ 
+diff --git a/src/hotspot/share/gc/g1/g1YoungCollector.cpp b/src/hotspot/share/gc/g1/g1YoungCollector.cpp
+index 351ecd06efb..81d46aa3979 100644
+--- a/src/hotspot/share/gc/g1/g1YoungCollector.cpp
++++ b/src/hotspot/share/gc/g1/g1YoungCollector.cpp
+@@ -35,6 +35,7 @@
+ #include "gc/g1/g1ConcurrentMark.hpp"
+ #include "gc/g1/g1GCPhaseTimes.hpp"
+ #include "gc/g1/g1YoungGCEvacFailureInjector.hpp"
++#include "gc/g1/g1EvacFailureRegions.inline.hpp"
+ #include "gc/g1/g1EvacInfo.hpp"
+ #include "gc/g1/g1HRPrinter.hpp"
+ #include "gc/g1/g1MonitoringSupport.hpp"
+@@ -77,12 +78,23 @@ class G1YoungGCTraceTime {
+   GCTraceTime(Info, gc) _tt;
+ 
+   const char* update_young_gc_name() {
++    char evacuation_failed_string[48];
++    evacuation_failed_string[0] = '\0';
++
++    if (_collector->evacuation_failed()) {
++      snprintf(evacuation_failed_string,
++               ARRAY_SIZE(evacuation_failed_string),
++               " (Evacuation Failure: %s%s%s)",
++               _collector->evacuation_alloc_failed() ? "Allocation" : "",
++               _collector->evacuation_alloc_failed() && _collector->evacuation_pinned() ? " / " : "",
++               _collector->evacuation_pinned() ? "Pinned" : "");
++    }
+     snprintf(_young_gc_name_data,
+              MaxYoungGCNameLength,
+              "Pause Young (%s) (%s)%s",
+              G1GCPauseTypeHelper::to_string(_pause_type),
+              GCCause::to_string(_pause_cause),
+-             _collector->evacuation_failed() ? " (Evacuation Failure)" : "");
++             evacuation_failed_string);
+     return _young_gc_name_data;
+   }
+ 
+@@ -314,6 +326,10 @@ class G1PrepareEvacuationTask : public WorkerTask {
+       if (!region->rem_set()->is_complete()) {
+         return false;
+       }
++      // We also cannot collect the humongous object if it is pinned.
++      if (region->has_pinned_objects()) {
++        return false;
++      }
+       // Candidate selection must satisfy the following constraints
+       // while concurrent marking is in progress:
+       //
+@@ -386,13 +402,15 @@ class G1PrepareEvacuationTask : public WorkerTask {
+       } else {
+         _g1h->register_region_with_region_attr(hr);
+       }
+-      log_debug(gc, humongous)("Humongous region %u (object size %zu @ " PTR_FORMAT ") remset %zu code roots %zu marked %d reclaim candidate %d type array %d",
++      log_debug(gc, humongous)("Humongous region %u (object size %zu @ " PTR_FORMAT ") remset %zu code roots %zu "
++                               "marked %d pinned count %u reclaim candidate %d type array %d",
+                                index,
+                                cast_to_oop(hr->bottom())->size() * HeapWordSize,
+                                p2i(hr->bottom()),
+                                hr->rem_set()->occupied(),
+                                hr->rem_set()->code_roots_list_length(),
+                                _g1h->concurrent_mark()->mark_bitmap()->is_marked(hr->bottom()),
++                               hr->pinned_count(),
+                                _g1h->is_humongous_reclaim_candidate(index),
+                                cast_to_oop(hr->bottom())->is_typeArray()
+                               );
+@@ -759,7 +777,7 @@ void G1YoungCollector::evacuate_next_optional_regions(G1ParScanThreadStateSet* p
+ void G1YoungCollector::evacuate_optional_collection_set(G1ParScanThreadStateSet* per_thread_states) {
+   const double collection_start_time_ms = phase_times()->cur_collection_start_sec() * 1000.0;
+ 
+-  while (!evacuation_failed() && collection_set()->optional_region_length() > 0) {
++  while (!evacuation_alloc_failed() && collection_set()->optional_region_length() > 0) {
+ 
+     double time_used_ms = os::elapsedTime() * 1000.0 - collection_start_time_ms;
+     double time_left_ms = MaxGCPauseMillis - time_used_ms;
+@@ -1010,7 +1028,15 @@ void G1YoungCollector::post_evacuate_collection_set(G1EvacInfo* evacuation_info,
+ }
+ 
+ bool G1YoungCollector::evacuation_failed() const {
+-  return _evac_failure_regions.evacuation_failed();
++  return _evac_failure_regions.has_regions_evac_failed();
++}
++
++bool G1YoungCollector::evacuation_pinned() const {
++  return _evac_failure_regions.has_regions_evac_pinned();
++}
++
++bool G1YoungCollector::evacuation_alloc_failed() const {
++  return _evac_failure_regions.has_regions_alloc_failed();
+ }
+ 
+ G1YoungCollector::G1YoungCollector(GCCause::Cause gc_cause) :
+@@ -1083,7 +1109,7 @@ void G1YoungCollector::collect() {
+     // modifies it to the next state.
+     jtm.report_pause_type(collector_state()->young_gc_pause_type(_concurrent_operation_is_full_mark));
+ 
+-    policy()->record_young_collection_end(_concurrent_operation_is_full_mark, evacuation_failed());
++    policy()->record_young_collection_end(_concurrent_operation_is_full_mark, evacuation_alloc_failed());
+   }
+   TASKQUEUE_STATS_ONLY(_g1h->task_queues()->print_and_reset_taskqueue_stats("Oop Queue");)
+ }
+diff --git a/src/hotspot/share/gc/g1/g1YoungCollector.hpp b/src/hotspot/share/gc/g1/g1YoungCollector.hpp
+index 4a81ee97ed7..506021a1bef 100644
+--- a/src/hotspot/share/gc/g1/g1YoungCollector.hpp
++++ b/src/hotspot/share/gc/g1/g1YoungCollector.hpp
+@@ -131,8 +131,12 @@ class G1YoungCollector {
+   void post_evacuate_collection_set(G1EvacInfo* evacuation_info,
+                                     G1ParScanThreadStateSet* per_thread_states);
+ 
+-  // True iff an evacuation has failed in the most-recent collection.
++  // True iff an evacuation failure of any kind occurred in the most-recent collection.
+   bool evacuation_failed() const;
++  // True iff an evacuation had pinned regions in the most-recent collection.
++  bool evacuation_pinned() const;
++  // True iff an evacuation had allocation failures in the most-recent collection.
++  bool evacuation_alloc_failed() const;
+ 
+ public:
+   G1YoungCollector(GCCause::Cause gc_cause);
+diff --git a/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.cpp b/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.cpp
+index d47f0e86c30..637860c8132 100644
+--- a/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.cpp
++++ b/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.cpp
+@@ -31,7 +31,7 @@
+ #include "gc/g1/g1CollectionSetCandidates.inline.hpp"
+ #include "gc/g1/g1CollectorState.hpp"
+ #include "gc/g1/g1ConcurrentMark.inline.hpp"
+-#include "gc/g1/g1EvacFailureRegions.hpp"
++#include "gc/g1/g1EvacFailureRegions.inline.hpp"
+ #include "gc/g1/g1EvacInfo.hpp"
+ #include "gc/g1/g1EvacStats.inline.hpp"
+ #include "gc/g1/g1OopClosures.inline.hpp"
+@@ -103,7 +103,7 @@ public:
+   }
+ };
+ 
+-class G1PostEvacuateCollectionSetCleanupTask1::RestoreRetainedRegionsTask : public G1AbstractSubTask {
++class G1PostEvacuateCollectionSetCleanupTask1::RestoreEvacFailureRegionsTask : public G1AbstractSubTask {
+   G1CollectedHeap* _g1h;
+   G1ConcurrentMark* _cm;
+ 
+@@ -265,14 +265,14 @@ class G1PostEvacuateCollectionSetCleanupTask1::RestoreRetainedRegionsTask : publ
+   }
+ 
+ public:
+-  RestoreRetainedRegionsTask(G1EvacFailureRegions* evac_failure_regions) :
+-    G1AbstractSubTask(G1GCPhaseTimes::RestoreRetainedRegions),
++  RestoreEvacFailureRegionsTask(G1EvacFailureRegions* evac_failure_regions) :
++    G1AbstractSubTask(G1GCPhaseTimes::RestoreEvacuationFailedRegions),
+     _g1h(G1CollectedHeap::heap()),
+     _cm(_g1h->concurrent_mark()),
+     _evac_failure_regions(evac_failure_regions),
+     _chunk_bitmap(mtGC) {
+ 
+-    _num_evac_fail_regions = _evac_failure_regions->num_regions_failed_evacuation();
++    _num_evac_fail_regions = _evac_failure_regions->num_regions_evac_failed();
+     _num_chunks_per_region = G1CollectedHeap::get_chunks_per_region();
+ 
+     _chunk_size = static_cast<uint>(HeapRegion::GrainWords / _num_chunks_per_region);
+@@ -284,10 +284,10 @@ public:
+   }
+ 
+   double worker_cost() const override {
+-    assert(_evac_failure_regions->evacuation_failed(), "Should not call this if not executed");
++    assert(_evac_failure_regions->has_regions_evac_failed(), "Should not call this if there were no evacuation failures");
+ 
+     double workers_per_region = (double)G1CollectedHeap::get_chunks_per_region() / G1RestoreRetainedRegionChunksPerWorker;
+-    return workers_per_region * _evac_failure_regions->num_regions_failed_evacuation();
++    return workers_per_region * _evac_failure_regions->num_regions_evac_failed();
+   }
+ 
+   void do_work(uint worker_id) override {
+@@ -308,16 +308,16 @@ G1PostEvacuateCollectionSetCleanupTask1::G1PostEvacuateCollectionSetCleanupTask1
+                                                                                  G1EvacFailureRegions* evac_failure_regions) :
+   G1BatchedTask("Post Evacuate Cleanup 1", G1CollectedHeap::heap()->phase_times())
+ {
+-  bool evacuation_failed = evac_failure_regions->evacuation_failed();
++  bool evac_failed = evac_failure_regions->has_regions_evac_failed();
+ 
+   add_serial_task(new MergePssTask(per_thread_states));
+-  add_serial_task(new RecalculateUsedTask(evacuation_failed));
++  add_serial_task(new RecalculateUsedTask(evac_failed));
+   if (SampleCollectionSetCandidatesTask::should_execute()) {
+     add_serial_task(new SampleCollectionSetCandidatesTask());
+   }
+   add_parallel_task(G1CollectedHeap::heap()->rem_set()->create_cleanup_after_scan_heap_roots_task());
+-  if (evacuation_failed) {
+-    add_parallel_task(new RestoreRetainedRegionsTask(evac_failure_regions));
++  if (evac_failed) {
++    add_parallel_task(new RestoreEvacFailureRegionsTask(evac_failure_regions));
+   }
+ }
+ 
+@@ -569,7 +569,7 @@ public:
+   }
+ 
+   double worker_cost() const override {
+-    return _evac_failure_regions->num_regions_failed_evacuation();
++    return _evac_failure_regions->num_regions_evac_failed();
+   }
+ 
+   void do_work(uint worker_id) override {
+@@ -757,10 +757,10 @@ class FreeCSetClosure : public HeapRegionClosure {
+     G1GCPhaseTimes* p = _g1h->phase_times();
+     assert(r->in_collection_set(), "Failed evacuation of region %u not in collection set", r->hrm_index());
+ 
+-    p->record_or_add_thread_work_item(G1GCPhaseTimes::RestoreRetainedRegions,
++    p->record_or_add_thread_work_item(G1GCPhaseTimes::RestoreEvacuationFailedRegions,
+                                       _worker_id,
+                                       1,
+-                                      G1GCPhaseTimes::RestoreRetainedRegionsFailedNum);
++                                      G1GCPhaseTimes::RestoreEvacFailureRegionsEvacFailedNum);
+ 
+     bool retain_region = _g1h->policy()->should_retain_evac_failed_region(r);
+     // Update the region state due to the failed evacuation.
+@@ -844,6 +844,7 @@ class G1PostEvacuateCollectionSetCleanupTask2::FreeCollectionSetTask : public G1
+   const size_t*     _surviving_young_words;
+   uint              _active_workers;
+   G1EvacFailureRegions* _evac_failure_regions;
++  volatile uint     _num_retained_regions;
+ 
+   FreeCSetStats* worker_stats(uint worker) {
+     return &_worker_stats[worker];
+@@ -869,7 +870,8 @@ public:
+     _claimer(0),
+     _surviving_young_words(surviving_young_words),
+     _active_workers(0),
+-    _evac_failure_regions(evac_failure_regions) {
++    _evac_failure_regions(evac_failure_regions),
++    _num_retained_regions(0) {
+ 
+     _g1h->clear_eden();
+   }
+@@ -877,10 +879,7 @@ public:
+   virtual ~FreeCollectionSetTask() {
+     Ticks serial_time = Ticks::now();
+ 
+-    G1GCPhaseTimes* p = _g1h->phase_times();
+-    bool has_new_retained_regions =
+-      p->sum_thread_work_items(G1GCPhaseTimes::RestoreRetainedRegions, G1GCPhaseTimes::RestoreRetainedRegionsRetainedNum) != 0;
+-
++    bool has_new_retained_regions = Atomic::load(&_num_retained_regions) != 0;
+     if (has_new_retained_regions) {
+       G1CollectionSetCandidates* candidates = _g1h->collection_set()->candidates();
+       candidates->sort_by_efficiency();
+@@ -891,7 +890,10 @@ public:
+       _worker_stats[worker].~FreeCSetStats();
+     }
+     FREE_C_HEAP_ARRAY(FreeCSetStats, _worker_stats);
++
++    G1GCPhaseTimes* p = _g1h->phase_times();
+     p->record_serial_free_cset_time_ms((Ticks::now() - serial_time).seconds() * 1000.0);
++
+     _g1h->clear_collection_set();
+   }
+ 
+@@ -911,10 +913,8 @@ public:
+     _g1h->collection_set_par_iterate_all(&cl, &_claimer, worker_id);
+     // Report per-region type timings.
+     cl.report_timing();
+-    _g1h->phase_times()->record_or_add_thread_work_item(G1GCPhaseTimes::RestoreRetainedRegions,
+-                                                        worker_id,
+-                                                        cl.num_retained_regions(),
+-                                                        G1GCPhaseTimes::RestoreRetainedRegionsRetainedNum);
++
++    Atomic::add(&_num_retained_regions, cl.num_retained_regions(), memory_order_relaxed);
+   }
+ };
+ 
+@@ -955,7 +955,7 @@ G1PostEvacuateCollectionSetCleanupTask2::G1PostEvacuateCollectionSetCleanupTask2
+     add_serial_task(new EagerlyReclaimHumongousObjectsTask());
+   }
+ 
+-  if (evac_failure_regions->evacuation_failed()) {
++  if (evac_failure_regions->has_regions_evac_failed()) {
+     add_parallel_task(new RestorePreservedMarksTask(per_thread_states->preserved_marks_set()));
+     add_parallel_task(new ProcessEvacuationFailedRegionsTask(evac_failure_regions));
+   }
+diff --git a/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.hpp b/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.hpp
+index 511eb1b4afb..868ab788b53 100644
+--- a/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.hpp
++++ b/src/hotspot/share/gc/g1/g1YoungGCPostEvacuateTasks.hpp
+@@ -39,12 +39,12 @@ class G1ParScanThreadStateSet;
+ // - Recalculate Used (s)
+ // - Sample Collection Set Candidates (s)
+ // - Clear Card Table
+-// - Restore retained regions (on evacuation failure)
++// - Restore evac failure regions (on evacuation failure)
+ class G1PostEvacuateCollectionSetCleanupTask1 : public G1BatchedTask {
+   class MergePssTask;
+   class RecalculateUsedTask;
+   class SampleCollectionSetCandidatesTask;
+-  class RestoreRetainedRegionsTask;
++  class RestoreEvacFailureRegionsTask;
+ 
+ public:
+   G1PostEvacuateCollectionSetCleanupTask1(G1ParScanThreadStateSet* per_thread_states,
+diff --git a/src/hotspot/share/gc/g1/g1_globals.hpp b/src/hotspot/share/gc/g1/g1_globals.hpp
+index 9ec0b45d22a..dc38047aa28 100644
+--- a/src/hotspot/share/gc/g1/g1_globals.hpp
++++ b/src/hotspot/share/gc/g1/g1_globals.hpp
+@@ -324,6 +324,10 @@
+           "retained region restore purposes.")                              \
+           range(1, 256)                                                     \
+                                                                             \
++  product(uint, G1NumCollectionsKeepPinned, 8, DIAGNOSTIC,                  \
++          "After how many GCs a region has been found pinned G1 should "    \
++          "give up reclaiming it.")                                         \
++                                                                            \
+   product(uint, G1NumCardsCostSampleThreshold, 1000, DIAGNOSTIC,            \
+           "Threshold for the number of cards when reporting remembered set "\
+           "card cost related prediction samples. A sample must involve "    \
+diff --git a/src/hotspot/share/gc/g1/heapRegion.cpp b/src/hotspot/share/gc/g1/heapRegion.cpp
+index da11963317e..29fe5031a35 100644
+--- a/src/hotspot/share/gc/g1/heapRegion.cpp
++++ b/src/hotspot/share/gc/g1/heapRegion.cpp
+@@ -232,7 +232,8 @@ HeapRegion::HeapRegion(uint hrm_index,
+   _young_index_in_cset(-1),
+   _surv_rate_group(nullptr),
+   _age_index(G1SurvRateGroup::InvalidAgeIndex),
+-  _node_index(G1NUMA::UnknownNodeIndex)
++  _node_index(G1NUMA::UnknownNodeIndex),
++  _pinned_object_count(0)
+ {
+   assert(Universe::on_page_boundary(mr.start()) && Universe::on_page_boundary(mr.end()),
+          "invalid space boundaries");
+@@ -423,6 +424,7 @@ void HeapRegion::print_on(outputStream* st) const {
+       st->print("|-");
+     }
+   }
++  st->print("|%3u", Atomic::load(&_pinned_object_count));
+   st->print_cr("");
+ }
+ 
+@@ -726,9 +728,20 @@ void HeapRegion::fill_with_dummy_object(HeapWord* address, size_t word_size, boo
+ void HeapRegion::fill_range_with_dead_objects(HeapWord* start, HeapWord* end) {
+   size_t range_size = pointer_delta(end, start);
+ 
+-  // Fill the dead range with objects. G1 might need to create two objects if
+-  // the range is larger than half a region, which is the max_fill_size().
+-  CollectedHeap::fill_with_objects(start, range_size);
++  // We must be a bit careful with regions that contain pinned objects. While the
++  // ranges passed in here corresponding to the space between live objects, it is
++  // possible that there is a pinned object that is not any more referenced by
++  // Java code (only by native).
++  //
++  // In this case we must not zap contents of such an array but we can overwrite
++  // the header; since only pinned typearrays are allowed, this fits nicely with
++  // putting filler arrays into the dead range as the object header sizes match and
++  // no user data is overwritten.
++  //
++  // In particular String Deduplication might change the reference to the character
++  // array of the j.l.String after native code obtained a raw reference to it (via
++  // GetStringCritical()).
++  CollectedHeap::fill_with_objects(start, range_size, !has_pinned_objects());
+   HeapWord* current = start;
+   do {
+     // Update the BOT if the a threshold is crossed.
+diff --git a/src/hotspot/share/gc/g1/heapRegion.hpp b/src/hotspot/share/gc/g1/heapRegion.hpp
+index 45d39924aba..2706b814000 100644
+--- a/src/hotspot/share/gc/g1/heapRegion.hpp
++++ b/src/hotspot/share/gc/g1/heapRegion.hpp
+@@ -256,6 +256,9 @@ private:
+   // NUMA node.
+   uint _node_index;
+ 
++  // Number of objects in this region that are currently pinned.
++  volatile uint _pinned_object_count;
++
+   void report_region_type_change(G1HeapRegionTraceType::Type to);
+ 
+   template <class Closure, bool in_gc_pause>
+@@ -299,6 +302,9 @@ public:
+   static uint   LogOfHRGrainBytes;
+   static uint   LogCardsPerRegion;
+ 
++  inline void increment_pinned_object_count();
++  inline void decrement_pinned_object_count();
++
+   static size_t GrainBytes;
+   static size_t GrainWords;
+   static size_t CardsPerRegion;
+@@ -402,6 +408,9 @@ public:
+ 
+   bool is_old_or_humongous() const { return _type.is_old_or_humongous(); }
+ 
++  uint pinned_count() const { return Atomic::load(&_pinned_object_count); }
++  bool has_pinned_objects() const { return pinned_count() > 0; }
++
+   void set_free();
+ 
+   void set_eden();
+diff --git a/src/hotspot/share/gc/g1/heapRegion.inline.hpp b/src/hotspot/share/gc/g1/heapRegion.inline.hpp
+index e7e10ea5ffe..ec68407b546 100644
+--- a/src/hotspot/share/gc/g1/heapRegion.inline.hpp
++++ b/src/hotspot/share/gc/g1/heapRegion.inline.hpp
+@@ -553,4 +553,12 @@ inline void HeapRegion::record_surv_words_in_group(size_t words_survived) {
+   _surv_rate_group->record_surviving_words(age, words_survived);
+ }
+ 
++inline void HeapRegion::increment_pinned_object_count() {
++  Atomic::add(&_pinned_object_count, 1u, memory_order_relaxed);
++}
++
++inline void HeapRegion::decrement_pinned_object_count() {
++  Atomic::sub(&_pinned_object_count, 1u, memory_order_relaxed);
++}
++
+ #endif // SHARE_GC_G1_HEAPREGION_INLINE_HPP
+diff --git a/src/hotspot/share/gc/g1/vmStructs_g1.hpp b/src/hotspot/share/gc/g1/vmStructs_g1.hpp
+index e7df5277e86..94ade0f387c 100644
+--- a/src/hotspot/share/gc/g1/vmStructs_g1.hpp
++++ b/src/hotspot/share/gc/g1/vmStructs_g1.hpp
+@@ -41,6 +41,7 @@
+   nonstatic_field(HeapRegion, _bottom,         HeapWord* const)               \
+   nonstatic_field(HeapRegion, _top,            HeapWord* volatile)            \
+   nonstatic_field(HeapRegion, _end,            HeapWord* const)               \
++  nonstatic_field(HeapRegion, _pinned_object_count, volatile uint)            \
+                                                                               \
+   nonstatic_field(HeapRegionType, _tag,       HeapRegionType::Tag volatile)   \
+                                                                               \
+diff --git a/src/hotspot/share/gc/shared/collectedHeap.hpp b/src/hotspot/share/gc/shared/collectedHeap.hpp
+index 19923ca9bc4..cccc7b16883 100644
+--- a/src/hotspot/share/gc/shared/collectedHeap.hpp
++++ b/src/hotspot/share/gc/shared/collectedHeap.hpp
+@@ -165,8 +165,10 @@ class CollectedHeap : public CHeapObj<mtGC> {
+ 
+   // Filler object utilities.
+   static inline size_t filler_array_hdr_size();
+-  static inline size_t filler_array_min_size();
+ 
++  static size_t filler_array_min_size();
++
++protected:
+   static inline void zap_filler_array_with(HeapWord* start, size_t words, juint value);
+   DEBUG_ONLY(static void fill_args_check(HeapWord* start, size_t words);)
+   DEBUG_ONLY(static void zap_filler_array(HeapWord* start, size_t words, bool zap = true);)
+diff --git a/src/hotspot/share/prims/whitebox.cpp b/src/hotspot/share/prims/whitebox.cpp
+index c15686dc87c..4e77bf0db3f 100644
+--- a/src/hotspot/share/prims/whitebox.cpp
++++ b/src/hotspot/share/prims/whitebox.cpp
+@@ -401,7 +401,7 @@ WB_ENTRY(jboolean, WB_isObjectInOldGen(JNIEnv* env, jobject o, jobject obj))
+   if (UseG1GC) {
+     G1CollectedHeap* g1h = G1CollectedHeap::heap();
+     const HeapRegion* hr = g1h->heap_region_containing(p);
+-    return !(hr->is_young());
++    return hr->is_old_or_humongous();
+   }
+ #endif
+ #if INCLUDE_PARALLELGC
+@@ -2593,6 +2593,32 @@ WB_ENTRY(void, WB_UnlockCritical(JNIEnv* env, jobject wb))
+   GCLocker::unlock_critical(thread);
+ WB_END
+ 
++WB_ENTRY(void, WB_PinObject(JNIEnv* env, jobject wb, jobject o))
++#if INCLUDE_G1GC
++  if (!UseG1GC) {
++    ShouldNotReachHere();
++    return;
++  }
++  oop obj = JNIHandles::resolve(o);
++  G1CollectedHeap::heap()->pin_object(thread, obj);
++#else
++  ShouldNotReachHere();
++#endif // INCLUDE_G1GC
++WB_END
++
++WB_ENTRY(void, WB_UnpinObject(JNIEnv* env, jobject wb, jobject o))
++#if INCLUDE_G1GC
++  if (!UseG1GC) {
++    ShouldNotReachHere();
++    return;
++  }
++  oop obj = JNIHandles::resolve(o);
++  G1CollectedHeap::heap()->unpin_object(thread, obj);
++#else
++  ShouldNotReachHere();
++#endif // INCLUDE_G1GC
++WB_END
++
+ WB_ENTRY(jboolean, WB_SetVirtualThreadsNotifyJvmtiMode(JNIEnv* env, jobject wb, jboolean enable))
+   if (!Continuations::enabled()) {
+     tty->print_cr("WB error: must be Continuations::enabled()!");
+@@ -2899,6 +2925,8 @@ static JNINativeMethod methods[] = {
+ 
+   {CC"lockCritical",    CC"()V",                      (void*)&WB_LockCritical},
+   {CC"unlockCritical",  CC"()V",                      (void*)&WB_UnlockCritical},
++  {CC"pinObject",       CC"(Ljava/lang/Object;)V",    (void*)&WB_PinObject},
++  {CC"unpinObject",     CC"(Ljava/lang/Object;)V",    (void*)&WB_UnpinObject},
+   {CC"setVirtualThreadsNotifyJvmtiMode", CC"(Z)Z",    (void*)&WB_SetVirtualThreadsNotifyJvmtiMode},
+   {CC"preTouchMemory",  CC"(JJ)V",                    (void*)&WB_PreTouchMemory},
+ };
+diff --git a/src/hotspot/share/runtime/vmStructs.cpp b/src/hotspot/share/runtime/vmStructs.cpp
+index afba3e2258c..54d591ff141 100644
+--- a/src/hotspot/share/runtime/vmStructs.cpp
++++ b/src/hotspot/share/runtime/vmStructs.cpp
+@@ -1108,6 +1108,7 @@
+   declare_unsigned_integer_type(u_char)                                   \
+   declare_unsigned_integer_type(unsigned int)                             \
+   declare_unsigned_integer_type(uint)                                     \
++  declare_unsigned_integer_type(volatile uint)                            \
+   declare_unsigned_integer_type(unsigned short)                           \
+   declare_unsigned_integer_type(jushort)                                  \
+   declare_unsigned_integer_type(unsigned long)                            \
+diff --git a/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/HSDB.java b/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/HSDB.java
+index dd813197bc0..d54cc7fb56e 100644
+--- a/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/HSDB.java
++++ b/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/HSDB.java
+@@ -1111,6 +1111,9 @@ public class HSDB implements ObjectHistogramPanel.Listener, SAListener {
+                             anno = "Old ";
+                             bad = false;
+                           }
++                          if (!bad && region.isPinned()) {
++                            anno += "Pinned ";
++                          }
+                         } else if (collHeap instanceof ParallelScavengeHeap) {
+                           ParallelScavengeHeap heap = (ParallelScavengeHeap) collHeap;
+                           if (heap.youngGen().isIn(handle)) {
+diff --git a/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/gc/g1/HeapRegion.java b/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/gc/g1/HeapRegion.java
+index b681330e5a7..580a4b1c397 100644
+--- a/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/gc/g1/HeapRegion.java
++++ b/src/jdk.hotspot.agent/share/classes/sun/jvm/hotspot/gc/g1/HeapRegion.java
+@@ -50,6 +50,8 @@ public class HeapRegion extends ContiguousSpace implements LiveRegionsProvider {
+     private static AddressField endField;
+ 
+     private static CIntegerField grainBytesField;
++    private static CIntegerField pinnedCountField;
++
+     private static long typeFieldOffset;
+     private static long pointerSize;
+ 
+@@ -71,6 +73,8 @@ public class HeapRegion extends ContiguousSpace implements LiveRegionsProvider {
+         endField = type.getAddressField("_end");
+ 
+         grainBytesField = type.getCIntegerField("GrainBytes");
++        pinnedCountField = type.getCIntegerField("_pinned_object_count");
++
+         typeFieldOffset = type.getField("_type").getOffset();
+ 
+         pointerSize = db.lookupType("HeapRegion*").getSize();
+@@ -124,6 +128,10 @@ public class HeapRegion extends ContiguousSpace implements LiveRegionsProvider {
+         return type.isHumongous();
+     }
+ 
++    public boolean isPinned() {
++        return pinnedCountField.getValue(addr) != 0;
++    }
++
+     public boolean isOld() {
+         return type.isOld();
+     }
+@@ -134,6 +142,6 @@ public class HeapRegion extends ContiguousSpace implements LiveRegionsProvider {
+ 
+     public void printOn(PrintStream tty) {
+         tty.print("Region: " + bottom() + "," + top() + "," + end());
+-        tty.println(":" + type.typeAnnotation());
++        tty.println(":" + type.typeAnnotation() + (isPinned() ? " Pinned" : ""));
+     }
+ }
+diff --git a/test/hotspot/jtreg/ProblemList.txt b/test/hotspot/jtreg/ProblemList.txt
+index 9e3a36cf480..726c78528a3 100644
+--- a/test/hotspot/jtreg/ProblemList.txt
++++ b/test/hotspot/jtreg/ProblemList.txt
+@@ -87,8 +87,8 @@ gc/g1/logging/TestG1LoggingFailure.java 8169634 generic-all
+ gc/g1/humongousObjects/TestHeapCounters.java 8178918 generic-all
+ gc/stress/gclocker/TestExcessGCLockerCollections.java 8229120 generic-all
+ gc/stress/gclocker/TestGCLockerWithParallel.java 8180622 generic-all
+-gc/stress/gclocker/TestGCLockerWithG1.java 8180622 generic-all
+-gc/stress/TestJNIBlockFullGC/TestJNIBlockFullGC.java 8192647 generic-all
++gc/stress/gclocker/TestGCLockerWithSerial.java 8180622 generic-all
++gc/stress/gclocker/TestGCLockerWithShenandoah.java 8180622 generic-all
+ gc/stress/TestStressG1Humongous.java 8286554 windows-x64
+ 
+ #############################################################################
+diff --git a/test/hotspot/jtreg/gc/g1/TestEvacuationFailure.java b/test/hotspot/jtreg/gc/g1/TestEvacuationFailure.java
+index bbd7fee0467..fd4a5094757 100644
+--- a/test/hotspot/jtreg/gc/g1/TestEvacuationFailure.java
++++ b/test/hotspot/jtreg/gc/g1/TestEvacuationFailure.java
+@@ -25,7 +25,7 @@ package gc.g1;
+ 
+ /*
+  * @test TestEvacuationFailure
+- * @summary Ensure the output for a minor GC with G1 that has evacuation failure contains the correct strings.
++ * @summary Ensure the output for a minor GC with G1 that has allocation failure contains the correct strings.
+  * @requires vm.gc.G1
+  * @requires vm.debug
+  * @library /test/lib
+@@ -55,7 +55,7 @@ public class TestEvacuationFailure {
+ 
+         OutputAnalyzer output = new OutputAnalyzer(pb.start());
+         System.out.println(output.getStdout());
+-        output.shouldContain("(Evacuation Failure)");
++        output.shouldContain("(Evacuation Failure:");
+         output.shouldHaveExitValue(0);
+     }
+ 
+diff --git a/test/hotspot/jtreg/gc/g1/TestGCLogMessages.java b/test/hotspot/jtreg/gc/g1/TestGCLogMessages.java
+index 6b249d69ab9..6a024bb3ba2 100644
+--- a/test/hotspot/jtreg/gc/g1/TestGCLogMessages.java
++++ b/test/hotspot/jtreg/gc/g1/TestGCLogMessages.java
+@@ -264,10 +264,11 @@ public class TestGCLogMessages {
+     LogMessageWithLevel exhFailureMessages[] = new LogMessageWithLevel[] {
+         new LogMessageWithLevel("Recalculate Used Memory", Level.DEBUG),
+         new LogMessageWithLevel("Restore Preserved Marks", Level.DEBUG),
+-        new LogMessageWithLevel("Restore Retained Regions", Level.DEBUG),
++        new LogMessageWithLevel("Restore Evacuation Failed Regions", Level.DEBUG),
+         new LogMessageWithLevel("Process Evacuation Failed Regions", Level.DEBUG),
+         new LogMessageWithLevel("Evacuation Failed Regions", Level.DEBUG),
+-        new LogMessageWithLevel("New Retained Regions", Level.DEBUG),
++        new LogMessageWithLevel("Pinned Regions", Level.DEBUG),
++        new LogMessageWithLevel("Allocation Failed Regions", Level.DEBUG),
+     };
+ 
+     private void testWithEvacuationFailureLogs() throws Exception {
+diff --git a/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedHumongousFragmentation.java b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedHumongousFragmentation.java
+new file mode 100644
+index 00000000000..fad01ab0022
+--- /dev/null
++++ b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedHumongousFragmentation.java
+@@ -0,0 +1,128 @@
++/*
++
++ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2016, 2018, Red Hat, Inc. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ *
++ */
++
++ /*
++ * @test id=g1
++ * @summary Make sure G1 can handle humongous allocation fragmentation with region pinning in the mix,
++ *          i.e. moving humongous objects around other pinned humongous objects even in a last resort
++ *          full gc.
++ *          Adapted from gc/TestAllocHumongousFragment.java
++ * @key randomness
++ * @requires vm.gc.G1
++ * @library /test/lib
++ * @build jdk.test.whitebox.WhiteBox
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
++ * @run main/othervm -Xlog:gc+region=trace -XX:+UnlockDiagnosticVMOptions -XX:+UnlockExperimentalVMOptions -Xmx1g -Xms1g
++ *      -XX:VerifyGCType=full -XX:+VerifyDuringGC -XX:+VerifyAfterGC -XX:+WhiteBoxAPI -Xbootclasspath/a:.
++ *      gc.g1.pinnedobjs.TestPinnedHumongousFragmentation
++ */
++
++package gc.g1.pinnedobjs;
++
++import java.util.*;
++
++import jdk.test.lib.Asserts;
++import jdk.test.lib.Utils;
++
++import jdk.test.whitebox.WhiteBox;
++
++public class TestPinnedHumongousFragmentation {
++
++    private static final WhiteBox wb = WhiteBox.getWhiteBox();
++
++    static final long TARGET_MB = 30_000; // 30 Gb allocations
++    static final long LIVE_MB   = 700;    // 700 Mb alive
++    static final int  PINNED_PERCENT = 5; // 5% of objects pinned
++
++    static volatile Object sink;
++
++    class PinInformation {
++        int[] object;
++        long address;
++
++        PinInformation(int[] object) {
++            this.object = object;
++            wb.pinObject(object);
++            this.address = wb.getObjectAddress(object);
++        }
++
++        void release() {
++            long newAddress = wb.getObjectAddress(object);
++            if (address != newAddress) {
++                Asserts.fail("Object at " + address + " moved to " + newAddress);
++            }
++            wb.unpinObject(object);
++            object = null;
++        }
++    }
++
++    static List<int[]> objects;
++    static List<PinInformation> pinnedObjects;
++
++    public static void main(String[] args) throws Exception {
++        (new TestPinnedHumongousFragmentation()).run();
++    }
++
++    void run() throws Exception {
++        final int min = 128 * 1024;
++        final int max = 16 * 1024 * 1024;
++        final long count = TARGET_MB * 1024 * 1024 / (16 + 4 * (min + (max - min) / 2));
++
++        objects = new ArrayList<int[]>();
++        pinnedObjects = new ArrayList<PinInformation>();
++        long current = 0;
++
++        Random rng = Utils.getRandomInstance();
++        for (long c = 0; c < count; c++) {
++            while (current > LIVE_MB * 1024 * 1024) {
++                int idx = rng.nextInt(objects.size());
++                int[] remove = objects.remove(idx);
++                current -= remove.length * 4 + 16;
++            }
++
++            // Pin random objects before the allocation that is (likely) going to
++            // cause full gcs. Remember them for unpinning.
++            for (int i = 0; i < objects.size() * PINNED_PERCENT / 100; i++) {
++                int[] target = objects.get(rng.nextInt(objects.size()));
++                pinnedObjects.add(new PinInformation(target));
++            }
++
++            int[] newObj = new int[min + rng.nextInt(max - min)];
++            current += newObj.length * 4 + 16;
++            objects.add(newObj);
++            sink = new Object();
++
++            // Unpin and clear remembered objects afterwards.
++            for (int i = 0; i < pinnedObjects.size(); i++) {
++                pinnedObjects.get(i).release();
++            }
++            pinnedObjects.clear();
++
++            System.out.println("Allocated: " + (current / 1024 / 1024) + " Mb");
++        }
++    }
++
++}
+diff --git a/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectContents.java b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectContents.java
+new file mode 100644
+index 00000000000..e0fdc88e2a1
+--- /dev/null
++++ b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectContents.java
+@@ -0,0 +1,90 @@
++/*
++ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary Test that pinned objects we lost all Java references to keep
++ *          the region and contents alive.
++ *          This test simulates this behavior using Whitebox/Unsafe methods
++ *          and not real native code for simplicity.
++ * @requires vm.gc.G1
++ * @requires vm.debug
++ * @library /test/lib
++ * @modules java.base/jdk.internal.misc:+open
++ *          java.management
++ * @build jdk.test.whitebox.WhiteBox
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
++ * @run main/othervm -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -Xbootclasspath/a:. -XX:+ZapUnusedHeapArea -Xlog:gc,gc+ergo+cset=trace gc.g1.pinnedobjs.TestPinnedObjectContents
++ */
++
++package gc.g1.pinnedobjs;
++
++import jdk.internal.misc.Unsafe;
++
++import jdk.test.lib.Asserts;
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++import jdk.test.whitebox.WhiteBox;
++
++public class TestPinnedObjectContents {
++
++    private static final jdk.internal.misc.Unsafe unsafe = Unsafe.getUnsafe();
++    private static final WhiteBox wb = WhiteBox.getWhiteBox();
++
++    public static long pinAndGetAddress(Object o) {
++        wb.pinObject(o);
++        return wb.getObjectAddress(o);
++    }
++
++    public static void main(String[] args) throws Exception {
++        // Remove garbage from VM initialization.
++        wb.fullGC();
++
++        // Allocate to-be pinned object and fill with "random" data.
++        final int ArraySize = 100;
++        int[] o = new int[ArraySize];
++        for (int i = 0; i < o.length; i++) {
++            o[i] = i;
++        }
++
++        Asserts.assertTrue(!wb.isObjectInOldGen(o), "should not be in old gen already");
++
++        // Remember memory offsets.
++        long baseOffset = unsafe.arrayBaseOffset(o.getClass());
++        long indexScale = unsafe.arrayIndexScale(o.getClass());
++        long address = pinAndGetAddress(o);
++
++        o = null; // And forget the (Java) reference to the int array.
++
++        // Do garbage collections to zap the data surrounding the "dead" object.
++        wb.youngGC();
++        wb.youngGC();
++
++        for (int i = 0; i < ArraySize; i++) {
++            int actual = unsafe.getInt(null, address + baseOffset + i * indexScale);
++            if (actual != i) {
++                Asserts.fail("Pinned array at offset " + i + " should contain the value " + i + " but is " + actual);
++            }
++        }
++    }
++}
++
+diff --git a/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectTypes.java b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectTypes.java
+new file mode 100644
+index 00000000000..ff730a30106
+--- /dev/null
++++ b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectTypes.java
+@@ -0,0 +1,86 @@
++/*
++ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary Test whether different object type can be pinned or not.
++ * @requires vm.gc.G1
++ * @requires vm.debug
++ * @library /test/lib
++ * @modules java.base/jdk.internal.misc
++ *          java.management
++ * @build jdk.test.whitebox.WhiteBox
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
++ * @run driver gc.g1.pinnedobjs.TestPinnedObjectTypes
++ */
++
++package gc.g1.pinnedobjs;
++
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++import jdk.test.whitebox.WhiteBox;
++
++public class TestPinnedObjectTypes {
++
++    public static void main(String[] args) throws Exception {
++        testPinning("Object", false);
++        testPinning("TypeArray", true);
++        testPinning("ObjArray", false);
++    }
++
++    private static void testPinning(String type, boolean shouldSucceed) throws Exception {
++        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder("-XX:+UseG1GC",
++                                                                             "-XX:+UnlockDiagnosticVMOptions",
++                                                                             "-XX:+WhiteBoxAPI",
++                                                                             "-Xbootclasspath/a:.",
++                                                                             "-Xmx32M",
++                                                                             "-Xmn16M",
++                                                                             "-Xlog:gc",
++                                                                             TestObjectPin.class.getName(),
++                                                                             type);
++
++        OutputAnalyzer output = new OutputAnalyzer(pb.start());
++        System.out.println(output.getStdout());
++        if (shouldSucceed) {
++          output.shouldHaveExitValue(0);
++        } else {
++          output.shouldNotHaveExitValue(0);
++        }
++    }
++
++}
++
++class TestObjectPin {
++
++    private static final WhiteBox wb = WhiteBox.getWhiteBox();
++
++    public static void main(String[] args) {
++        Object o = switch (args[0]) {
++            case "Object" -> new Object();
++            case "TypeArray" -> new int[100];
++            case "ObjArray" -> new Object[100];
++            default -> null;
++        };
++        wb.pinObject(o);
++    }
++}
++
+diff --git a/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectsEvacuation.java b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectsEvacuation.java
+new file mode 100644
+index 00000000000..7ffd9432eb5
+--- /dev/null
++++ b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedObjectsEvacuation.java
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary Test pinned objects lifecycle from young gen to eventual reclamation.
++ * @requires vm.gc.G1
++ * @library /test/lib
++ * @modules java.base/jdk.internal.misc
++ *          java.management
++ * @build jdk.test.whitebox.WhiteBox
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
++ * @run driver gc.g1.pinnedobjs.TestPinnedObjectsEvacuation
++ */
++
++package gc.g1.pinnedobjs;
++
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import jdk.test.lib.Asserts;
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++import jdk.test.whitebox.WhiteBox;
++
++public class TestPinnedObjectsEvacuation {
++
++    public static void main(String[] args) throws Exception {
++        testPinnedEvacuation(0, 0, 0, 1);
++        testPinnedEvacuation(1, 1, 0, 1);
++        testPinnedEvacuation(2, 1, 1, 0);
++        testPinnedEvacuation(3, 1, 1, 0);
++    }
++
++    private static int numMatches(String stringToMatch, String pattern) {
++        Pattern r = Pattern.compile(pattern);
++        Matcher m = r.matcher(stringToMatch);
++        return (int)m.results().count();
++    }
++
++    private static void assertMatches(int expected, int actual, String what) {
++        if (expected != actual) {
++          Asserts.fail("Expected " + expected + " " + what + " events but got " + actual);
++        }
++    }
++
++    private static void testPinnedEvacuation(int younGCsBeforeUnpin, int expectedSkipEvents, int expectedDropEvents, int expectedReclaimEvents) throws Exception {
++        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder("-XX:+UseG1GC",
++                                                                             "-XX:+UnlockDiagnosticVMOptions",
++                                                                             "-XX:+WhiteBoxAPI",
++                                                                             "-Xbootclasspath/a:.",
++                                                                             "-Xmx32M",
++                                                                             "-Xmn16M",
++                                                                             "-XX:G1NumCollectionsKeepPinned=2",
++                                                                             "-XX:+VerifyAfterGC",
++                                                                             "-Xlog:gc,gc+ergo+cset=trace",
++                                                                             TestObjectPin.class.getName(),
++                                                                             String.valueOf(younGCsBeforeUnpin));
++
++        OutputAnalyzer output = new OutputAnalyzer(pb.start());
++        System.out.println(output.getStdout());
++        output.shouldHaveExitValue(0);
++
++        assertMatches(expectedSkipEvents, numMatches(output.getStdout(), ".*Retained candidate \\d+ can not be reclaimed currently. Skipping.*"), "skip");
++        assertMatches(expectedDropEvents, numMatches(output.getStdout(), ".*Retained candidate \\d+ can not be reclaimed currently. Dropping.*"), "drop");
++        assertMatches(expectedReclaimEvents, numMatches(output.getStdout(), ".*Finish adding retained candidates to collection set. Initial: 1,.*"), "reclaim");
++    }
++
++}
++
++class TestObjectPin {
++
++    private static final WhiteBox wb = WhiteBox.getWhiteBox();
++
++    public static long pinAndGetAddress(Object o) {
++        wb.pinObject(o);
++        return wb.getObjectAddress(o);
++    }
++
++    public static void unpinAndCompareAddress(Object o, long expectedAddress) {
++        Asserts.assertEQ(expectedAddress, wb.getObjectAddress(o), "Object has moved during pinning.");
++        wb.unpinObject(o);
++    }
++
++    public static void main(String[] args) {
++
++        int youngGCBeforeUnpin = Integer.parseInt(args[0]);
++
++        // Remove garbage from VM initialization.
++        wb.fullGC();
++
++        Object o = new int[100];
++        Asserts.assertTrue(!wb.isObjectInOldGen(o), "should not be pinned in old gen");
++
++        long address = pinAndGetAddress(o);
++
++        // First young GC: should move the object into old gen.
++        wb.youngGC();
++        Asserts.assertTrue(wb.isObjectInOldGen(o), "Pinned object not in old gen after young GC");
++
++        // The object is (still) pinned. Do some configurable young gcs that fail to add it to the
++        // collection set candidates.
++        for (int i = 0; i < youngGCBeforeUnpin; i++) {
++          wb.youngGC();
++        }
++        unpinAndCompareAddress(o, address);
++
++        // Unpinned the object. This next gc should take the region if not dropped.
++        wb.youngGC();
++    }
++}
++
+diff --git a/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedOldObjectsEvacuation.java b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedOldObjectsEvacuation.java
+new file mode 100644
+index 00000000000..86f7a62ef70
+--- /dev/null
++++ b/test/hotspot/jtreg/gc/g1/pinnedobjs/TestPinnedOldObjectsEvacuation.java
+@@ -0,0 +1,337 @@
++/*
++ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/* @test
++ * @summary Test pinned objects lifecycle from old gen to eventual reclamation.
++ * @requires vm.gc.G1
++ * @library /test/lib
++ * @modules java.base/jdk.internal.misc
++ *          java.management
++ * @build jdk.test.whitebox.WhiteBox
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
++ * @run driver gc.g1.pinnedobjs.TestPinnedOldObjectsEvacuation
++ */
++
++package gc.g1.pinnedobjs;
++
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import jdk.test.lib.Asserts;
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++import jdk.test.whitebox.WhiteBox;
++
++class TestResultTracker {
++    private int trackedRegion = -1;
++    private int curGC = -1;
++    private String stdout;
++    private int expectedMarkingSkipEvents;      // How many times has the region from the "marking" collection set candidate set been "skipped".
++    private int expectedRetainedSkipEvents;     // How many times has the region from the "retained" collection set candidate set been "skipped".
++    private int expectedDropEvents;             // How many times has the region from the "retained" collection set candidate set been "dropped".
++    private int expectedMarkingReclaimEvents;   // How many times has the region from the "marking" collection set candidate set been put into the collection set.
++    private int expectedRetainedReclaimEvents;  // How many times has the region from the "marking" collection set candidate set been put into the collection set.
++
++    TestResultTracker(String stdout,
++                      int expectedMarkingSkipEvents,
++                      int expectedRetainedSkipEvents,
++                      int expectedDropEvents,
++                      int expectedMarkingReclaimEvents,
++                      int expectedRetainedReclaimEvents) {
++        this.stdout = stdout;
++        this.expectedMarkingSkipEvents = expectedMarkingSkipEvents;
++        this.expectedRetainedSkipEvents = expectedRetainedSkipEvents;
++        this.expectedDropEvents = expectedDropEvents;
++        this.expectedMarkingReclaimEvents = expectedMarkingReclaimEvents;
++        this.expectedRetainedReclaimEvents = expectedRetainedReclaimEvents;
++    }
++
++    private void updateOrCompareCurRegion(String phase, int curRegion) {
++        if (trackedRegion == -1) {
++            trackedRegion = curRegion;
++        } else {
++            if (trackedRegion != curRegion) {
++                Asserts.fail("Expected region " + trackedRegion + " to be used but is " + curRegion);
++            }
++        }
++    }
++
++    private void expectMoreMatches(Matcher matcher, String event) {
++        if (!matcher.find()) {
++            Asserts.fail("Expected one more " + event);
++        }
++    }
++
++    private int expectIncreasingGC(Matcher matcher) {
++        int nextGC = Integer.parseInt(matcher.group(1));
++        if (nextGC <= curGC) {
++            Asserts.fail("Non-increasing GC number from " + curGC + " to " + nextGC);
++        }
++        return nextGC;
++    }
++
++    // Verify log messages based on expected events.
++    //
++    // There are two log messages printed with -Xlog:ergo+cset=trace that report about success or failure to
++    // evacuate particular regions (in this case) due to pinning:
++    //
++    //   1) GC(<x>) Marking/Retained candidate <region-idx> can not be reclaimed currently. Skipping/Dropping.
++    //
++    // and
++    //
++    //   2) GC(<x>) Finish adding retained/marking candidates to collection set. Initial: <y> ... pinned: <z>
++    //
++    // 1) reports about whether the given region has been added to the collection set or not. The last word indicates whether the
++    // region has been removed from the collection set candidates completely ("Dropping"), or just skipped for this collection
++    // ("Skipping")
++    //
++    // This message is printed for every such region, however since the test only pins a single object/region and can only be
++    // in one of the collection set candidate sets, there will be only one message per GC.
++    //
++    // 2) reports statistics about how many regions were added to the initial collection set, optional collection set (not shown
++    // here) and the amount of pinned regions for every kind of collection set candidate sets ("marking" or "retained").
++    //
++    // There are two such messages per GC.
++    //
++    // The code below tracks that single pinned region through the various stages as defined by the policy.
++    //
++    public void verify() throws Exception {
++        final String skipDropEvents = "GC\\((\\d+)\\).*(Marking|Retained) candidate (\\d+) can not be reclaimed currently\\. (Skipping|Dropping)";
++        final String reclaimEvents = "GC\\((\\d+)\\) Finish adding (retained|marking) candidates to collection set\\. Initial: (\\d+).*pinned: (\\d+)";
++
++        Matcher skipDropMatcher = Pattern.compile(skipDropEvents, Pattern.MULTILINE).matcher(stdout);
++        Matcher reclaimMatcher = Pattern.compile(reclaimEvents, Pattern.MULTILINE).matcher(stdout);
++
++        for (int i = 0; i < expectedMarkingSkipEvents; i++) {
++            expectMoreMatches(skipDropMatcher, "expectedMarkingSkipEvents");
++            curGC = expectIncreasingGC(skipDropMatcher);
++
++            Asserts.assertEQ("Marking", skipDropMatcher.group(2), "Expected \"Marking\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(2) + "\"");
++            updateOrCompareCurRegion("MarkingSkip", Integer.parseInt(skipDropMatcher.group(3)));
++            Asserts.assertEQ("Skipping", skipDropMatcher.group(4), "Expected \"Skipping\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(4) + "\"");
++
++            while (true) {
++                if (!reclaimMatcher.find()) {
++                    Asserts.fail("Could not find \"Finish adding * candidates\" line for GC " + curGC);
++                }
++                if (reclaimMatcher.group(2).equals("retained")) {
++                    continue;
++                }
++                if (Integer.parseInt(reclaimMatcher.group(1)) == curGC) {
++                    int actual = Integer.parseInt(reclaimMatcher.group(4));
++                    Asserts.assertEQ(actual, 1, "Expected number of pinned to be 1 after marking skip but is " + actual);
++                    break;
++                }
++            }
++        }
++
++        for (int i = 0; i < expectedRetainedSkipEvents; i++) {
++            expectMoreMatches(skipDropMatcher, "expectedRetainedSkipEvents");
++            curGC = expectIncreasingGC(skipDropMatcher);
++
++            Asserts.assertEQ("Retained", skipDropMatcher.group(2), "Expected \"Retained\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(2) + "\"");
++            updateOrCompareCurRegion("RetainedSkip", Integer.parseInt(skipDropMatcher.group(3)));
++            Asserts.assertEQ("Skipping", skipDropMatcher.group(4), "Expected \"Skipping\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(4) + "\"");
++
++            while (true) {
++                if (!reclaimMatcher.find()) {
++                    Asserts.fail("Could not find \"Finish adding * candidates\" line for GC " + curGC);
++                }
++                if (reclaimMatcher.group(2).equals("marking")) {
++                    continue;
++                }
++                if (Integer.parseInt(reclaimMatcher.group(1)) == curGC) {
++                    int actual = Integer.parseInt(reclaimMatcher.group(4));
++                    Asserts.assertEQ(actual, 1, "Expected number of pinned to be 1 after retained skip but is " + actual);
++                    break;
++                }
++            }
++        }
++
++        for (int i = 0; i < expectedDropEvents; i++) {
++            expectMoreMatches(skipDropMatcher, "expectedDropEvents");
++            curGC = expectIncreasingGC(skipDropMatcher);
++
++            Asserts.assertEQ("Retained", skipDropMatcher.group(2), "Expected \"Retained\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(2) + "\"");
++            updateOrCompareCurRegion("RetainedDrop", Integer.parseInt(skipDropMatcher.group(3)));
++            Asserts.assertEQ("Dropping", skipDropMatcher.group(4), "Expected \"Dropping\" tag for GC " + curGC + " but got \"" + skipDropMatcher.group(4) + "\"");
++
++            while (true) {
++                if (!reclaimMatcher.find()) {
++                    Asserts.fail("Could not find \"Finish adding * candidates\" line for GC " + curGC);
++                }
++                if (reclaimMatcher.group(2).equals("marking")) {
++                    continue;
++                }
++                if (Integer.parseInt(reclaimMatcher.group(1)) == curGC) {
++                    int actual = Integer.parseInt(reclaimMatcher.group(4));
++                    if (actual != 1) {
++                        Asserts.fail("Expected number of pinned to be 1 after dropping but is " + actual);
++                    }
++                    break;
++                }
++            }
++        }
++
++        for (int i = 0; i < expectedMarkingReclaimEvents; i++) {
++            expectMoreMatches(reclaimMatcher, "\"Finish adding * candidates\" line for GC " + curGC);
++
++            int nextGC = Integer.parseInt(reclaimMatcher.group(1));
++            curGC = nextGC;
++            if (reclaimMatcher.group(2).equals("retained")) {
++                continue;
++            }
++
++            if (Integer.parseInt(reclaimMatcher.group(1)) == nextGC) {
++                int actual = Integer.parseInt(reclaimMatcher.group(4));
++                if (actual != 0) {
++                    Asserts.fail("Expected number of pinned to be 0 after marking reclaim but is " + actual);
++                }
++            }
++        }
++
++        for (int i = 0; i < expectedRetainedReclaimEvents; i++) {
++            expectMoreMatches(reclaimMatcher, "\"Finish adding * candidates\" line for GC " + curGC);
++
++            int nextGC = Integer.parseInt(reclaimMatcher.group(1));
++            curGC = nextGC;
++            if (reclaimMatcher.group(2).equals("marking")) {
++                continue;
++            }
++
++            if (Integer.parseInt(reclaimMatcher.group(1)) == nextGC) {
++                int actual = Integer.parseInt(reclaimMatcher.group(4));
++                if (actual != 0) {
++                    Asserts.fail("Expected number of pinned to be 0 after retained reclaim but is " + actual);
++                }
++            }
++        }
++    }
++}
++
++public class TestPinnedOldObjectsEvacuation {
++
++    public static void main(String[] args) throws Exception {
++        // younGCsBeforeUnpin, expectedMarkingSkipEvents, expectedRetainedSkipEvents, expectedDropEvents, expectedMarkingReclaimEvents, expectedRetainedReclaimEvents
++        testPinnedEvacuation(1, 1, 0, 0, 0, 1);
++        testPinnedEvacuation(2, 1, 1, 0, 0, 1);
++        testPinnedEvacuation(3, 1, 2, 0, 0, 1);
++        testPinnedEvacuation(4, 1, 2, 1, 0, 0);
++    }
++
++    private static int numMatches(String stringToMatch, String pattern) {
++        Pattern r = Pattern.compile(pattern);
++        Matcher m = r.matcher(stringToMatch);
++        return (int)m.results().count();
++    }
++
++    private static void assertMatches(int expected, int actual, String what) {
++        if (expected != actual) {
++          Asserts.fail("Expected " + expected + " " + what + " events but got " + actual);
++        }
++    }
++
++    private static void testPinnedEvacuation(int youngGCsBeforeUnpin,
++                                             int expectedMarkingSkipEvents,
++                                             int expectedRetainedSkipEvents,
++                                             int expectedDropEvents,
++                                             int expectedMarkingReclaimEvents,
++                                             int expectedRetainedReclaimEvents) throws Exception {
++        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder("-XX:+UseG1GC",
++                                                                             "-XX:+UnlockDiagnosticVMOptions",
++                                                                             "-XX:+WhiteBoxAPI",
++                                                                             "-Xbootclasspath/a:.",
++                                                                             "-Xmx32M",
++                                                                             "-Xmn16M",
++                                                                             "-XX:MarkSweepDeadRatio=0",
++                                                                             "-XX:G1NumCollectionsKeepPinned=3",
++                                                                             "-XX:+UnlockExperimentalVMOptions",
++                                                                             // Take all old regions to make sure that the pinned one is included in the collection set.
++                                                                             "-XX:G1MixedGCLiveThresholdPercent=100",
++                                                                             "-XX:G1HeapWastePercent=0",
++                                                                             "-XX:+VerifyAfterGC",
++                                                                             "-Xlog:gc,gc+ergo+cset=trace",
++                                                                             TestObjectPin.class.getName(),
++                                                                             String.valueOf(youngGCsBeforeUnpin));
++
++        OutputAnalyzer output = new OutputAnalyzer(pb.start());
++        System.out.println(output.getStdout());
++        output.shouldHaveExitValue(0);
++
++        TestResultTracker t = new TestResultTracker(output.getStdout(),
++                                                    expectedMarkingSkipEvents,
++                                                    expectedRetainedSkipEvents,
++                                                    expectedDropEvents,
++                                                    expectedMarkingReclaimEvents,
++                                                    expectedRetainedReclaimEvents);
++        t.verify();
++    }
++
++}
++
++class TestObjectPin {
++
++    private static final WhiteBox wb = WhiteBox.getWhiteBox();
++
++    public static long pinAndGetAddress(Object o) {
++        wb.pinObject(o);
++        return wb.getObjectAddress(o);
++    }
++
++    public static void unpinAndCompareAddress(Object o, long expectedAddress) {
++        Asserts.assertEQ(expectedAddress, wb.getObjectAddress(o), "Object has moved during pinning.");
++        wb.unpinObject(o);
++    }
++
++    public static void main(String[] args) {
++
++        int youngGCBeforeUnpin = Integer.parseInt(args[0]);
++        // Remove garbage from VM initialization
++        wb.fullGC();
++
++        Object o = new int[100];
++        Asserts.assertTrue(!wb.isObjectInOldGen(o), "should not be pinned in old gen");
++
++        long address = pinAndGetAddress(o);
++
++        // Move pinned object into old gen. That region containing it should be almost completely empty,
++        // so it will be picked up as collection set candidate.
++        wb.fullGC();
++        Asserts.assertTrue(wb.isObjectInOldGen(o), "Pinned object not in old gen after young GC");
++
++        // Do a concurrent cycle to move the region into the marking candidates.
++        wb.g1RunConcurrentGC();
++        // Perform the "Prepare Mixed" GC.
++        wb.youngGC();
++        // The object is (still) pinned. Do some configurable young gcs that fail to add it to the
++        // collection set candidates.
++        for (int i = 0; i < youngGCBeforeUnpin; i++) {
++          wb.youngGC();
++        }
++        unpinAndCompareAddress(o, address);
++
++        // Unpinned the object. This next gc should take the region if not dropped.
++        wb.youngGC();
++    }
++}
++
+diff --git a/test/hotspot/jtreg/gc/g1/plab/TestPLABEvacuationFailure.java b/test/hotspot/jtreg/gc/g1/plab/TestPLABEvacuationFailure.java
+index e4ca3f9ea85..ecceca21f2b 100644
+--- a/test/hotspot/jtreg/gc/g1/plab/TestPLABEvacuationFailure.java
++++ b/test/hotspot/jtreg/gc/g1/plab/TestPLABEvacuationFailure.java
+@@ -24,7 +24,7 @@
+  /*
+  * @test TestPLABEvacuationFailure
+  * @bug 8148376
+- * @summary Checks PLAB statistics on evacuation failure
++ * @summary Checks PLAB statistics on evacuation/allocation failure
+  * @requires vm.gc.G1
+  * @library /test/lib /
+  * @modules java.base/jdk.internal.misc
+@@ -196,7 +196,7 @@ public class TestPLABEvacuationFailure {
+ 
+     private static List<Long> getGcIdPlabEvacFailures(OutputAnalyzer out) {
+         return out.asLines().stream()
+-                .filter(line -> line.contains("(Evacuation Failure)"))
++                .filter(line -> line.contains("(Evacuation Failure"))
+                 .map(line -> LogParser.getGcIdFromLine(line, GC_ID_PATTERN))
+                 .collect(Collectors.toList());
+     }
+diff --git a/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/TestJNIBlockFullGC.java b/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/TestJNIBlockFullGC.java
+deleted file mode 100644
+index 6a336e7b9f1..00000000000
+--- a/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/TestJNIBlockFullGC.java
++++ /dev/null
+@@ -1,191 +0,0 @@
+-/*
+- * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2017 SAP SE and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- */
+-
+-package gc.stress.TestJNIBlockFullGC;
+-
+-/*
+- * @test TestJNIBlockFullGC
+- * @summary Check that in G1 a Full GC to reclaim space can not be blocked out by the GC locker.
+- * @key randomness
+- * @requires vm.gc.G1
+- * @library /test/lib
+- * @run main/othervm/native -Xmx64m -XX:+UseG1GC -Xlog:gc=info,gc+alloc=trace -XX:MaxGCPauseMillis=10 gc.stress.TestJNIBlockFullGC.TestJNIBlockFullGC 10 10000 10000 10000 30000 10000 0.7
+- */
+-
+-import java.lang.ref.SoftReference;
+-import java.util.Random;
+-import jdk.test.lib.Utils;
+-
+-public class TestJNIBlockFullGC {
+-    private static final Random rng = Utils.getRandomInstance();
+-
+-    static {
+-        System.loadLibrary("TestJNIBlockFullGC");
+-    }
+-
+-    public static volatile Object tmp;
+-
+-    public static volatile boolean hadError = false;
+-
+-    private static native int TestCriticalArray0(int[] x);
+-
+-    public static class Node {
+-        public SoftReference<Node> next;
+-        long payload1;
+-        long payload2;
+-        long payload3;
+-        long payload4;
+-
+-        public Node(int load) {
+-            payload1 = payload2 = payload3 = payload4 = load;
+-        }
+-    }
+-
+-    public static void warmUp(long warmupEndTimeNanos, int size, long seed) {
+-        Random r = new Random(seed);
+-        // First let the GC assume most of our objects will die.
+-        Node[] roots = new Node[size];
+-
+-        while (System.nanoTime() - warmupEndTimeNanos < 0) {
+-            int index = (int) (r.nextDouble() * roots.length);
+-            roots[index] = new Node(1);
+-        }
+-
+-        // Make sure the young generation is empty.
+-        for (int i = 0; i < roots.length; ++i) {
+-            roots[i] = null;
+-        }
+-    }
+-
+-    public static void runTest(long endTimeNanos, int size, double alive, long seed) {
+-        Random r = new Random(seed);
+-        final int length = 10000;
+-        int[] array1 = new int[length];
+-        for (int x = 1; x < length; x++) {
+-            array1[x] = x;
+-        }
+-
+-        Node[] roots = new Node[size];
+-        try {
+-            int index = 0;
+-            roots[0] = new Node(0);
+-
+-            while (!hadError && (System.nanoTime() - endTimeNanos < 0)) {
+-                int test_val1 = TestCriticalArray0(array1);
+-
+-                if (r.nextDouble() > alive) {
+-                    tmp = new Node(test_val1);
+-                } else {
+-                    index = (int) (r.nextDouble() * roots.length);
+-
+-                    if (roots[index] != null) {
+-                        Node node = new Node(test_val1);
+-                        node.next = new SoftReference<Node>(roots[index]);
+-                        roots[index] = node;
+-                    } else {
+-                        roots[index] = new Node(test_val1);
+-                    }
+-                }
+-            }
+-        } catch (OutOfMemoryError e) {
+-            hadError = true;
+-            e.printStackTrace();
+-        }
+-    }
+-
+-    private static void joinThreads(Thread[] threads) throws Exception {
+-        for (int i = 0; i < threads.length; i++) {
+-            try {
+-                if (threads[i] != null) {
+-                  threads[i].join();
+-                }
+-            } catch (InterruptedException e) {
+-                e.printStackTrace();
+-                throw e;
+-            }
+-        }
+-    }
+-
+-    public static void main(String[] args) throws Exception {
+-        if (args.length < 7){
+-            System.out.println("Usage: java TestJNIBlockFullGC <warmupThreads> <warmup-time-in-millis> <warmup iterations> <threads> <time-in-millis> <iterations> <aliveFrac>");
+-            System.exit(0);
+-        }
+-
+-        int warmupThreads = Integer.parseInt(args[0]);
+-        System.out.println("# Warmup Threads = " + warmupThreads);
+-
+-        long warmupDurationNanos = 1_000_000L * Integer.parseInt(args[1]);
+-        System.out.println("WarmUp Duration Millis = " + args[1]);
+-        int warmupIterations = Integer.parseInt(args[2]);
+-        System.out.println("# Warmup Iterations = "+ warmupIterations);
+-
+-        int mainThreads = Integer.parseInt(args[3]);
+-        System.out.println("# Main Threads = " + mainThreads);
+-        long mainDurationNanos = 1_000_000L * Integer.parseInt(args[4]);
+-        System.out.println("Main Duration Millis = " + args[4]);
+-        int mainIterations = Integer.parseInt(args[5]);
+-        System.out.println("# Main Iterations = " + mainIterations);
+-
+-        double liveFrac = Double.parseDouble(args[6]);
+-        System.out.println("Live Fraction = " + liveFrac);
+-
+-        Thread threads[] = new Thread[Math.max(warmupThreads, mainThreads)];
+-
+-        System.out.println("Start warm-up threads!");
+-        long warmupStartTimeNanos = System.nanoTime();
+-        for (int i = 0; i < warmupThreads; i++) {
+-            long seed = rng.nextLong();
+-            threads[i] = new Thread() {
+-                public void run() {
+-                    warmUp(warmupStartTimeNanos + warmupDurationNanos, warmupIterations, seed);
+-                };
+-            };
+-            threads[i].start();
+-        }
+-
+-        joinThreads(threads);
+-
+-        System.gc();
+-        System.out.println("Keep alive a lot");
+-
+-        long startTimeNanos = System.nanoTime();
+-        for (int i = 0; i < mainThreads; i++) {
+-            long seed = rng.nextLong();
+-            threads[i] = new Thread() {
+-                public void run() {
+-                    runTest(startTimeNanos + mainDurationNanos, mainIterations, liveFrac, seed);
+-                };
+-            };
+-            threads[i].start();
+-        }
+-        System.out.println("All threads started");
+-
+-        joinThreads(threads);
+-
+-        if (hadError) {
+-            throw new RuntimeException("Experienced an OoME during execution.");
+-        }
+-    }
+-}
+diff --git a/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/libTestJNIBlockFullGC.c b/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/libTestJNIBlockFullGC.c
+deleted file mode 100644
+index 76448c825d8..00000000000
+--- a/test/hotspot/jtreg/gc/stress/TestJNIBlockFullGC/libTestJNIBlockFullGC.c
++++ /dev/null
+@@ -1,47 +0,0 @@
+-/*
+- * Copyright (c) 2018, 2020, Oracle and/or its affiliates. All rights reserved.
+- * Copyright (c) 2017 SAP SE and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- */
+-
+-#include "jni.h"
+-
+-JNIEXPORT jint JNICALL
+-Java_gc_stress_TestJNIBlockFullGC_TestJNIBlockFullGC_TestCriticalArray0(JNIEnv *env, jclass jCls, jintArray jIn) {
+-  jint *bufIn = NULL;
+-  jint jInLen = (*env)->GetArrayLength(env, jIn);
+-  jint result = 0;
+-  jint i;
+-
+-  if (jInLen != 0) {
+-    bufIn = (jint*)(*env)->GetPrimitiveArrayCritical(env, jIn, 0);
+-  }
+-
+-  for (i = 0; i < jInLen; ++i) {
+-    result += bufIn[i]; // result = sum of all array elements
+-  }
+-
+-  if (bufIn != NULL) {
+-    (*env)->ReleasePrimitiveArrayCritical(env, jIn, bufIn, 0);
+-  }
+-
+-  return result;
+-}
+diff --git a/test/hotspot/jtreg/gc/stress/gclocker/TestExcessGCLockerCollections.java b/test/hotspot/jtreg/gc/stress/gclocker/TestExcessGCLockerCollections.java
+index deaf08748a6..d18548abdfe 100644
+--- a/test/hotspot/jtreg/gc/stress/gclocker/TestExcessGCLockerCollections.java
++++ b/test/hotspot/jtreg/gc/stress/gclocker/TestExcessGCLockerCollections.java
+@@ -31,6 +31,8 @@ package gc.stress.gclocker;
+  * @requires vm.gc != "Z"
+  * @requires vm.gc != "Epsilon"
+  * @requires vm.gc != "Shenandoah"
++ * @requires vm.gc != "G1"
++ * @requires vm.gc != null
+  * @library /test/lib
+  * @modules java.base/jdk.internal.misc
+  * @run driver/timeout=1000 gc.stress.gclocker.TestExcessGCLockerCollections 300 4 2
+@@ -151,7 +153,7 @@ public class TestExcessGCLockerCollections {
+     private static final String BAD_LOCKER = locker + " [1-9][0-9]?M";
+ 
+     private static final String[] COMMON_OPTIONS = new String[] {
+-        "-Xmx1G", "-Xms1G", "-Xmn256M", "-Xlog:gc" };
++        "-Xmx1G", "-Xms1G", "-Xmn256M", "-Xlog:gc,gc+ergo*=debug,gc+ergo+cset=trace:x.log", "-XX:+UnlockDiagnosticVMOptions", "-XX:+VerifyAfterGC"};
+ 
+     public static void main(String args[]) throws Exception {
+         if (args.length < 3) {
+diff --git a/test/jdk/jdk/jfr/event/gc/collection/TestG1ParallelPhases.java b/test/jdk/jdk/jfr/event/gc/collection/TestG1ParallelPhases.java
+index 3d378712c42..1e64a0bb4e4 100644
+--- a/test/jdk/jdk/jfr/event/gc/collection/TestG1ParallelPhases.java
++++ b/test/jdk/jdk/jfr/event/gc/collection/TestG1ParallelPhases.java
+@@ -125,7 +125,7 @@ public class TestG1ParallelPhases {
+         // since we can not reliably guarantee that they occur (or not).
+         Set<String> optPhases = of(
+             // The following phases only occur on evacuation failure.
+-            "RestoreRetainedRegions",
++            "RestoreEvacuationFailedRegions",
+             "RemoveSelfForwards",
+             "RestorePreservedMarks",
+             "ProcessEvacuationFailedRegions",
+diff --git a/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1ConcurrentMark.java b/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1ConcurrentMark.java
+index 5ec810b11c8..bd3a7f63a8a 100644
+--- a/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1ConcurrentMark.java
++++ b/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1ConcurrentMark.java
+@@ -40,7 +40,7 @@ public class TestGCCauseWithG1ConcurrentMark {
+         String testID = "G1ConcurrentMark";
+         String[] vmFlags = {"-XX:+UseG1GC", "-XX:+ExplicitGCInvokesConcurrent"};
+         String[] gcNames = {GCHelper.gcG1New, GCHelper.gcG1Old, GCHelper.gcG1Full};
+-        String[] gcCauses = {"Metadata GC Threshold", "GCLocker Initiated GC", "G1 Evacuation Pause", "G1 Preventive Collection",
++        String[] gcCauses = {"Metadata GC Threshold", "G1 Evacuation Pause", "G1 Preventive Collection",
+                              "G1 Compaction Pause", "System.gc()"};
+         GCGarbageCollectionUtil.test(testID, vmFlags, gcNames, gcCauses);
+     }
+diff --git a/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1FullCollection.java b/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1FullCollection.java
+index a83e0ba6d6f..072c3905baf 100644
+--- a/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1FullCollection.java
++++ b/test/jdk/jdk/jfr/event/gc/collection/TestGCCauseWithG1FullCollection.java
+@@ -40,7 +40,7 @@ public class TestGCCauseWithG1FullCollection {
+         String testID = "G1FullCollection";
+         String[] vmFlags = {"-XX:+UseG1GC"};
+         String[] gcNames = {GCHelper.gcG1New, GCHelper.gcG1Old, GCHelper.gcG1Full};
+-        String[] gcCauses = {"Metadata GC Threshold", "GCLocker Initiated GC", "G1 Evacuation Pause", "G1 Preventive Collection",
++        String[] gcCauses = {"Metadata GC Threshold", "G1 Evacuation Pause", "G1 Preventive Collection",
+                              "G1 Compaction Pause", "System.gc()"};
+         GCGarbageCollectionUtil.test(testID, vmFlags, gcNames, gcCauses);
+     }
+diff --git a/test/jdk/jdk/jfr/event/gc/detailed/TestGCLockerEvent.java b/test/jdk/jdk/jfr/event/gc/detailed/TestGCLockerEvent.java
+index f0d9fa3f35a..596af47de39 100644
+--- a/test/jdk/jdk/jfr/event/gc/detailed/TestGCLockerEvent.java
++++ b/test/jdk/jdk/jfr/event/gc/detailed/TestGCLockerEvent.java
+@@ -26,11 +26,12 @@
+  * @test TestGCLockerEvent
+  * @key jfr
+  * @requires vm.hasJFR
+- * @requires vm.gc.G1
++ * @requires vm.gc.Serial | vm.gc.Parallel
++ * @requires vm.gc != null
+  * @library /test/lib
+  * @build jdk.test.whitebox.WhiteBox
+  * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
+- * @run main/othervm -Xbootclasspath/a:. -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -Xmx32m -Xms32m -Xmn12m -XX:+UseG1GC jdk.jfr.event.gc.detailed.TestGCLockerEvent
++ * @run main/othervm -Xbootclasspath/a:. -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -Xmx32m -Xms32m -Xmn12m jdk.jfr.event.gc.detailed.TestGCLockerEvent
+  */
+ 
+ package jdk.jfr.event.gc.detailed;
+diff --git a/test/lib/jdk/test/whitebox/WhiteBox.java b/test/lib/jdk/test/whitebox/WhiteBox.java
+index 3743aa506ff..4023d97e696 100644
+--- a/test/lib/jdk/test/whitebox/WhiteBox.java
++++ b/test/lib/jdk/test/whitebox/WhiteBox.java
+@@ -785,6 +785,10 @@ public class WhiteBox {
+ 
+   public native void unlockCritical();
+ 
++  public native void pinObject(Object o);
++
++  public native void unpinObject(Object o);
++
+   public native boolean setVirtualThreadsNotifyJvmtiMode(boolean enabled);
+ 
+   public native void preTouchMemory(long addr, long size);

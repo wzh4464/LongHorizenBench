@@ -1,0 +1,17 @@
+diff --git a/src/transformer/scaled_masked_softmax_grad_v2/scaled_masked_softmax_grad_v2_norm_headdim.h b/src/transformer/scaled_masked_softmax_grad_v2/scaled_masked_softmax_grad_v2_norm_headdim.h
+index 91f4704..495df12 100644
+--- a/src/transformer/scaled_masked_softmax_grad_v2/scaled_masked_softmax_grad_v2_norm_headdim.h
++++ b/src/transformer/scaled_masked_softmax_grad_v2/scaled_masked_softmax_grad_v2_norm_headdim.h
+@@ -122,9 +122,9 @@ __aicore__ inline void ScaledMaskedSoftmaxGradV2NormHeadDim<T>::ComputeSoftmaxGr
+         Cast(tmpBufY, yLocal, RoundMode::CAST_NONE, this->calcNum);
+         inQueueYGrad.FreeTensor(yGradLocal);
+         inQueueY.FreeTensor(yLocal);
+-        DoSoftmaxGrad(tmpBufYGrad, tmpBufYGrad, tmpBufY);
+-        DoScaleAndMask(tmpBufYGrad);
+-        Cast(xGradLocal, tmpBufYGrad, RoundMode::CAST_RINT, this->calcNum);
++        DoSoftmaxGrad(tmpBufY, tmpBufYGrad, tmpBufY);
++        DoScaleAndMask(tmpBufY);
++        Cast(xGradLocal, tmpBufY, RoundMode::CAST_RINT, this->calcNum);
+     }
+     outQueueXGrad.EnQue(xGradLocal);
+ }

@@ -1,0 +1,1 @@
+sources/images/compress_activation_coloured.png

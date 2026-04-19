@@ -1,0 +1,3 @@
+Python/Python-ast.c
+Python/importlib_external.h
+Python/importlib_zipimport.h

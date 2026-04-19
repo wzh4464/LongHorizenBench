@@ -1,0 +1,21 @@
+# Codex 隔离运行环境
+FROM node:22-bookworm
+
+# 安装基础工具
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    ripgrep \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Codex CLI
+RUN npm install -g @openai/codex
+
+# 创建工作用户
+RUN useradd -m -s /bin/bash codex
+USER codex
+WORKDIR /workspace
+
+# 默认入口
+ENTRYPOINT ["codex"]

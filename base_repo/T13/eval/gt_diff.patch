@@ -1,0 +1,3509 @@
+diff --git a/doc/classes/Animation.xml b/doc/classes/Animation.xml
+index 887e9cda81..609d7eff39 100644
+--- a/doc/classes/Animation.xml
++++ b/doc/classes/Animation.xml
+@@ -34,6 +34,14 @@
+ 		<link title="Animation documentation index">$DOCS_URL/tutorials/animation/index.html</link>
+ 	</tutorials>
+ 	<methods>
++		<method name="add_marker">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" />
++			<param index="1" name="time" type="float" />
++			<description>
++				Adds a marker to this Animation.
++			</description>
++		</method>
+ 		<method name="add_track">
+ 			<return type="int" />
+ 			<param index="0" name="type" type="int" enum="Animation.TrackType" />
+@@ -271,12 +279,60 @@
+ 				Returns the index of the specified track. If the track is not found, return -1.
+ 			</description>
+ 		</method>
++		<method name="get_marker_at_time" qualifiers="const">
++			<return type="StringName" />
++			<param index="0" name="time" type="float" />
++			<description>
++				Returns the name of the marker located at the given time.
++			</description>
++		</method>
++		<method name="get_marker_color" qualifiers="const">
++			<return type="Color" />
++			<param index="0" name="name" type="StringName" />
++			<description>
++				Returns the given marker's color.
++			</description>
++		</method>
++		<method name="get_marker_names" qualifiers="const">
++			<return type="PackedStringArray" />
++			<description>
++				Returns every marker in this Animation, sorted ascending by time.
++			</description>
++		</method>
++		<method name="get_marker_time" qualifiers="const">
++			<return type="float" />
++			<param index="0" name="name" type="StringName" />
++			<description>
++				Returns the given marker's time.
++			</description>
++		</method>
++		<method name="get_next_marker" qualifiers="const">
++			<return type="StringName" />
++			<param index="0" name="time" type="float" />
++			<description>
++				Returns the closest marker that comes after the given time. If no such marker exists, an empty string is returned.
++			</description>
++		</method>
++		<method name="get_prev_marker" qualifiers="const">
++			<return type="StringName" />
++			<param index="0" name="time" type="float" />
++			<description>
++				Returns the closest marker that comes before the given time. If no such marker exists, an empty string is returned.
++			</description>
++		</method>
+ 		<method name="get_track_count" qualifiers="const">
+ 			<return type="int" />
+ 			<description>
+ 				Returns the amount of tracks in the animation.
+ 			</description>
+ 		</method>
++		<method name="has_marker" qualifiers="const">
++			<return type="bool" />
++			<param index="0" name="name" type="StringName" />
++			<description>
++				Returns [code]true[/code] if this Animation contains a marker with the given name.
++			</description>
++		</method>
+ 		<method name="method_track_get_name" qualifiers="const">
+ 			<return type="StringName" />
+ 			<param index="0" name="track_idx" type="int" />
+@@ -320,6 +376,13 @@
+ 				Returns the interpolated position value at the given time (in seconds). The [param track_idx] must be the index of a 3D position track.
+ 			</description>
+ 		</method>
++		<method name="remove_marker">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" />
++			<description>
++				Removes the marker with the given name from this Animation.
++			</description>
++		</method>
+ 		<method name="remove_track">
+ 			<return type="void" />
+ 			<param index="0" name="track_idx" type="int" />
+@@ -363,6 +426,14 @@
+ 				Returns the interpolated scale value at the given time (in seconds). The [param track_idx] must be the index of a 3D scale track.
+ 			</description>
+ 		</method>
++		<method name="set_marker_color">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" />
++			<param index="1" name="color" type="Color" />
++			<description>
++				Sets the given marker's color.
++			</description>
++		</method>
+ 		<method name="track_find_key" qualifiers="const">
+ 			<return type="int" />
+ 			<param index="0" name="track_idx" type="int" />
+diff --git a/doc/classes/AnimationPlayer.xml b/doc/classes/AnimationPlayer.xml
+index 1ca8ac2fa5..9aeb4b7162 100644
+--- a/doc/classes/AnimationPlayer.xml
++++ b/doc/classes/AnimationPlayer.xml
+@@ -75,6 +75,24 @@
+ 				Returns the node which node path references will travel from.
+ 			</description>
+ 		</method>
++		<method name="get_section_end_time" qualifiers="const">
++			<return type="float" />
++			<description>
++				Returns the end time of the section currently being played.
++			</description>
++		</method>
++		<method name="get_section_start_time" qualifiers="const">
++			<return type="float" />
++			<description>
++				Returns the start time of the section currently being played.
++			</description>
++		</method>
++		<method name="has_section" qualifiers="const">
++			<return type="bool" />
++			<description>
++				Returns [code]true[/code] if an animation is currently playing with section.
++			</description>
++		</method>
+ 		<method name="is_playing" qualifiers="const">
+ 			<return type="bool" />
+ 			<description>
+@@ -110,6 +128,54 @@
+ 				This method is a shorthand for [method play] with [code]custom_speed = -1.0[/code] and [code]from_end = true[/code], so see its description for more information.
+ 			</description>
+ 		</method>
++		<method name="play_section">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="1" name="start_time" type="float" default="-1" />
++			<param index="2" name="end_time" type="float" default="-1" />
++			<param index="3" name="custom_blend" type="float" default="-1" />
++			<param index="4" name="custom_speed" type="float" default="1.0" />
++			<param index="5" name="from_end" type="bool" default="false" />
++			<description>
++				Plays the animation with key [param name] and the section starting from [param start_time] and ending on [param end_time]. See also [method play].
++				Setting [param start_time] to a value outside the range of the animation means the start of the animation will be used instead, and setting [param end_time] to a value outside the range of the animation means the end of the animation will be used instead. [param start_time] cannot be equal to [param end_time].
++			</description>
++		</method>
++		<method name="play_section_backwards">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="1" name="start_time" type="float" default="-1" />
++			<param index="2" name="end_time" type="float" default="-1" />
++			<param index="3" name="custom_blend" type="float" default="-1" />
++			<description>
++				Plays the animation with key [param name] and the section starting from [param start_time] and ending on [param end_time] in reverse.
++				This method is a shorthand for [method play_section] with [code]custom_speed = -1.0[/code] and [code]from_end = true[/code], see its description for more information.
++			</description>
++		</method>
++		<method name="play_section_with_markers">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="1" name="start_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="2" name="end_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="3" name="custom_blend" type="float" default="-1" />
++			<param index="4" name="custom_speed" type="float" default="1.0" />
++			<param index="5" name="from_end" type="bool" default="false" />
++			<description>
++				Plays the animation with key [param name] and the section starting from [param start_marker] and ending on [param end_marker].
++				If the start marker is empty, the section starts from the beginning of the animation. If the end marker is empty, the section ends on the end of the animation. See also [method play].
++			</description>
++		</method>
++		<method name="play_section_with_markers_backwards">
++			<return type="void" />
++			<param index="0" name="name" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="1" name="start_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="2" name="end_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="3" name="custom_blend" type="float" default="-1" />
++			<description>
++				Plays the animation with key [param name] and the section starting from [param start_marker] and ending on [param end_marker] in reverse.
++				This method is a shorthand for [method play_section_with_markers] with [code]custom_speed = -1.0[/code] and [code]from_end = true[/code], see its description for more information.
++			</description>
++		</method>
+ 		<method name="play_with_capture">
+ 			<return type="void" />
+ 			<param index="0" name="name" type="StringName" default="&amp;&quot;&quot;" />
+@@ -139,6 +205,12 @@
+ 				[b]Note:[/b] If a looped animation is currently playing, the queued animation will never play unless the looped animation is stopped somehow.
+ 			</description>
+ 		</method>
++		<method name="reset_section">
++			<return type="void" />
++			<description>
++				Resets the current section if section is set.
++			</description>
++		</method>
+ 		<method name="seek">
+ 			<return type="void" />
+ 			<param index="0" name="seconds" type="float" />
+@@ -180,6 +252,23 @@
+ 				Sets the node which node path references will travel from.
+ 			</description>
+ 		</method>
++		<method name="set_section">
++			<return type="void" />
++			<param index="0" name="start_time" type="float" default="-1" />
++			<param index="1" name="end_time" type="float" default="-1" />
++			<description>
++				Changes the start and end times of the section being played. The current playback position will be clamped within the new section. See also [method play_section].
++			</description>
++		</method>
++		<method name="set_section_with_markers">
++			<return type="void" />
++			<param index="0" name="start_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<param index="1" name="end_marker" type="StringName" default="&amp;&quot;&quot;" />
++			<description>
++				Changes the start and end markers of the section being played. The current playback position will be clamped within the new section. See also [method play_section_with_markers].
++				If the argument is empty, the section uses the beginning or end of the animation. If both are empty, it means that the section is not set.
++			</description>
++		</method>
+ 		<method name="stop">
+ 			<return type="void" />
+ 			<param index="0" name="keep_state" type="bool" default="false" />
+diff --git a/editor/animation_track_editor.cpp b/editor/animation_track_editor.cpp
+index d277ba2f6d..63f86607e5 100644
+--- a/editor/animation_track_editor.cpp
++++ b/editor/animation_track_editor.cpp
+@@ -39,6 +39,7 @@
+ #include "editor/editor_string_names.h"
+ #include "editor/editor_undo_redo_manager.h"
+ #include "editor/gui/editor_spin_slider.h"
++#include "editor/gui/editor_validation_panel.h"
+ #include "editor/gui/scene_tree_editor.h"
+ #include "editor/inspector_dock.h"
+ #include "editor/multi_node_edit.h"
+@@ -48,6 +49,7 @@
+ #include "scene/animation/animation_player.h"
+ #include "scene/animation/tween.h"
+ #include "scene/gui/check_box.h"
++#include "scene/gui/color_picker.h"
+ #include "scene/gui/grid_container.h"
+ #include "scene/gui/option_button.h"
+ #include "scene/gui/panel_container.h"
+@@ -1467,7 +1469,7 @@ void AnimationTimelineEdit::_notification(int p_what) {
+ 		case NOTIFICATION_DRAW: {
+ 			int key_range = get_size().width - get_buttons_width() - get_name_limit();
+ 
+-			if (!animation.is_valid()) {
++			if (animation.is_null()) {
+ 				return;
+ 			}
+ 
+@@ -1522,6 +1524,18 @@ void AnimationTimelineEdit::_notification(int p_what) {
+ 					}
+ 				}
+ 
++				PackedStringArray markers = animation->get_marker_names();
++				if (markers.size() > 0) {
++					float min_marker = animation->get_marker_time(markers[0]);
++					float max_marker = animation->get_marker_time(markers[markers.size() - 1]);
++					if (min_marker < time_min) {
++						time_min = min_marker;
++					}
++					if (max_marker > time_max) {
++						time_max = max_marker;
++					}
++				}
++
+ 				float extra = (zoomw / scale) * 0.5;
+ 
+ 				time_max += extra;
+@@ -1701,7 +1715,7 @@ void AnimationTimelineEdit::set_zoom(Range *p_zoom) {
+ }
+ 
+ void AnimationTimelineEdit::auto_fit() {
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return;
+ 	}
+ 
+@@ -1780,7 +1794,7 @@ void AnimationTimelineEdit::update_play_position() {
+ }
+ 
+ void AnimationTimelineEdit::update_values() {
+-	if (!animation.is_valid() || editing) {
++	if (animation.is_null() || editing) {
+ 		return;
+ 	}
+ 
+@@ -1792,6 +1806,7 @@ void AnimationTimelineEdit::update_values() {
+ 		time_icon->set_tooltip_text(TTR("Animation length (frames)"));
+ 		if (track_edit) {
+ 			track_edit->editor->_update_key_edit();
++			track_edit->editor->marker_edit->_update_key_edit();
+ 		}
+ 	} else {
+ 		length->set_value(animation->get_length());
+@@ -1821,7 +1836,7 @@ void AnimationTimelineEdit::update_values() {
+ }
+ 
+ void AnimationTimelineEdit::_play_position_draw() {
+-	if (!animation.is_valid() || play_position_pos < 0) {
++	if (animation.is_null() || play_position_pos < 0) {
+ 		return;
+ 	}
+ 
+@@ -1972,6 +1987,7 @@ AnimationTimelineEdit::AnimationTimelineEdit() {
+ 
+ 	Control *expander = memnew(Control);
+ 	expander->set_h_size_flags(SIZE_EXPAND_FILL);
++	expander->set_mouse_filter(MOUSE_FILTER_IGNORE);
+ 	len_hb->add_child(expander);
+ 	time_icon = memnew(TextureRect);
+ 	time_icon->set_v_size_flags(SIZE_SHRINK_CENTER);
+@@ -2124,6 +2140,62 @@ void AnimationTrackEdit::_notification(int p_what) {
+ 				draw_line(Point2(limit, 0), Point2(limit, get_size().height), h_line_color, Math::round(EDSCALE));
+ 			}
+ 
++			// Marker sections.
++
++			{
++				float scale = timeline->get_zoom_scale();
++				int limit_end = get_size().width - timeline->get_buttons_width();
++
++				PackedStringArray section = editor->get_selected_section();
++				if (section.size() == 2) {
++					StringName start_marker = section[0];
++					StringName end_marker = section[1];
++					double start_time = animation->get_marker_time(start_marker);
++					double end_time = animation->get_marker_time(end_marker);
++
++					// When AnimationPlayer is playing, don't move the preview rect, so it still indicates the playback section.
++					AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++					if (editor->is_marker_moving_selection() && !(player && player->is_playing())) {
++						start_time += editor->get_marker_moving_selection_offset();
++						end_time += editor->get_marker_moving_selection_offset();
++					}
++
++					if (start_time < animation->get_length() && end_time >= 0) {
++						float start_ofs = MAX(0, start_time) - timeline->get_value();
++						float end_ofs = MIN(animation->get_length(), end_time) - timeline->get_value();
++						start_ofs = start_ofs * scale + limit;
++						end_ofs = end_ofs * scale + limit;
++						start_ofs = MAX(start_ofs, limit);
++						end_ofs = MIN(end_ofs, limit_end);
++						Rect2 rect;
++						rect.set_position(Vector2(start_ofs, 0));
++						rect.set_size(Vector2(end_ofs - start_ofs, get_size().height));
++
++						draw_rect(rect, Color(1, 0.1, 0.1, 0.2));
++					}
++				}
++			}
++
++			// Marker overlays.
++
++			{
++				float scale = timeline->get_zoom_scale();
++				PackedStringArray markers = animation->get_marker_names();
++				for (const StringName marker : markers) {
++					double time = animation->get_marker_time(marker);
++					if (editor->is_marker_selected(marker) && editor->is_marker_moving_selection()) {
++						time += editor->get_marker_moving_selection_offset();
++					}
++					if (time >= 0) {
++						float offset = time - timeline->get_value();
++						offset = offset * scale + limit;
++						Color marker_color = animation->get_marker_color(marker);
++						marker_color.a = 0.2;
++						draw_line(Point2(offset, 0), Point2(offset, get_size().height), marker_color);
++					}
++				}
++			}
++
+ 			// Keyframes.
+ 
+ 			draw_bg(limit, get_size().width - timeline->get_buttons_width() - outer_margin);
+@@ -2352,7 +2424,7 @@ void AnimationTrackEdit::_notification(int p_what) {
+ }
+ 
+ int AnimationTrackEdit::get_key_height() const {
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return 0;
+ 	}
+ 
+@@ -2360,7 +2432,7 @@ int AnimationTrackEdit::get_key_height() const {
+ }
+ 
+ Rect2 AnimationTrackEdit::get_key_rect(int p_index, float p_pixels_sec) {
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return Rect2();
+ 	}
+ 	Rect2 rect = Rect2(-type_icon->get_width() / 2, 0, type_icon->get_width(), get_size().height);
+@@ -2399,7 +2471,7 @@ void AnimationTrackEdit::draw_key_link(int p_index, float p_pixels_sec, int p_x,
+ }
+ 
+ void AnimationTrackEdit::draw_key(int p_index, float p_pixels_sec, int p_x, bool p_selected, int p_clip_left, int p_clip_right) {
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return;
+ 	}
+ 
+@@ -2573,7 +2645,7 @@ void AnimationTrackEdit::set_editor(AnimationTrackEditor *p_editor) {
+ }
+ 
+ void AnimationTrackEdit::_play_position_draw() {
+-	if (!animation.is_valid() || play_position_pos < 0) {
++	if (animation.is_null() || play_position_pos < 0) {
+ 		return;
+ 	}
+ 
+@@ -3522,6 +3594,64 @@ void AnimationTrackEditGroup::_notification(int p_what) {
+ 
+ 			draw_style_box(stylebox_header, Rect2(Point2(), get_size()));
+ 
++			int limit = timeline->get_name_limit();
++
++			// Section preview.
++
++			{
++				float scale = timeline->get_zoom_scale();
++				int limit_end = get_size().width - timeline->get_buttons_width();
++
++				PackedStringArray section = editor->get_selected_section();
++				if (section.size() == 2) {
++					StringName start_marker = section[0];
++					StringName end_marker = section[1];
++					double start_time = editor->get_current_animation()->get_marker_time(start_marker);
++					double end_time = editor->get_current_animation()->get_marker_time(end_marker);
++
++					// When AnimationPlayer is playing, don't move the preview rect, so it still indicates the playback section.
++					AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++					if (editor->is_marker_moving_selection() && !(player && player->is_playing())) {
++						start_time += editor->get_marker_moving_selection_offset();
++						end_time += editor->get_marker_moving_selection_offset();
++					}
++
++					if (start_time < editor->get_current_animation()->get_length() && end_time >= 0) {
++						float start_ofs = MAX(0, start_time) - timeline->get_value();
++						float end_ofs = MIN(editor->get_current_animation()->get_length(), end_time) - timeline->get_value();
++						start_ofs = start_ofs * scale + limit;
++						end_ofs = end_ofs * scale + limit;
++						start_ofs = MAX(start_ofs, limit);
++						end_ofs = MIN(end_ofs, limit_end);
++						Rect2 rect;
++						rect.set_position(Vector2(start_ofs, 0));
++						rect.set_size(Vector2(end_ofs - start_ofs, get_size().height));
++
++						draw_rect(rect, Color(1, 0.1, 0.1, 0.2));
++					}
++				}
++			}
++
++			// Marker overlays.
++
++			{
++				float scale = timeline->get_zoom_scale();
++				PackedStringArray markers = editor->get_current_animation()->get_marker_names();
++				for (const StringName marker : markers) {
++					double time = editor->get_current_animation()->get_marker_time(marker);
++					if (editor->is_marker_selected(marker) && editor->is_marker_moving_selection()) {
++						time += editor->get_marker_moving_selection_offset();
++					}
++					if (time >= 0) {
++						float offset = time - timeline->get_value();
++						offset = offset * scale + limit;
++						Color marker_color = editor->get_current_animation()->get_marker_color(marker);
++						marker_color.a = 0.2;
++						draw_line(Point2(offset, 0), Point2(offset, get_size().height), marker_color);
++					}
++				}
++			}
++
+ 			draw_line(Point2(), Point2(get_size().width, 0), h_line_color, Math::round(EDSCALE));
+ 			draw_line(Point2(timeline->get_name_limit(), 0), Point2(timeline->get_name_limit(), get_size().height), v_line_color, Math::round(EDSCALE));
+ 			draw_line(Point2(get_size().width - timeline->get_buttons_width() - outer_margin, 0), Point2(get_size().width - timeline->get_buttons_width() - outer_margin, get_size().height), v_line_color, Math::round(EDSCALE));
+@@ -3590,6 +3720,10 @@ void AnimationTrackEditGroup::set_root(Node *p_root) {
+ 	queue_redraw();
+ }
+ 
++void AnimationTrackEditGroup::set_editor(AnimationTrackEditor *p_editor) {
++	editor = p_editor;
++}
++
+ void AnimationTrackEditGroup::_zoom_changed() {
+ 	queue_redraw();
+ }
+@@ -3623,6 +3757,9 @@ void AnimationTrackEditor::set_animation(const Ref<Animation> &p_anim, bool p_re
+ 	read_only = p_read_only;
+ 	timeline->set_animation(p_anim, read_only);
+ 
++	marker_edit->set_animation(p_anim, read_only);
++	marker_edit->set_play_position(timeline->get_play_position());
++
+ 	_cancel_bezier_edit();
+ 	_update_tracks();
+ 
+@@ -3873,6 +4010,7 @@ void AnimationTrackEditor::_track_grab_focus(int p_track) {
+ 
+ void AnimationTrackEditor::set_anim_pos(float p_pos) {
+ 	timeline->set_play_position(p_pos);
++	marker_edit->set_play_position(p_pos);
+ 	for (int i = 0; i < track_edits.size(); i++) {
+ 		track_edits[i]->set_play_position(p_pos);
+ 	}
+@@ -4043,7 +4181,7 @@ void AnimationTrackEditor::insert_transform_key(Node3D *p_node, const String &p_
+ 	if (!keying) {
+ 		return;
+ 	}
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return;
+ 	}
+ 
+@@ -4083,7 +4221,7 @@ bool AnimationTrackEditor::has_track(Node3D *p_node, const String &p_sub, const
+ 	if (!keying) {
+ 		return false;
+ 	}
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return false;
+ 	}
+ 
+@@ -4230,6 +4368,22 @@ void AnimationTrackEditor::insert_node_value_key(Node *p_node, const String &p_p
+ 	_query_insert(id);
+ }
+ 
++PackedStringArray AnimationTrackEditor::get_selected_section() const {
++	return marker_edit->get_selected_section();
++}
++
++bool AnimationTrackEditor::is_marker_selected(const StringName &p_marker) const {
++	return marker_edit->is_marker_selected(p_marker);
++}
++
++bool AnimationTrackEditor::is_marker_moving_selection() const {
++	return marker_edit->is_moving_selection();
++}
++
++float AnimationTrackEditor::get_marker_moving_selection_offset() const {
++	return marker_edit->get_moving_selection_offset();
++}
++
+ void AnimationTrackEditor::insert_value_key(const String &p_property, bool p_advance) {
+ 	EditorSelectionHistory *history = EditorNode::get_singleton()->get_editor_selection_history();
+ 
+@@ -4316,7 +4470,7 @@ void AnimationTrackEditor::_confirm_insert_list() {
+ 
+ PropertyInfo AnimationTrackEditor::_find_hint_for_track(int p_idx, NodePath &r_base_path, Variant *r_current_val) {
+ 	r_base_path = NodePath();
+-	ERR_FAIL_COND_V(!animation.is_valid(), PropertyInfo());
++	ERR_FAIL_COND_V(animation.is_null(), PropertyInfo());
+ 	ERR_FAIL_INDEX_V(p_idx, animation->get_track_count(), PropertyInfo());
+ 
+ 	if (!root) {
+@@ -4769,6 +4923,7 @@ void AnimationTrackEditor::_update_tracks() {
+ 				g->set_root(root);
+ 				g->set_tooltip_text(tooltip);
+ 				g->set_timeline(timeline);
++				g->set_editor(this);
+ 				groups.push_back(g);
+ 				VBoxContainer *vb = memnew(VBoxContainer);
+ 				vb->add_theme_constant_override("separation", 0);
+@@ -4860,12 +5015,13 @@ void AnimationTrackEditor::_snap_mode_changed(int p_mode) {
+ 	if (key_edit) {
+ 		key_edit->set_use_fps(use_fps);
+ 	}
++	marker_edit->set_use_fps(use_fps);
+ 	step->set_step(use_fps ? FPS_DECIMAL : SECOND_DECIMAL);
+ 	_update_step_spinbox();
+ }
+ 
+ void AnimationTrackEditor::_update_step_spinbox() {
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return;
+ 	}
+ 	step->set_block_signals(true);
+@@ -4978,6 +5134,7 @@ void AnimationTrackEditor::_notification(int p_what) {
+ void AnimationTrackEditor::_update_scroll(double) {
+ 	_redraw_tracks();
+ 	_redraw_groups();
++	marker_edit->queue_redraw();
+ }
+ 
+ void AnimationTrackEditor::_update_step(double p_new_step) {
+@@ -5253,6 +5410,8 @@ void AnimationTrackEditor::_timeline_value_changed(double) {
+ 
+ 	bezier_edit->queue_redraw();
+ 	bezier_edit->update_play_position();
++
++	marker_edit->update_play_position();
+ }
+ 
+ int AnimationTrackEditor::_get_track_selected() {
+@@ -5445,6 +5604,8 @@ void AnimationTrackEditor::_key_selected(int p_key, bool p_single, int p_track)
+ 
+ 	_redraw_tracks();
+ 	_update_key_edit();
++
++	marker_edit->_clear_selection(marker_edit->is_selection_active());
+ }
+ 
+ void AnimationTrackEditor::_key_deselected(int p_key, int p_track) {
+@@ -5513,7 +5674,7 @@ void AnimationTrackEditor::_clear_selection(bool p_update) {
+ 
+ void AnimationTrackEditor::_update_key_edit() {
+ 	_clear_key_edit();
+-	if (!animation.is_valid()) {
++	if (animation.is_null()) {
+ 		return;
+ 	}
+ 
+@@ -5600,6 +5761,8 @@ void AnimationTrackEditor::_select_at_anim(const Ref<Animation> &p_anim, int p_t
+ 
+ 	selection.insert(sk, ki);
+ 	_update_key_edit();
++
++	marker_edit->_clear_selection(marker_edit->is_selection_active());
+ }
+ 
+ void AnimationTrackEditor::_move_selection_commit() {
+@@ -7311,6 +7474,15 @@ AnimationTrackEditor::AnimationTrackEditor() {
+ 	box_selection_container->set_clip_contents(true);
+ 	timeline_vbox->add_child(box_selection_container);
+ 
++	marker_edit = memnew(AnimationMarkerEdit);
++	timeline->get_child(0)->add_child(marker_edit);
++	marker_edit->set_editor(this);
++	marker_edit->set_timeline(timeline);
++	marker_edit->set_h_size_flags(SIZE_EXPAND_FILL);
++	marker_edit->set_anchors_and_offsets_preset(Control::LayoutPreset::PRESET_FULL_RECT);
++	marker_edit->connect(SceneStringName(draw), callable_mp(this, &AnimationTrackEditor::_redraw_groups));
++	marker_edit->connect(SceneStringName(draw), callable_mp(this, &AnimationTrackEditor::_redraw_tracks));
++
+ 	scroll = memnew(ScrollContainer);
+ 	box_selection_container->add_child(scroll);
+ 	scroll->set_anchors_and_offsets_preset(PRESET_FULL_RECT);
+@@ -7826,3 +7998,1203 @@ AnimationTrackKeyEditEditor::AnimationTrackKeyEditEditor(Ref<Animation> p_animat
+ 
+ AnimationTrackKeyEditEditor::~AnimationTrackKeyEditEditor() {
+ }
++
++void AnimationMarkerEdit::_zoom_changed() {
++	queue_redraw();
++	play_position->queue_redraw();
++}
++
++void AnimationMarkerEdit::_menu_selected(int p_index) {
++	switch (p_index) {
++		case MENU_KEY_INSERT: {
++			_insert_marker(insert_at_pos);
++		} break;
++		case MENU_KEY_RENAME: {
++			if (selection.size() > 0) {
++				_rename_marker(*selection.last());
++			}
++		} break;
++		case MENU_KEY_DELETE: {
++			_delete_selected_markers();
++		} break;
++		case MENU_KEY_TOGGLE_MARKER_NAMES: {
++			should_show_all_marker_names = !should_show_all_marker_names;
++			queue_redraw();
++		} break;
++	}
++}
++
++void AnimationMarkerEdit::_play_position_draw() {
++	if (animation.is_null() || play_position_pos < 0) {
++		return;
++	}
++
++	float scale = timeline->get_zoom_scale();
++	int h = get_size().height;
++
++	int px = (play_position_pos - timeline->get_value()) * scale + timeline->get_name_limit();
++
++	if (px >= timeline->get_name_limit() && px < (get_size().width - timeline->get_buttons_width())) {
++		Color color = get_theme_color(SNAME("accent_color"), EditorStringName(Editor));
++		play_position->draw_line(Point2(px, 0), Point2(px, h), color, Math::round(2 * EDSCALE));
++	}
++}
++
++bool AnimationMarkerEdit::_try_select_at_ui_pos(const Point2 &p_pos, bool p_aggregate, bool p_deselectable) {
++	int limit = timeline->get_name_limit();
++	int limit_end = get_size().width - timeline->get_buttons_width();
++	// Left Border including space occupied by keyframes on t=0.
++	int limit_start_hitbox = limit - type_icon->get_width();
++
++	if (p_pos.x >= limit_start_hitbox && p_pos.x <= limit_end) {
++		int key_idx = -1;
++		float key_distance = 1e20;
++		PackedStringArray names = animation->get_marker_names();
++		for (int i = 0; i < names.size(); i++) {
++			Rect2 rect = const_cast<AnimationMarkerEdit *>(this)->get_key_rect(timeline->get_zoom_scale());
++			float offset = animation->get_marker_time(names[i]) - timeline->get_value();
++			offset = offset * timeline->get_zoom_scale() + limit;
++			rect.position.x += offset;
++			if (rect.has_point(p_pos)) {
++				if (const_cast<AnimationMarkerEdit *>(this)->is_key_selectable_by_distance()) {
++					float distance = Math::abs(offset - p_pos.x);
++					if (key_idx == -1 || distance < key_distance) {
++						key_idx = i;
++						key_distance = distance;
++					}
++				} else {
++					// First one does it.
++					break;
++				}
++			}
++		}
++
++		if (key_idx != -1) {
++			if (p_aggregate) {
++				StringName name = names[key_idx];
++				if (selection.has(name)) {
++					if (p_deselectable) {
++						call_deferred("_deselect_key", name);
++						moving_selection_pivot = 0.0f;
++						moving_selection_mouse_begin_x = 0.0f;
++					}
++				} else {
++					call_deferred("_select_key", name, false);
++					moving_selection_attempt = true;
++					moving_selection_effective = false;
++					select_single_attempt = StringName();
++					moving_selection_pivot = animation->get_marker_time(name);
++					moving_selection_mouse_begin_x = p_pos.x;
++				}
++
++			} else {
++				StringName name = names[key_idx];
++				if (!selection.has(name)) {
++					call_deferred("_select_key", name, true);
++					select_single_attempt = StringName();
++				} else {
++					select_single_attempt = name;
++				}
++
++				moving_selection_attempt = true;
++				moving_selection_effective = false;
++				moving_selection_pivot = animation->get_marker_time(name);
++				moving_selection_mouse_begin_x = p_pos.x;
++			}
++
++			if (read_only) {
++				moving_selection_attempt = false;
++				moving_selection_pivot = 0.0f;
++				moving_selection_mouse_begin_x = 0.0f;
++			}
++			return true;
++		}
++	}
++
++	return false;
++}
++
++bool AnimationMarkerEdit::_is_ui_pos_in_current_section(const Point2 &p_pos) {
++	int limit = timeline->get_name_limit();
++	int limit_end = get_size().width - timeline->get_buttons_width();
++
++	if (p_pos.x >= limit && p_pos.x <= limit_end) {
++		PackedStringArray section = get_selected_section();
++		if (!section.is_empty()) {
++			StringName start_marker = section[0];
++			StringName end_marker = section[1];
++			float start_offset = (animation->get_marker_time(start_marker) - timeline->get_value()) * timeline->get_zoom_scale() + limit;
++			float end_offset = (animation->get_marker_time(end_marker) - timeline->get_value()) * timeline->get_zoom_scale() + limit;
++			return p_pos.x >= start_offset && p_pos.x <= end_offset;
++		}
++	}
++
++	return false;
++}
++
++HBoxContainer *AnimationMarkerEdit::_create_hbox_labeled_control(const String &p_text, Control *p_control) const {
++	HBoxContainer *hbox = memnew(HBoxContainer);
++	Label *label = memnew(Label);
++	label->set_text(p_text);
++	hbox->add_child(label);
++	hbox->add_child(p_control);
++	hbox->set_h_size_flags(SIZE_EXPAND_FILL);
++	label->set_h_size_flags(SIZE_EXPAND_FILL);
++	label->set_stretch_ratio(1.0);
++	p_control->set_h_size_flags(SIZE_EXPAND_FILL);
++	p_control->set_stretch_ratio(1.0);
++	return hbox;
++}
++
++void AnimationMarkerEdit::_update_key_edit() {
++	_clear_key_edit();
++	if (animation.is_null()) {
++		return;
++	}
++
++	if (selection.size() == 1) {
++		key_edit = memnew(AnimationMarkerKeyEdit);
++		key_edit->animation = animation;
++		key_edit->animation_read_only = read_only;
++		key_edit->marker_name = *selection.begin();
++		key_edit->use_fps = timeline->is_using_fps();
++		key_edit->marker_edit = this;
++
++		EditorNode::get_singleton()->push_item(key_edit);
++
++		InspectorDock::get_singleton()->set_info(TTR("Marker name is read-only in the inspector."), TTR("A marker's name can only be changed by right-clicking it in the animation editor and selecting \"Rename Marker\", in order to make sure that marker names are all unique."), true);
++	} else if (selection.size() > 1) {
++		multi_key_edit = memnew(AnimationMultiMarkerKeyEdit);
++		multi_key_edit->animation = animation;
++		multi_key_edit->animation_read_only = read_only;
++		multi_key_edit->marker_edit = this;
++		for (const StringName &name : selection) {
++			multi_key_edit->marker_names.push_back(name);
++		}
++
++		EditorNode::get_singleton()->push_item(multi_key_edit);
++	}
++}
++
++void AnimationMarkerEdit::_clear_key_edit() {
++	if (key_edit) {
++		// If key edit is the object being inspected, remove it first.
++		if (InspectorDock::get_inspector_singleton()->get_edited_object() == key_edit) {
++			EditorNode::get_singleton()->push_item(nullptr);
++		}
++
++		// Then actually delete it.
++		memdelete(key_edit);
++		key_edit = nullptr;
++	}
++
++	if (multi_key_edit) {
++		if (InspectorDock::get_inspector_singleton()->get_edited_object() == multi_key_edit) {
++			EditorNode::get_singleton()->push_item(nullptr);
++		}
++
++		memdelete(multi_key_edit);
++		multi_key_edit = nullptr;
++	}
++}
++
++void AnimationMarkerEdit::_bind_methods() {
++	ClassDB::bind_method("_clear_selection_for_anim", &AnimationMarkerEdit::_clear_selection_for_anim);
++	ClassDB::bind_method("_select_key", &AnimationMarkerEdit::_select_key);
++	ClassDB::bind_method("_deselect_key", &AnimationMarkerEdit::_deselect_key);
++}
++
++void AnimationMarkerEdit::_notification(int p_what) {
++	switch (p_what) {
++		case NOTIFICATION_THEME_CHANGED: {
++			if (animation.is_null()) {
++				return;
++			}
++
++			type_icon = get_editor_theme_icon(SNAME("Marker"));
++			selected_icon = get_editor_theme_icon(SNAME("MarkerSelected"));
++		} break;
++
++		case NOTIFICATION_DRAW: {
++			if (animation.is_null()) {
++				return;
++			}
++
++			int limit = timeline->get_name_limit();
++
++			Ref<Font> font = get_theme_font(SceneStringName(font), SNAME("Label"));
++			Color color = get_theme_color(SceneStringName(font_color), SNAME("Label"));
++			int hsep = get_theme_constant(SNAME("h_separation"), SNAME("ItemList"));
++			Color linecolor = color;
++			linecolor.a = 0.2;
++
++			// SECTION PREVIEW //
++
++			{
++				float scale = timeline->get_zoom_scale();
++				int limit_end = get_size().width - timeline->get_buttons_width();
++
++				PackedStringArray section = get_selected_section();
++				if (section.size() == 2) {
++					StringName start_marker = section[0];
++					StringName end_marker = section[1];
++					double start_time = animation->get_marker_time(start_marker);
++					double end_time = animation->get_marker_time(end_marker);
++
++					// When AnimationPlayer is playing, don't move the preview rect, so it still indicates the playback section.
++					AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++					if (moving_selection && !(player && player->is_playing())) {
++						start_time += moving_selection_offset;
++						end_time += moving_selection_offset;
++					}
++
++					if (start_time < animation->get_length() && end_time >= 0) {
++						float start_ofs = MAX(0, start_time) - timeline->get_value();
++						float end_ofs = MIN(animation->get_length(), end_time) - timeline->get_value();
++						start_ofs = start_ofs * scale + limit;
++						end_ofs = end_ofs * scale + limit;
++						start_ofs = MAX(start_ofs, limit);
++						end_ofs = MIN(end_ofs, limit_end);
++						Rect2 rect;
++						rect.set_position(Vector2(start_ofs, 0));
++						rect.set_size(Vector2(end_ofs - start_ofs, get_size().height));
++
++						draw_rect(rect, Color(1, 0.1, 0.1, 0.2));
++					}
++				}
++			}
++
++			// KEYFRAMES //
++
++			draw_bg(limit, get_size().width - timeline->get_buttons_width());
++
++			{
++				float scale = timeline->get_zoom_scale();
++				int limit_end = get_size().width - timeline->get_buttons_width();
++
++				PackedStringArray names = animation->get_marker_names();
++				for (int i = 0; i < names.size(); i++) {
++					StringName name = names[i];
++					bool is_selected = selection.has(name);
++					float offset = animation->get_marker_time(name) - timeline->get_value();
++					if (is_selected && moving_selection) {
++						offset += moving_selection_offset;
++					}
++
++					offset = offset * scale + limit;
++
++					draw_key(name, scale, int(offset), is_selected, limit, limit_end);
++
++					const int font_size = 16;
++					Size2 string_size = font->get_string_size(name, HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size);
++					if (int(offset) <= limit_end && int(offset) >= limit && should_show_all_marker_names) {
++						float bottom = get_size().height + string_size.y - font->get_descent(font_size);
++						float extrusion = MAX(0, offset + string_size.x - limit_end); // How much the string would extrude outside limit_end if unadjusted.
++						Color marker_color = animation->get_marker_color(name);
++						draw_string(font, Point2(offset - extrusion, bottom), name, HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size, marker_color);
++						draw_string_outline(font, Point2(offset - extrusion, bottom), name, HORIZONTAL_ALIGNMENT_LEFT, -1.0, font_size, 1, color);
++					}
++				}
++			}
++
++			draw_fg(limit, get_size().width - timeline->get_buttons_width());
++
++			// BUTTONS //
++
++			{
++				int ofs = get_size().width - timeline->get_buttons_width();
++
++				draw_line(Point2(ofs, 0), Point2(ofs, get_size().height), linecolor, Math::round(EDSCALE));
++
++				ofs += hsep;
++			}
++
++			draw_line(Vector2(0, get_size().height), get_size(), linecolor, Math::round(EDSCALE));
++		} break;
++
++		case NOTIFICATION_MOUSE_ENTER:
++			hovered = true;
++			queue_redraw();
++			break;
++		case NOTIFICATION_MOUSE_EXIT:
++			hovered = false;
++			// When the mouse cursor exits the track, we're no longer hovering any keyframe.
++			hovering_marker = StringName();
++			queue_redraw();
++			break;
++	}
++}
++
++void AnimationMarkerEdit::gui_input(const Ref<InputEvent> &p_event) {
++	ERR_FAIL_COND(p_event.is_null());
++
++	if (animation.is_null()) {
++		return;
++	}
++
++	if (p_event->is_pressed()) {
++		if (ED_IS_SHORTCUT("animation_marker_edit/rename_marker", p_event)) {
++			if (!read_only) {
++				_menu_selected(MENU_KEY_RENAME);
++			}
++		}
++
++		if (ED_IS_SHORTCUT("animation_marker_edit/delete_selection", p_event)) {
++			if (!read_only) {
++				_menu_selected(MENU_KEY_DELETE);
++			}
++		}
++
++		if (ED_IS_SHORTCUT("animation_marker_edit/toggle_marker_names", p_event)) {
++			if (!read_only) {
++				_menu_selected(MENU_KEY_TOGGLE_MARKER_NAMES);
++			}
++		}
++	}
++
++	Ref<InputEventMouseButton> mb = p_event;
++
++	if (mb.is_valid() && mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT) {
++		Point2 pos = mb->get_position();
++		if (_try_select_at_ui_pos(pos, mb->is_command_or_control_pressed() || mb->is_shift_pressed(), true)) {
++			accept_event();
++		} else if (!_is_ui_pos_in_current_section(pos)) {
++			_clear_selection_for_anim(animation);
++		}
++	}
++
++	if (mb.is_valid() && moving_selection_attempt) {
++		if (!mb->is_pressed() && mb->get_button_index() == MouseButton::LEFT) {
++			moving_selection_attempt = false;
++			if (moving_selection && moving_selection_effective) {
++				if (Math::abs(moving_selection_offset) > CMP_EPSILON) {
++					_move_selection_commit();
++					accept_event(); // So play position doesn't snap to the end of move selection.
++				}
++			} else if (select_single_attempt) {
++				call_deferred("_select_key", select_single_attempt, true);
++
++				// First select click should not affect play position.
++				if (!selection.has(select_single_attempt)) {
++					accept_event();
++				} else {
++					// Second click and onwards should snap to marker time.
++					double ofs = animation->get_marker_time(select_single_attempt);
++					timeline->set_play_position(ofs);
++					timeline->emit_signal(SNAME("timeline_changed"), ofs, mb->is_alt_pressed());
++					accept_event();
++				}
++			} else {
++				// First select click should not affect play position.
++				if (!selection.has(select_single_attempt)) {
++					accept_event();
++				}
++			}
++
++			moving_selection = false;
++			select_single_attempt = StringName();
++		}
++
++		if (moving_selection && mb->is_pressed() && mb->get_button_index() == MouseButton::RIGHT) {
++			moving_selection_attempt = false;
++			moving_selection = false;
++			_move_selection_cancel();
++		}
++	}
++
++	if (mb.is_valid() && mb->is_pressed() && mb->get_button_index() == MouseButton::RIGHT) {
++		Point2 pos = mb->get_position();
++		if (pos.x >= timeline->get_name_limit() && pos.x <= get_size().width - timeline->get_buttons_width()) {
++			// Can do something with menu too! show insert key.
++			float offset = (pos.x - timeline->get_name_limit()) / timeline->get_zoom_scale();
++			if (!read_only) {
++				bool selected = _try_select_at_ui_pos(pos, mb->is_command_or_control_pressed() || mb->is_shift_pressed(), false);
++
++				menu->clear();
++				menu->add_icon_item(get_editor_theme_icon(SNAME("Key")), TTR("Insert Marker..."), MENU_KEY_INSERT);
++
++				if (selected || selection.size() > 0) {
++					menu->add_icon_item(get_editor_theme_icon(SNAME("Edit")), TTR("Rename Marker"), MENU_KEY_RENAME);
++					menu->add_icon_item(get_editor_theme_icon(SNAME("Remove")), TTR("Delete Marker(s)"), MENU_KEY_DELETE);
++				}
++
++				menu->add_icon_item(get_editor_theme_icon(should_show_all_marker_names ? SNAME("GuiChecked") : SNAME("GuiUnchecked")), TTR("Show All Marker Names"), MENU_KEY_TOGGLE_MARKER_NAMES);
++				menu->reset_size();
++
++				moving_selection_attempt = false;
++				moving_selection = false;
++
++				menu->set_position(get_screen_position() + get_local_mouse_position());
++				menu->popup();
++
++				insert_at_pos = offset + timeline->get_value();
++				accept_event();
++			}
++		}
++	}
++
++	Ref<InputEventMouseMotion> mm = p_event;
++
++	if (mm.is_valid()) {
++		const StringName previous_hovering_marker = hovering_marker;
++
++		// Hovering compressed keyframes for editing is not possible.
++		const float scale = timeline->get_zoom_scale();
++		const int limit = timeline->get_name_limit();
++		const int limit_end = get_size().width - timeline->get_buttons_width();
++		// Left Border including space occupied by keyframes on t=0.
++		const int limit_start_hitbox = limit - type_icon->get_width();
++		const Point2 pos = mm->get_position();
++
++		if (pos.x >= limit_start_hitbox && pos.x <= limit_end) {
++			// Use the same logic as key selection to ensure that hovering accurately represents
++			// which key will be selected when clicking.
++			int key_idx = -1;
++			float key_distance = 1e20;
++
++			hovering_marker = StringName();
++
++			PackedStringArray names = animation->get_marker_names();
++
++			// Hovering should happen in the opposite order of drawing for more accurate overlap hovering.
++			for (int i = names.size() - 1; i >= 0; i--) {
++				StringName name = names[i];
++				Rect2 rect = get_key_rect(scale);
++				float offset = animation->get_marker_time(name) - timeline->get_value();
++				offset = offset * scale + limit;
++				rect.position.x += offset;
++
++				if (rect.has_point(pos)) {
++					if (is_key_selectable_by_distance()) {
++						const float distance = Math::abs(offset - pos.x);
++						if (key_idx == -1 || distance < key_distance) {
++							key_idx = i;
++							key_distance = distance;
++							hovering_marker = name;
++						}
++					} else {
++						// First one does it.
++						hovering_marker = name;
++						break;
++					}
++				}
++			}
++
++			if (hovering_marker != previous_hovering_marker) {
++				// Required to draw keyframe hover feedback on the correct keyframe.
++				queue_redraw();
++			}
++		}
++	}
++
++	if (mm.is_valid() && mm->get_button_mask().has_flag(MouseButtonMask::LEFT) && moving_selection_attempt) {
++		if (!moving_selection) {
++			moving_selection = true;
++			_move_selection_begin();
++		}
++
++		float moving_begin_time = ((moving_selection_mouse_begin_x - timeline->get_name_limit()) / timeline->get_zoom_scale()) + timeline->get_value();
++		float new_time = ((mm->get_position().x - timeline->get_name_limit()) / timeline->get_zoom_scale()) + timeline->get_value();
++		float delta = new_time - moving_begin_time;
++		float snapped_time = editor->snap_time(moving_selection_pivot + delta);
++
++		float offset = 0.0;
++		if (Math::abs(editor->get_moving_selection_offset()) > CMP_EPSILON || (snapped_time > moving_selection_pivot && delta > CMP_EPSILON) || (snapped_time < moving_selection_pivot && delta < -CMP_EPSILON)) {
++			offset = snapped_time - moving_selection_pivot;
++			moving_selection_effective = true;
++		}
++
++		_move_selection(offset);
++	}
++}
++
++String AnimationMarkerEdit::get_tooltip(const Point2 &p_pos) const {
++	if (animation.is_null()) {
++		return Control::get_tooltip(p_pos);
++	}
++
++	int limit = timeline->get_name_limit();
++	int limit_end = get_size().width - timeline->get_buttons_width();
++	// Left Border including space occupied by keyframes on t=0.
++	int limit_start_hitbox = limit - type_icon->get_width();
++
++	if (p_pos.x >= limit_start_hitbox && p_pos.x <= limit_end) {
++		int key_idx = -1;
++		float key_distance = 1e20;
++
++		PackedStringArray names = animation->get_marker_names();
++
++		// Select should happen in the opposite order of drawing for more accurate overlap select.
++		for (int i = names.size() - 1; i >= 0; i--) {
++			StringName name = names[i];
++			Rect2 rect = const_cast<AnimationMarkerEdit *>(this)->get_key_rect(timeline->get_zoom_scale());
++			float offset = animation->get_marker_time(name) - timeline->get_value();
++			offset = offset * timeline->get_zoom_scale() + limit;
++			rect.position.x += offset;
++
++			if (rect.has_point(p_pos)) {
++				if (const_cast<AnimationMarkerEdit *>(this)->is_key_selectable_by_distance()) {
++					float distance = ABS(offset - p_pos.x);
++					if (key_idx == -1 || distance < key_distance) {
++						key_idx = i;
++						key_distance = distance;
++					}
++				} else {
++					// First one does it.
++					break;
++				}
++			}
++		}
++
++		if (key_idx != -1) {
++			String name = names[key_idx];
++			String text = TTR("Time (s):") + " " + TS->format_number(rtos(Math::snapped(animation->get_marker_time(name), 0.0001))) + "\n";
++			text += TTR("Marker:") + " " + name + "\n";
++			return text;
++		}
++	}
++
++	return Control::get_tooltip(p_pos);
++}
++
++int AnimationMarkerEdit::get_key_height() const {
++	if (animation.is_null()) {
++		return 0;
++	}
++
++	return type_icon->get_height();
++}
++
++Rect2 AnimationMarkerEdit::get_key_rect(float p_pixels_sec) const {
++	if (animation.is_null()) {
++		return Rect2();
++	}
++
++	Rect2 rect = Rect2(-type_icon->get_width() / 2, get_size().height - type_icon->get_size().height, type_icon->get_width(), type_icon->get_size().height);
++
++	// Make it a big easier to click.
++	rect.position.x -= rect.size.x * 0.5;
++	rect.size.x *= 2;
++	return rect;
++}
++
++PackedStringArray AnimationMarkerEdit::get_selected_section() const {
++	if (selection.size() >= 2) {
++		PackedStringArray arr;
++		arr.push_back(""); // Marker with smallest time.
++		arr.push_back(""); // Marker with largest time.
++		double min_time = INFINITY;
++		double max_time = -INFINITY;
++		for (const StringName &marker_name : selection) {
++			double time = animation->get_marker_time(marker_name);
++			if (time < min_time) {
++				arr.set(0, marker_name);
++				min_time = time;
++			}
++			if (time > max_time) {
++				arr.set(1, marker_name);
++				max_time = time;
++			}
++		}
++		return arr;
++	}
++
++	return PackedStringArray();
++}
++
++bool AnimationMarkerEdit::is_marker_selected(const StringName &p_marker) const {
++	return selection.has(p_marker);
++}
++
++bool AnimationMarkerEdit::is_key_selectable_by_distance() const {
++	return true;
++}
++
++void AnimationMarkerEdit::draw_key(const StringName &p_name, float p_pixels_sec, int p_x, bool p_selected, int p_clip_left, int p_clip_right) {
++	if (animation.is_null()) {
++		return;
++	}
++
++	if (p_x < p_clip_left || p_x > p_clip_right) {
++		return;
++	}
++
++	Ref<Texture2D> icon_to_draw = p_selected ? selected_icon : type_icon;
++
++	Vector2 ofs(p_x - icon_to_draw->get_width() / 2, int(get_size().height - icon_to_draw->get_height()));
++
++	// Don't apply custom marker color when the key is selected.
++	Color marker_color = p_selected ? Color(1, 1, 1) : animation->get_marker_color(p_name);
++
++	// Use a different color for the currently hovered key.
++	// The color multiplier is chosen to work with both dark and light editor themes,
++	// and on both unselected and selected key icons.
++	draw_texture(
++			icon_to_draw,
++			ofs,
++			p_name == hovering_marker ? get_theme_color(SNAME("folder_icon_color"), SNAME("FileDialog")) : marker_color);
++}
++
++void AnimationMarkerEdit::draw_bg(int p_clip_left, int p_clip_right) {
++}
++
++void AnimationMarkerEdit::draw_fg(int p_clip_left, int p_clip_right) {
++}
++
++Ref<Animation> AnimationMarkerEdit::get_animation() const {
++	return animation;
++}
++
++void AnimationMarkerEdit::set_animation(const Ref<Animation> &p_animation, bool p_read_only) {
++	if (animation.is_valid()) {
++		_clear_selection_for_anim(animation);
++	}
++	animation = p_animation;
++	read_only = p_read_only;
++	type_icon = get_editor_theme_icon(SNAME("Marker"));
++	selected_icon = get_editor_theme_icon(SNAME("MarkerSelected"));
++
++	queue_redraw();
++}
++
++Size2 AnimationMarkerEdit::get_minimum_size() const {
++	Ref<Texture2D> texture = get_editor_theme_icon(SNAME("Object"));
++	Ref<Font> font = get_theme_font(SceneStringName(font), SNAME("Label"));
++	int font_size = get_theme_font_size(SceneStringName(font_size), SNAME("Label"));
++	int separation = get_theme_constant(SNAME("v_separation"), SNAME("ItemList"));
++
++	int max_h = MAX(texture->get_height(), font->get_height(font_size));
++	max_h = MAX(max_h, get_key_height());
++
++	return Vector2(1, max_h + separation);
++}
++
++void AnimationMarkerEdit::set_timeline(AnimationTimelineEdit *p_timeline) {
++	timeline = p_timeline;
++	timeline->connect("zoom_changed", callable_mp(this, &AnimationMarkerEdit::_zoom_changed));
++	timeline->connect("name_limit_changed", callable_mp(this, &AnimationMarkerEdit::_zoom_changed));
++}
++
++void AnimationMarkerEdit::set_editor(AnimationTrackEditor *p_editor) {
++	editor = p_editor;
++}
++
++void AnimationMarkerEdit::set_play_position(float p_pos) {
++	play_position_pos = p_pos;
++	play_position->queue_redraw();
++}
++
++void AnimationMarkerEdit::update_play_position() {
++	play_position->queue_redraw();
++}
++
++void AnimationMarkerEdit::set_use_fps(bool p_use_fps) {
++	if (key_edit) {
++		key_edit->use_fps = p_use_fps;
++		key_edit->notify_property_list_changed();
++	}
++}
++
++void AnimationMarkerEdit::_move_selection_begin() {
++	moving_selection = true;
++	moving_selection_offset = 0;
++}
++
++void AnimationMarkerEdit::_move_selection(float p_offset) {
++	moving_selection_offset = p_offset;
++	queue_redraw();
++}
++
++void AnimationMarkerEdit::_move_selection_commit() {
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Animation Move Markers"));
++
++	for (HashSet<StringName>::Iterator E = selection.last(); E; --E) {
++		StringName name = *E;
++		double time = animation->get_marker_time(name);
++		float newpos = time + moving_selection_offset;
++		undo_redo->add_do_method(animation.ptr(), "remove_marker", name);
++		undo_redo->add_do_method(animation.ptr(), "add_marker", name, newpos);
++		undo_redo->add_do_method(animation.ptr(), "set_marker_color", name, animation->get_marker_color(name));
++		undo_redo->add_undo_method(animation.ptr(), "remove_marker", name);
++		undo_redo->add_undo_method(animation.ptr(), "add_marker", name, time);
++		undo_redo->add_undo_method(animation.ptr(), "set_marker_color", name, animation->get_marker_color(name));
++
++		// add_marker will overwrite the overlapped key on the redo pass, so we add it back on the undo pass.
++		if (StringName overlap = animation->get_marker_at_time(newpos)) {
++			if (select_single_attempt == overlap) {
++				select_single_attempt = "";
++			}
++			undo_redo->add_undo_method(animation.ptr(), "add_marker", overlap, newpos);
++			undo_redo->add_undo_method(animation.ptr(), "set_marker_color", overlap, animation->get_marker_color(overlap));
++		}
++	}
++
++	moving_selection = false;
++	AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++	if (player) {
++		PackedStringArray selected_section = get_selected_section();
++		if (selected_section.size() >= 2) {
++			undo_redo->add_do_method(player, "set_section_with_markers", selected_section[0], selected_section[1]);
++			undo_redo->add_undo_method(player, "set_section_with_markers", selected_section[0], selected_section[1]);
++		}
++	}
++	undo_redo->add_do_method(timeline, "queue_redraw");
++	undo_redo->add_undo_method(timeline, "queue_redraw");
++	undo_redo->add_do_method(this, "queue_redraw");
++	undo_redo->add_undo_method(this, "queue_redraw");
++	undo_redo->commit_action();
++	_update_key_edit();
++}
++
++void AnimationMarkerEdit::_delete_selected_markers() {
++	if (selection.size()) {
++		EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++		undo_redo->create_action(TTR("Animation Delete Keys"));
++		for (const StringName &name : selection) {
++			double time = animation->get_marker_time(name);
++			undo_redo->add_do_method(animation.ptr(), "remove_marker", name);
++			undo_redo->add_undo_method(animation.ptr(), "add_marker", name, time);
++			undo_redo->add_undo_method(animation.ptr(), "set_marker_color", name, animation->get_marker_color(name));
++		}
++		_clear_selection_for_anim(animation);
++
++		undo_redo->add_do_method(this, "queue_redraw");
++		undo_redo->add_undo_method(this, "queue_redraw");
++		undo_redo->commit_action();
++		_update_key_edit();
++	}
++}
++
++void AnimationMarkerEdit::_move_selection_cancel() {
++	moving_selection = false;
++	queue_redraw();
++}
++
++void AnimationMarkerEdit::_clear_selection(bool p_update) {
++	AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++	if (player) {
++		player->reset_section();
++	}
++
++	selection.clear();
++
++	if (p_update) {
++		queue_redraw();
++	}
++
++	_clear_key_edit();
++}
++
++void AnimationMarkerEdit::_clear_selection_for_anim(const Ref<Animation> &p_anim) {
++	if (animation != p_anim) {
++		return;
++	}
++
++	_clear_selection(true);
++}
++
++void AnimationMarkerEdit::_select_key(const StringName &p_name, bool is_single) {
++	if (is_single) {
++		_clear_selection(false);
++	}
++
++	selection.insert(p_name);
++
++	AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++	if (player) {
++		if (selection.size() >= 2) {
++			PackedStringArray selected_section = get_selected_section();
++			double start_time = animation->get_marker_time(selected_section[0]);
++			double end_time = animation->get_marker_time(selected_section[1]);
++			player->set_section(start_time, end_time);
++		} else {
++			player->reset_section();
++		}
++	}
++
++	queue_redraw();
++	_update_key_edit();
++
++	editor->_clear_selection(editor->is_selection_active());
++}
++
++void AnimationMarkerEdit::_deselect_key(const StringName &p_name) {
++	selection.erase(p_name);
++
++	AnimationPlayer *player = AnimationPlayerEditor::get_singleton()->get_player();
++	if (player) {
++		if (selection.size() >= 2) {
++			PackedStringArray selected_section = get_selected_section();
++			double start_time = animation->get_marker_time(selected_section[0]);
++			double end_time = animation->get_marker_time(selected_section[1]);
++			player->set_section(start_time, end_time);
++		} else {
++			player->reset_section();
++		}
++	}
++
++	queue_redraw();
++	_update_key_edit();
++}
++
++void AnimationMarkerEdit::_insert_marker(float p_ofs) {
++	if (editor->is_snap_timeline_enabled()) {
++		p_ofs = editor->snap_time(p_ofs);
++	}
++
++	marker_insert_confirm->popup_centered(Size2(200, 100) * EDSCALE);
++	marker_insert_color->set_pick_color(Color(1, 1, 1));
++
++	String base = "new_marker";
++	int count = 1;
++	while (true) {
++		String attempt = base;
++		if (count > 1) {
++			attempt += vformat("_%d", count);
++		}
++		if (animation->has_marker(attempt)) {
++			count++;
++			continue;
++		}
++		base = attempt;
++		break;
++	}
++
++	marker_insert_new_name->set_text(base);
++	_marker_insert_new_name_changed(base);
++	marker_insert_ofs = p_ofs;
++}
++
++void AnimationMarkerEdit::_rename_marker(const StringName &p_name) {
++	marker_rename_confirm->popup_centered(Size2i(200, 0) * EDSCALE);
++	marker_rename_prev_name = p_name;
++	marker_rename_new_name->set_text(p_name);
++}
++
++void AnimationMarkerEdit::_marker_insert_confirmed() {
++	StringName name = marker_insert_new_name->get_text();
++
++	if (animation->has_marker(name)) {
++		marker_insert_error_dialog->set_text(vformat(TTR("Marker '%s' already exists!"), name));
++		marker_insert_error_dialog->popup_centered();
++		return;
++	}
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++
++	undo_redo->create_action(TTR("Add Marker Key"));
++	undo_redo->add_do_method(animation.ptr(), "add_marker", name, marker_insert_ofs);
++	undo_redo->add_undo_method(animation.ptr(), "remove_marker", name);
++	StringName existing_marker = animation->get_marker_at_time(marker_insert_ofs);
++	if (existing_marker) {
++		undo_redo->add_undo_method(animation.ptr(), "add_marker", existing_marker, marker_insert_ofs);
++		undo_redo->add_undo_method(animation.ptr(), "set_marker_color", existing_marker, animation->get_marker_color(existing_marker));
++	}
++	undo_redo->add_do_method(animation.ptr(), "set_marker_color", name, marker_insert_color->get_pick_color());
++
++	undo_redo->add_do_method(this, "queue_redraw");
++	undo_redo->add_undo_method(this, "queue_redraw");
++
++	undo_redo->commit_action();
++
++	marker_insert_confirm->hide();
++}
++
++void AnimationMarkerEdit::_marker_insert_new_name_changed(const String &p_text) {
++	marker_insert_confirm->get_ok_button()->set_disabled(p_text.is_empty());
++}
++
++void AnimationMarkerEdit::_marker_rename_confirmed() {
++	StringName new_name = marker_rename_new_name->get_text();
++	StringName prev_name = marker_rename_prev_name;
++
++	if (new_name == StringName()) {
++		marker_rename_error_dialog->set_text(TTR("Empty marker names are not allowed."));
++		marker_rename_error_dialog->popup_centered();
++		return;
++	}
++
++	if (new_name != prev_name && animation->has_marker(new_name)) {
++		marker_rename_error_dialog->set_text(vformat(TTR("Marker '%s' already exists!"), new_name));
++		marker_rename_error_dialog->popup_centered();
++		return;
++	}
++
++	if (prev_name != new_name) {
++		EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++		undo_redo->create_action(TTR("Rename Marker"));
++		undo_redo->add_do_method(animation.ptr(), "remove_marker", prev_name);
++		undo_redo->add_do_method(animation.ptr(), "add_marker", new_name, animation->get_marker_time(prev_name));
++		undo_redo->add_do_method(animation.ptr(), "set_marker_color", new_name, animation->get_marker_color(prev_name));
++		undo_redo->add_undo_method(animation.ptr(), "remove_marker", new_name);
++		undo_redo->add_undo_method(animation.ptr(), "add_marker", prev_name, animation->get_marker_time(prev_name));
++		undo_redo->add_undo_method(animation.ptr(), "set_marker_color", prev_name, animation->get_marker_color(prev_name));
++		undo_redo->add_do_method(this, "_select_key", new_name, true);
++		undo_redo->add_undo_method(this, "_select_key", prev_name, true);
++		undo_redo->commit_action();
++		select_single_attempt = StringName();
++	}
++	marker_rename_confirm->hide();
++}
++
++void AnimationMarkerEdit::_marker_rename_new_name_changed(const String &p_text) {
++	marker_rename_confirm->get_ok_button()->set_disabled(p_text.is_empty());
++}
++
++AnimationMarkerEdit::AnimationMarkerEdit() {
++	play_position = memnew(Control);
++	play_position->set_mouse_filter(MOUSE_FILTER_PASS);
++	add_child(play_position);
++	play_position->connect(SceneStringName(draw), callable_mp(this, &AnimationMarkerEdit::_play_position_draw));
++	set_focus_mode(FOCUS_CLICK);
++	set_mouse_filter(MOUSE_FILTER_PASS); // Scroll has to work too for selection.
++
++	menu = memnew(PopupMenu);
++	add_child(menu);
++	menu->connect(SceneStringName(id_pressed), callable_mp(this, &AnimationMarkerEdit::_menu_selected));
++	menu->add_shortcut(ED_SHORTCUT("animation_marker_edit/rename_marker", TTR("Rename Marker"), Key::R), MENU_KEY_RENAME);
++	menu->add_shortcut(ED_SHORTCUT("animation_marker_edit/delete_selection", TTR("Delete Markers (s)"), Key::KEY_DELETE), MENU_KEY_DELETE);
++	menu->add_shortcut(ED_SHORTCUT("animation_marker_edit/toggle_marker_names", TTR("Show All Marker Names"), Key::M), MENU_KEY_TOGGLE_MARKER_NAMES);
++
++	marker_insert_confirm = memnew(ConfirmationDialog);
++	marker_insert_confirm->set_title(TTR("Insert Marker"));
++	marker_insert_confirm->set_hide_on_ok(false);
++	marker_insert_confirm->connect(SceneStringName(confirmed), callable_mp(this, &AnimationMarkerEdit::_marker_insert_confirmed));
++	add_child(marker_insert_confirm);
++	VBoxContainer *marker_insert_vbox = memnew(VBoxContainer);
++	marker_insert_vbox->set_anchors_and_offsets_preset(Control::LayoutPreset::PRESET_FULL_RECT);
++	marker_insert_confirm->add_child(marker_insert_vbox);
++	marker_insert_new_name = memnew(LineEdit);
++	marker_insert_new_name->connect(SceneStringName(text_changed), callable_mp(this, &AnimationMarkerEdit::_marker_insert_new_name_changed));
++	marker_insert_confirm->register_text_enter(marker_insert_new_name);
++	marker_insert_vbox->add_child(_create_hbox_labeled_control(TTR("Marker Name"), marker_insert_new_name));
++	marker_insert_color = memnew(ColorPickerButton);
++	marker_insert_color->set_edit_alpha(false);
++	marker_insert_color->get_popup()->connect("about_to_popup", callable_mp(EditorNode::get_singleton(), &EditorNode::setup_color_picker).bind(marker_insert_color->get_picker()));
++	marker_insert_vbox->add_child(_create_hbox_labeled_control(TTR("Marker Color"), marker_insert_color));
++	marker_insert_error_dialog = memnew(AcceptDialog);
++	marker_insert_error_dialog->set_ok_button_text(TTR("Close"));
++	marker_insert_error_dialog->set_title(TTR("Error!"));
++	marker_insert_confirm->add_child(marker_insert_error_dialog);
++
++	marker_rename_confirm = memnew(ConfirmationDialog);
++	marker_rename_confirm->set_title(TTR("Rename Marker"));
++	marker_rename_confirm->set_hide_on_ok(false);
++	marker_rename_confirm->connect(SceneStringName(confirmed), callable_mp(this, &AnimationMarkerEdit::_marker_rename_confirmed));
++	add_child(marker_rename_confirm);
++	VBoxContainer *marker_rename_vbox = memnew(VBoxContainer);
++	marker_rename_vbox->set_anchors_and_offsets_preset(Control::LayoutPreset::PRESET_FULL_RECT);
++	marker_rename_confirm->add_child(marker_rename_vbox);
++	Label *marker_rename_new_name_label = memnew(Label);
++	marker_rename_new_name_label->set_text(TTR("Change Marker Name:"));
++	marker_rename_vbox->add_child(marker_rename_new_name_label);
++	marker_rename_new_name = memnew(LineEdit);
++	marker_rename_new_name->connect(SceneStringName(text_changed), callable_mp(this, &AnimationMarkerEdit::_marker_rename_new_name_changed));
++	marker_rename_confirm->register_text_enter(marker_rename_new_name);
++	marker_rename_vbox->add_child(marker_rename_new_name);
++
++	marker_rename_error_dialog = memnew(AcceptDialog);
++	marker_rename_error_dialog->set_ok_button_text(TTR("Close"));
++	marker_rename_error_dialog->set_title(TTR("Error!"));
++	marker_rename_confirm->add_child(marker_rename_error_dialog);
++}
++
++AnimationMarkerEdit::~AnimationMarkerEdit() {
++}
++
++float AnimationMarkerKeyEdit::get_time() const {
++	return animation->get_marker_time(marker_name);
++}
++
++void AnimationMarkerKeyEdit::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("_hide_script_from_inspector"), &AnimationMarkerKeyEdit::_hide_script_from_inspector);
++	ClassDB::bind_method(D_METHOD("_hide_metadata_from_inspector"), &AnimationMarkerKeyEdit::_hide_metadata_from_inspector);
++	ClassDB::bind_method(D_METHOD("_dont_undo_redo"), &AnimationMarkerKeyEdit::_dont_undo_redo);
++	ClassDB::bind_method(D_METHOD("_is_read_only"), &AnimationMarkerKeyEdit::_is_read_only);
++	ClassDB::bind_method(D_METHOD("_set_marker_name"), &AnimationMarkerKeyEdit::_set_marker_name);
++}
++
++void AnimationMarkerKeyEdit::_set_marker_name(const StringName &p_name) {
++	marker_name = p_name;
++}
++
++bool AnimationMarkerKeyEdit::_set(const StringName &p_name, const Variant &p_value) {
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++
++	if (p_name == "color") {
++		Color color = p_value;
++		Color prev_color = animation->get_marker_color(marker_name);
++		if (color != prev_color) {
++			undo_redo->create_action(TTR("Edit Marker Color"), UndoRedo::MERGE_ENDS);
++			undo_redo->add_do_method(animation.ptr(), "set_marker_color", marker_name, color);
++			undo_redo->add_undo_method(animation.ptr(), "set_marker_color", marker_name, prev_color);
++			undo_redo->add_do_method(marker_edit, "queue_redraw");
++			undo_redo->add_undo_method(marker_edit, "queue_redraw");
++			undo_redo->commit_action();
++		}
++		return true;
++	}
++
++	return false;
++}
++
++bool AnimationMarkerKeyEdit::_get(const StringName &p_name, Variant &r_ret) const {
++	if (p_name == "name") {
++		r_ret = marker_name;
++		return true;
++	}
++
++	if (p_name == "color") {
++		r_ret = animation->get_marker_color(marker_name);
++		return true;
++	}
++
++	return false;
++}
++
++void AnimationMarkerKeyEdit::_get_property_list(List<PropertyInfo> *p_list) const {
++	if (animation.is_null()) {
++		return;
++	}
++
++	p_list->push_back(PropertyInfo(Variant::STRING_NAME, "name", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_READ_ONLY | PROPERTY_USAGE_EDITOR));
++	p_list->push_back(PropertyInfo(Variant::COLOR, "color", PROPERTY_HINT_COLOR_NO_ALPHA));
++}
++
++void AnimationMultiMarkerKeyEdit::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("_hide_script_from_inspector"), &AnimationMultiMarkerKeyEdit::_hide_script_from_inspector);
++	ClassDB::bind_method(D_METHOD("_hide_metadata_from_inspector"), &AnimationMultiMarkerKeyEdit::_hide_metadata_from_inspector);
++	ClassDB::bind_method(D_METHOD("_dont_undo_redo"), &AnimationMultiMarkerKeyEdit::_dont_undo_redo);
++	ClassDB::bind_method(D_METHOD("_is_read_only"), &AnimationMultiMarkerKeyEdit::_is_read_only);
++}
++
++bool AnimationMultiMarkerKeyEdit::_set(const StringName &p_name, const Variant &p_value) {
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	if (p_name == "color") {
++		Color color = p_value;
++
++		undo_redo->create_action(TTR("Multi Edit Marker Color"), UndoRedo::MERGE_ENDS);
++
++		for (const StringName &marker_name : marker_names) {
++			undo_redo->add_do_method(animation.ptr(), "set_marker_color", marker_name, color);
++			undo_redo->add_undo_method(animation.ptr(), "set_marker_color", marker_name, animation->get_marker_color(marker_name));
++		}
++
++		undo_redo->add_do_method(marker_edit, "queue_redraw");
++		undo_redo->add_undo_method(marker_edit, "queue_redraw");
++		undo_redo->commit_action();
++
++		return true;
++	}
++
++	return false;
++}
++
++bool AnimationMultiMarkerKeyEdit::_get(const StringName &p_name, Variant &r_ret) const {
++	if (p_name == "color") {
++		r_ret = animation->get_marker_color(marker_names[0]);
++		return true;
++	}
++
++	return false;
++}
++
++void AnimationMultiMarkerKeyEdit::_get_property_list(List<PropertyInfo> *p_list) const {
++	if (animation.is_null()) {
++		return;
++	}
++
++	p_list->push_back(PropertyInfo(Variant::COLOR, "color", PROPERTY_HINT_COLOR_NO_ALPHA));
++}
++
++// AnimationMarkerKeyEditEditorPlugin
++
++void AnimationMarkerKeyEditEditor::_time_edit_entered() {
++}
++
++void AnimationMarkerKeyEditEditor::_time_edit_exited() {
++	real_t new_time = spinner->get_value();
++
++	if (use_fps) {
++		real_t fps = animation->get_step();
++		if (fps > 0) {
++			fps = 1.0 / fps;
++		}
++		new_time /= fps;
++	}
++
++	real_t prev_time = animation->get_marker_time(marker_name);
++
++	if (Math::is_equal_approx(new_time, prev_time)) {
++		return; // No change.
++	}
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Animation Change Marker Time"), UndoRedo::MERGE_ENDS);
++
++	Color color = animation->get_marker_color(marker_name);
++	undo_redo->add_do_method(animation.ptr(), "add_marker", marker_name, new_time);
++	undo_redo->add_do_method(animation.ptr(), "set_marker_color", marker_name, color);
++	undo_redo->add_undo_method(animation.ptr(), "remove_marker", marker_name);
++	undo_redo->add_undo_method(animation.ptr(), "add_marker", marker_name, prev_time);
++	undo_redo->add_undo_method(animation.ptr(), "set_marker_color", marker_name, color);
++	StringName existing_marker = animation->get_marker_at_time(new_time);
++	if (existing_marker) {
++		undo_redo->add_undo_method(animation.ptr(), "add_marker", existing_marker, animation->get_marker_time(existing_marker));
++		undo_redo->add_undo_method(animation.ptr(), "set_marker_color", existing_marker, animation->get_marker_color(existing_marker));
++	}
++	AnimationPlayerEditor *ape = AnimationPlayerEditor::get_singleton();
++	if (ape) {
++		AnimationTrackEditor *ate = ape->get_track_editor();
++		if (ate) {
++			AnimationMarkerEdit *ame = ate->marker_edit;
++			undo_redo->add_do_method(ame, "queue_redraw");
++			undo_redo->add_undo_method(ame, "queue_redraw");
++		}
++	}
++	undo_redo->commit_action();
++}
++
++AnimationMarkerKeyEditEditor::AnimationMarkerKeyEditEditor(Ref<Animation> p_animation, const StringName &p_name, bool p_use_fps) {
++	if (p_animation.is_null()) {
++		return;
++	}
++
++	animation = p_animation;
++	use_fps = p_use_fps;
++	marker_name = p_name;
++
++	set_label("Time");
++
++	spinner = memnew(EditorSpinSlider);
++	spinner->set_focus_mode(Control::FOCUS_CLICK);
++	spinner->set_min(0);
++	spinner->set_allow_greater(true);
++	spinner->set_allow_lesser(true);
++
++	float time = animation->get_marker_time(marker_name);
++
++	if (use_fps) {
++		spinner->set_step(FPS_DECIMAL);
++		real_t fps = animation->get_step();
++		if (fps > 0) {
++			fps = 1.0 / fps;
++		}
++		spinner->set_value(time * fps);
++	} else {
++		spinner->set_step(SECOND_DECIMAL);
++		spinner->set_value(time);
++		spinner->set_max(animation->get_length());
++	}
++
++	add_child(spinner);
++
++	spinner->connect("grabbed", callable_mp(this, &AnimationMarkerKeyEditEditor::_time_edit_entered), CONNECT_DEFERRED);
++	spinner->connect("ungrabbed", callable_mp(this, &AnimationMarkerKeyEditEditor::_time_edit_exited), CONNECT_DEFERRED);
++	spinner->connect("value_focus_entered", callable_mp(this, &AnimationMarkerKeyEditEditor::_time_edit_entered), CONNECT_DEFERRED);
++	spinner->connect("value_focus_exited", callable_mp(this, &AnimationMarkerKeyEditEditor::_time_edit_exited), CONNECT_DEFERRED);
++}
++
++AnimationMarkerKeyEditEditor::~AnimationMarkerKeyEditEditor() {
++}
+diff --git a/editor/animation_track_editor.h b/editor/animation_track_editor.h
+index 6b9140ddaa..0da474afd4 100644
+--- a/editor/animation_track_editor.h
++++ b/editor/animation_track_editor.h
+@@ -41,9 +41,11 @@
+ #include "scene/gui/tree.h"
+ #include "scene/resources/animation.h"
+ 
++class AnimationMarkerEdit;
+ class AnimationTrackEditor;
+ class AnimationTrackEdit;
+ class CheckBox;
++class ColorPickerButton;
+ class EditorSpinSlider;
+ class HSlider;
+ class OptionButton;
+@@ -52,6 +54,7 @@ class SceneTreeDialog;
+ class SpinBox;
+ class TextureRect;
+ class ViewPanner;
++class EditorValidationPanel;
+ 
+ class AnimationTrackKeyEdit : public Object {
+ 	GDCLASS(AnimationTrackKeyEdit, Object);
+@@ -128,6 +131,58 @@ protected:
+ 	void _get_property_list(List<PropertyInfo> *p_list) const;
+ };
+ 
++class AnimationMarkerKeyEdit : public Object {
++	GDCLASS(AnimationMarkerKeyEdit, Object);
++
++public:
++	bool animation_read_only = false;
++
++	Ref<Animation> animation;
++	StringName marker_name;
++	bool use_fps = false;
++
++	AnimationMarkerEdit *marker_edit = nullptr;
++
++	bool _hide_script_from_inspector() { return true; }
++	bool _hide_metadata_from_inspector() { return true; }
++	bool _dont_undo_redo() { return true; }
++
++	bool _is_read_only() { return animation_read_only; }
++
++	float get_time() const;
++
++protected:
++	static void _bind_methods();
++	void _set_marker_name(const StringName &p_name);
++	bool _set(const StringName &p_name, const Variant &p_value);
++	bool _get(const StringName &p_name, Variant &r_ret) const;
++	void _get_property_list(List<PropertyInfo> *p_list) const;
++};
++
++class AnimationMultiMarkerKeyEdit : public Object {
++	GDCLASS(AnimationMultiMarkerKeyEdit, Object);
++
++public:
++	bool animation_read_only = false;
++
++	Ref<Animation> animation;
++	Vector<StringName> marker_names;
++
++	AnimationMarkerEdit *marker_edit = nullptr;
++
++	bool _hide_script_from_inspector() { return true; }
++	bool _hide_metadata_from_inspector() { return true; }
++	bool _dont_undo_redo() { return true; }
++
++	bool _is_read_only() { return animation_read_only; }
++
++protected:
++	static void _bind_methods();
++	bool _set(const StringName &p_name, const Variant &p_value);
++	bool _get(const StringName &p_name, Variant &r_ret) const;
++	void _get_property_list(List<PropertyInfo> *p_list) const;
++};
++
+ class AnimationTimelineEdit : public Range {
+ 	GDCLASS(AnimationTimelineEdit, Range);
+ 
+@@ -218,6 +273,140 @@ public:
+ 	AnimationTimelineEdit();
+ };
+ 
++class AnimationMarkerEdit : public Control {
++	GDCLASS(AnimationMarkerEdit, Control);
++	friend class AnimationTimelineEdit;
++
++	enum {
++		MENU_KEY_INSERT,
++		MENU_KEY_RENAME,
++		MENU_KEY_DELETE,
++		MENU_KEY_TOGGLE_MARKER_NAMES,
++	};
++
++	AnimationTimelineEdit *timeline = nullptr;
++	Control *play_position = nullptr; // Separate control used to draw so updates for only position changed are much faster.
++	float play_position_pos = 0.0f;
++
++	HashSet<StringName> selection;
++
++	Ref<Animation> animation;
++	bool read_only = false;
++
++	Ref<Texture2D> type_icon;
++	Ref<Texture2D> selected_icon;
++
++	PopupMenu *menu = nullptr;
++
++	bool hovered = false;
++	StringName hovering_marker;
++
++	void _zoom_changed();
++
++	Ref<Texture2D> icon_cache;
++
++	void _menu_selected(int p_index);
++
++	void _play_position_draw();
++	bool _try_select_at_ui_pos(const Point2 &p_pos, bool p_aggregate, bool p_deselectable);
++	bool _is_ui_pos_in_current_section(const Point2 &p_pos);
++
++	float insert_at_pos = 0.0f;
++	bool moving_selection_attempt = false;
++	bool moving_selection_effective = false;
++	float moving_selection_offset = 0.0f;
++	float moving_selection_pivot = 0.0f;
++	float moving_selection_mouse_begin_x = 0.0f;
++	float moving_selection_mouse_begin_y = 0.0f;
++	StringName select_single_attempt;
++	bool moving_selection = false;
++	void _move_selection_begin();
++	void _move_selection(float p_offset);
++	void _move_selection_commit();
++	void _move_selection_cancel();
++
++	void _clear_selection_for_anim(const Ref<Animation> &p_anim);
++	void _select_key(const StringName &p_name, bool is_single = false);
++	void _deselect_key(const StringName &p_name);
++
++	void _insert_marker(float p_ofs);
++	void _rename_marker(const StringName &p_name);
++	void _delete_selected_markers();
++
++	ConfirmationDialog *marker_insert_confirm = nullptr;
++	LineEdit *marker_insert_new_name = nullptr;
++	ColorPickerButton *marker_insert_color = nullptr;
++	AcceptDialog *marker_insert_error_dialog = nullptr;
++	float marker_insert_ofs = 0;
++
++	ConfirmationDialog *marker_rename_confirm = nullptr;
++	LineEdit *marker_rename_new_name = nullptr;
++	StringName marker_rename_prev_name;
++
++	AcceptDialog *marker_rename_error_dialog = nullptr;
++
++	bool should_show_all_marker_names = false;
++
++	////////////// edit menu stuff
++
++	void _marker_insert_confirmed();
++	void _marker_insert_new_name_changed(const String &p_text);
++	void _marker_rename_confirmed();
++	void _marker_rename_new_name_changed(const String &p_text);
++
++	AnimationTrackEditor *editor = nullptr;
++
++	HBoxContainer *_create_hbox_labeled_control(const String &p_text, Control *p_control) const;
++
++	void _update_key_edit();
++	void _clear_key_edit();
++
++	AnimationMarkerKeyEdit *key_edit = nullptr;
++	AnimationMultiMarkerKeyEdit *multi_key_edit = nullptr;
++
++protected:
++	static void _bind_methods();
++	void _notification(int p_what);
++
++	virtual void gui_input(const Ref<InputEvent> &p_event) override;
++
++public:
++	virtual String get_tooltip(const Point2 &p_pos) const override;
++
++	virtual int get_key_height() const;
++	virtual Rect2 get_key_rect(float p_pixels_sec) const;
++	virtual bool is_key_selectable_by_distance() const;
++	virtual void draw_key(const StringName &p_name, float p_pixels_sec, int p_x, bool p_selected, int p_clip_left, int p_clip_right);
++	virtual void draw_bg(int p_clip_left, int p_clip_right);
++	virtual void draw_fg(int p_clip_left, int p_clip_right);
++
++	Ref<Animation> get_animation() const;
++	AnimationTimelineEdit *get_timeline() const { return timeline; }
++	AnimationTrackEditor *get_editor() const { return editor; }
++	bool is_selection_active() const { return !selection.is_empty(); }
++	bool is_moving_selection() const { return moving_selection; }
++	float get_moving_selection_offset() const { return moving_selection_offset; }
++	void set_animation(const Ref<Animation> &p_animation, bool p_read_only);
++	virtual Size2 get_minimum_size() const override;
++
++	void set_timeline(AnimationTimelineEdit *p_timeline);
++	void set_editor(AnimationTrackEditor *p_editor);
++
++	void set_play_position(float p_pos);
++	void update_play_position();
++
++	void set_use_fps(bool p_use_fps);
++
++	PackedStringArray get_selected_section() const;
++	bool is_marker_selected(const StringName &p_marker) const;
++
++	// For use by AnimationTrackEditor.
++	void _clear_selection(bool p_update);
++
++	AnimationMarkerEdit();
++	~AnimationMarkerEdit();
++};
++
+ class AnimationTrackEdit : public Control {
+ 	GDCLASS(AnimationTrackEdit, Control);
+ 	friend class AnimationTimelineEdit;
+@@ -367,6 +556,7 @@ class AnimationTrackEditGroup : public Control {
+ 	NodePath node;
+ 	Node *root = nullptr;
+ 	AnimationTimelineEdit *timeline = nullptr;
++	AnimationTrackEditor *editor = nullptr;
+ 
+ 	void _zoom_changed();
+ 
+@@ -380,6 +570,7 @@ public:
+ 	virtual Size2 get_minimum_size() const override;
+ 	void set_timeline(AnimationTimelineEdit *p_timeline);
+ 	void set_root(Node *p_root);
++	void set_editor(AnimationTrackEditor *p_editor);
+ 
+ 	AnimationTrackEditGroup();
+ };
+@@ -388,6 +579,7 @@ class AnimationTrackEditor : public VBoxContainer {
+ 	GDCLASS(AnimationTrackEditor, VBoxContainer);
+ 	friend class AnimationTimelineEdit;
+ 	friend class AnimationBezierTrackEdit;
++	friend class AnimationMarkerKeyEditEditor;
+ 
+ 	Ref<Animation> animation;
+ 	bool read_only = false;
+@@ -405,6 +597,7 @@ class AnimationTrackEditor : public VBoxContainer {
+ 	Label *info_message = nullptr;
+ 
+ 	AnimationTimelineEdit *timeline = nullptr;
++	AnimationMarkerEdit *marker_edit = nullptr;
+ 	HSlider *zoom = nullptr;
+ 	EditorSpinSlider *step = nullptr;
+ 	TextureRect *zoom_icon = nullptr;
+@@ -743,6 +936,10 @@ public:
+ 	float get_moving_selection_offset() const;
+ 	float snap_time(float p_value, bool p_relative = false);
+ 	bool is_grouping_tracks();
++	PackedStringArray get_selected_section() const;
++	bool is_marker_selected(const StringName &p_marker) const;
++	bool is_marker_moving_selection() const;
++	float get_marker_moving_selection_offset() const;
+ 
+ 	/** If `p_from_mouse_event` is `true`, handle Shift key presses for precise snapping. */
+ 	void goto_prev_step(bool p_from_mouse_event);
+@@ -781,4 +978,23 @@ public:
+ 	~AnimationTrackKeyEditEditor();
+ };
+ 
++// AnimationMarkerKeyEditEditorPlugin
++
++class AnimationMarkerKeyEditEditor : public EditorProperty {
++	GDCLASS(AnimationMarkerKeyEditEditor, EditorProperty);
++
++	Ref<Animation> animation;
++	StringName marker_name;
++	bool use_fps = false;
++
++	EditorSpinSlider *spinner = nullptr;
++
++	void _time_edit_entered();
++	void _time_edit_exited();
++
++public:
++	AnimationMarkerKeyEditEditor(Ref<Animation> p_animation, const StringName &p_name, bool p_use_fps);
++	~AnimationMarkerKeyEditEditor();
++};
++
+ #endif // ANIMATION_TRACK_EDITOR_H
+diff --git a/editor/editor_node.cpp b/editor/editor_node.cpp
+index 665255b9b2..3bae9ae984 100644
+--- a/editor/editor_node.cpp
++++ b/editor/editor_node.cpp
+@@ -7722,6 +7722,7 @@ EditorNode::EditorNode() {
+ 
+ 	add_editor_plugin(memnew(AnimationPlayerEditorPlugin));
+ 	add_editor_plugin(memnew(AnimationTrackKeyEditEditorPlugin));
++	add_editor_plugin(memnew(AnimationMarkerKeyEditEditorPlugin));
+ 	add_editor_plugin(memnew(CanvasItemEditorPlugin));
+ 	add_editor_plugin(memnew(Node3DEditorPlugin));
+ 	add_editor_plugin(memnew(ScriptEditorPlugin));
+diff --git a/editor/icons/Marker.svg b/editor/icons/Marker.svg
+new file mode 100644
+index 0000000000..ff91a4a947
+--- /dev/null
++++ b/editor/icons/Marker.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="-959.5 540.5 10 10"><path fill="#e0e0e0" d="m-954.5 550-3-3v-6h6v6z"/></svg>
+\ No newline at end of file
+diff --git a/editor/icons/MarkerSelected.svg b/editor/icons/MarkerSelected.svg
+new file mode 100644
+index 0000000000..c581a3a651
+--- /dev/null
++++ b/editor/icons/MarkerSelected.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="-959.5 540.5 10 10"><path fill="#5fb2ff" d="m-952 541.5v5.086l-2.5 2.5-2.5-2.5v-5.086zm1-1h-7v6.5l3.5 3.5 3.5-3.5z"/><path fill="#003e7a" d="m-957 546.586 2.5 2.5 2.5-2.5v-5.086h-5z"/></svg>
+\ No newline at end of file
+diff --git a/editor/plugins/animation_blend_tree_editor_plugin.cpp b/editor/plugins/animation_blend_tree_editor_plugin.cpp
+index a28fe01666..9e282cb3fa 100644
+--- a/editor/plugins/animation_blend_tree_editor_plugin.cpp
++++ b/editor/plugins/animation_blend_tree_editor_plugin.cpp
+@@ -36,6 +36,7 @@
+ #include "core/os/keyboard.h"
+ #include "editor/editor_inspector.h"
+ #include "editor/editor_node.h"
++#include "editor/editor_properties.h"
+ #include "editor/editor_settings.h"
+ #include "editor/editor_string_names.h"
+ #include "editor/editor_undo_redo_manager.h"
+@@ -45,6 +46,7 @@
+ #include "scene/animation/animation_player.h"
+ #include "scene/gui/check_box.h"
+ #include "scene/gui/menu_button.h"
++#include "scene/gui/option_button.h"
+ #include "scene/gui/panel.h"
+ #include "scene/gui/progress_bar.h"
+ #include "scene/gui/separator.h"
+@@ -1262,4 +1264,168 @@ AnimationNodeBlendTreeEditor::AnimationNodeBlendTreeEditor() {
+ 	open_file->set_title(TTR("Open Animation Node"));
+ 	open_file->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
+ 	open_file->connect("file_selected", callable_mp(this, &AnimationNodeBlendTreeEditor::_file_opened));
++
++	animation_node_inspector_plugin = Ref<EditorInspectorPluginAnimationNodeAnimation>(memnew(EditorInspectorPluginAnimationNodeAnimation));
++	EditorInspector::add_inspector_plugin(animation_node_inspector_plugin);
++}
++
++AnimationNodeBlendTreeEditor::~AnimationNodeBlendTreeEditor() {
++}
++
++// EditorPluginAnimationNodeAnimation
++
++void AnimationNodeAnimationEditor::_open_set_custom_timeline_from_marker_dialog() {
++	AnimationTree *tree = AnimationTreeEditor::get_singleton()->get_animation_tree();
++	StringName anim_name = animation_node_animation->get_animation();
++	PackedStringArray markers = tree->has_animation(anim_name) ? tree->get_animation(anim_name)->get_marker_names() : PackedStringArray();
++
++	dialog->select_start->clear();
++	dialog->select_start->add_icon_item(get_editor_theme_icon(SNAME("PlayStart")), TTR("Start of Animation"));
++	dialog->select_start->add_separator();
++	dialog->select_end->clear();
++	dialog->select_end->add_icon_item(get_editor_theme_icon(SNAME("PlayStartBackwards")), TTR("End of Animation"));
++	dialog->select_end->add_separator();
++
++	for (const String &marker : markers) {
++		dialog->select_start->add_item(marker);
++		dialog->select_end->add_item(marker);
++	}
++
++	// Because the default selections are always valid, and marker times won't change during the dialog, we can ensure that the user can only select valid markers.
++	// This invariant is maintained by _validate_markers.
++	dialog->select_start->select(0);
++	dialog->select_end->select(0);
++
++	dialog->popup_centered(Size2(200, 0) * EDSCALE);
++}
++
++void AnimationNodeAnimationEditor::_validate_markers(int p_id) {
++	// Note: p_id is ignored. It is included because OptionButton's item_changed signal always passes it.
++	int start_id = dialog->select_start->get_selected_id();
++	int end_id = dialog->select_end->get_selected_id();
++
++	StringName anim_name = animation_node_animation->get_animation();
++	Ref<Animation> animation = AnimationTreeEditor::get_singleton()->get_animation_tree()->get_animation(anim_name);
++	ERR_FAIL_COND(animation.is_null());
++
++	double start_time = start_id < 2 ? 0 : animation->get_marker_time(dialog->select_start->get_item_text(start_id));
++	double end_time = end_id < 2 ? animation->get_length() : animation->get_marker_time(dialog->select_end->get_item_text(end_id));
++
++	// p_start and p_end have the same item count.
++	for (int i = 2; i < dialog->select_start->get_item_count(); i++) {
++		String start_marker = dialog->select_start->get_item_text(i);
++		String end_marker = dialog->select_end->get_item_text(i);
++		dialog->select_start->set_item_disabled(i, end_id >= 2 && (i == end_id || animation->get_marker_time(start_marker) > end_time));
++		dialog->select_end->set_item_disabled(i, start_id >= 2 && (i == start_id || start_time > animation->get_marker_time(end_marker)));
++	}
++}
++
++void AnimationNodeAnimationEditor::_confirm_set_custom_timeline_from_marker_dialog() {
++	int start_id = dialog->select_start->get_selected_id();
++	int end_id = dialog->select_end->get_selected_id();
++
++	Ref<Animation> animation = AnimationTreeEditor::get_singleton()->get_animation_tree()->get_animation(animation_node_animation->get_animation());
++	ERR_FAIL_COND(animation.is_null());
++	double start_time = start_id < 2 ? 0 : animation->get_marker_time(dialog->select_start->get_item_text(start_id));
++	double end_time = end_id < 2 ? animation->get_length() : animation->get_marker_time(dialog->select_end->get_item_text(end_id));
++	double length = end_time - start_time;
++
++	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
++	undo_redo->create_action(TTR("Set Custom Timeline from Marker"));
++	undo_redo->add_do_method(*animation_node_animation, "set_start_offset", start_time);
++	undo_redo->add_undo_method(*animation_node_animation, "set_start_offset", animation_node_animation->get_start_offset());
++	undo_redo->add_do_method(*animation_node_animation, "set_stretch_time_scale", false);
++	undo_redo->add_undo_method(*animation_node_animation, "set_stretch_time_scale", animation_node_animation->is_stretching_time_scale());
++	undo_redo->add_do_method(*animation_node_animation, "set_timeline_length", length);
++	undo_redo->add_undo_method(*animation_node_animation, "set_timeline_length", animation_node_animation->get_timeline_length());
++	undo_redo->add_do_method(*animation_node_animation, "notify_property_list_changed");
++	undo_redo->add_undo_method(*animation_node_animation, "notify_property_list_changed");
++	undo_redo->commit_action();
++}
++
++AnimationNodeAnimationEditor::AnimationNodeAnimationEditor(Ref<AnimationNodeAnimation> p_animation_node_animation) {
++	animation_node_animation = p_animation_node_animation;
++
++	dialog = memnew(AnimationNodeAnimationEditorDialog);
++	add_child(dialog);
++	dialog->set_hide_on_ok(false);
++	dialog->select_start->connect(SceneStringName(item_selected), callable_mp(this, &AnimationNodeAnimationEditor::_validate_markers));
++	dialog->select_end->connect(SceneStringName(item_selected), callable_mp(this, &AnimationNodeAnimationEditor::_validate_markers));
++	dialog->connect(SceneStringName(confirmed), callable_mp(this, &AnimationNodeAnimationEditor::_confirm_set_custom_timeline_from_marker_dialog));
++
++	Control *top_spacer = memnew(Control);
++	add_child(top_spacer);
++	top_spacer->set_custom_minimum_size(Size2(0, 2) * EDSCALE);
++
++	button = memnew(Button);
++	add_child(button);
++	button->set_text(TTR("Set Custom Timeline from Marker"));
++	button->set_h_size_flags(Control::SIZE_SHRINK_CENTER);
++	button->connect(SceneStringName(pressed), callable_mp(this, &AnimationNodeAnimationEditor::_open_set_custom_timeline_from_marker_dialog));
++
++	Control *bottom_spacer = memnew(Control);
++	add_child(bottom_spacer);
++	bottom_spacer->set_custom_minimum_size(Size2(0, 2) * EDSCALE);
++}
++
++AnimationNodeAnimationEditor::~AnimationNodeAnimationEditor() {
++}
++
++void AnimationNodeAnimationEditor::_notification(int p_what) {
++	switch (p_what) {
++		case NOTIFICATION_THEME_CHANGED: {
++			button->set_theme_type_variation(SNAME("InspectorActionButton"));
++			button->set_icon(get_editor_theme_icon(SNAME("Edit")));
++		} break;
++	}
++}
++
++bool EditorInspectorPluginAnimationNodeAnimation::can_handle(Object *p_object) {
++	Ref<AnimationNodeAnimation> ana(Object::cast_to<AnimationNodeAnimation>(p_object));
++	return ana.is_valid() && ana->is_using_custom_timeline();
++}
++
++bool EditorInspectorPluginAnimationNodeAnimation::parse_property(Object *p_object, const Variant::Type p_type, const String &p_path, const PropertyHint p_hint, const String &p_hint_text, const BitField<PropertyUsageFlags> p_usage, const bool p_wide) {
++	Ref<AnimationNodeAnimation> ana(Object::cast_to<AnimationNodeAnimation>(p_object));
++	ERR_FAIL_COND_V(ana.is_null(), false);
++
++	if (p_path == "timeline_length") {
++		add_custom_control(memnew(AnimationNodeAnimationEditor(ana)));
++	}
++
++	return false;
++}
++
++AnimationNodeAnimationEditorDialog::AnimationNodeAnimationEditorDialog() {
++	set_title(TTR("Select Markers..."));
++	VBoxContainer *vbox = memnew(VBoxContainer);
++	add_child(vbox);
++	vbox->set_offsets_preset(Control::PRESET_FULL_RECT);
++
++	HBoxContainer *container_start = memnew(HBoxContainer);
++	vbox->add_child(container_start);
++	Label *label_start = memnew(Label);
++	container_start->add_child(label_start);
++	label_start->set_h_size_flags(Control::SIZE_EXPAND_FILL);
++	label_start->set_stretch_ratio(1);
++	label_start->set_text(TTR("Start Marker"));
++	select_start = memnew(OptionButton);
++	container_start->add_child(select_start);
++	select_start->set_h_size_flags(Control::SIZE_EXPAND_FILL);
++	select_start->set_stretch_ratio(2);
++
++	HBoxContainer *container_end = memnew(HBoxContainer);
++	vbox->add_child(container_end);
++	Label *label_end = memnew(Label);
++	container_end->add_child(label_end);
++	label_end->set_h_size_flags(Control::SIZE_EXPAND_FILL);
++	label_end->set_stretch_ratio(1);
++	label_end->set_text(TTR("End Marker"));
++	select_end = memnew(OptionButton);
++	container_end->add_child(select_end);
++	select_end->set_h_size_flags(Control::SIZE_EXPAND_FILL);
++	select_end->set_stretch_ratio(2);
++}
++
++AnimationNodeAnimationEditorDialog::~AnimationNodeAnimationEditorDialog() {
+ }
+diff --git a/editor/plugins/animation_blend_tree_editor_plugin.h b/editor/plugins/animation_blend_tree_editor_plugin.h
+index ee6f087e07..9e7793977b 100644
+--- a/editor/plugins/animation_blend_tree_editor_plugin.h
++++ b/editor/plugins/animation_blend_tree_editor_plugin.h
+@@ -32,9 +32,11 @@
+ #define ANIMATION_BLEND_TREE_EDITOR_PLUGIN_H
+ 
+ #include "core/object/script_language.h"
++#include "editor/editor_inspector.h"
+ #include "editor/plugins/animation_tree_editor_plugin.h"
+ #include "scene/animation/animation_blend_tree.h"
+ #include "scene/gui/button.h"
++#include "scene/gui/dialogs.h"
+ #include "scene/gui/graph_edit.h"
+ #include "scene/gui/panel_container.h"
+ #include "scene/gui/popup.h"
+@@ -47,6 +49,7 @@ class EditorFileDialog;
+ class EditorProperty;
+ class MenuButton;
+ class PanelContainer;
++class EditorInspectorPluginAnimationNodeAnimation;
+ 
+ class AnimationNodeBlendTreeEditor : public AnimationTreeNodeEditorPlugin {
+ 	GDCLASS(AnimationNodeBlendTreeEditor, AnimationTreeNodeEditorPlugin);
+@@ -147,6 +150,8 @@ class AnimationNodeBlendTreeEditor : public AnimationTreeNodeEditorPlugin {
+ 		MENU_LOAD_FILE_CONFIRM = 1002
+ 	};
+ 
++	Ref<EditorInspectorPluginAnimationNodeAnimation> animation_node_inspector_plugin;
++
+ protected:
+ 	void _notification(int p_what);
+ 	static void _bind_methods();
+@@ -165,6 +170,48 @@ public:
+ 	void update_graph();
+ 
+ 	AnimationNodeBlendTreeEditor();
++	~AnimationNodeBlendTreeEditor();
++};
++
++// EditorPluginAnimationNodeAnimation
++
++class EditorInspectorPluginAnimationNodeAnimation : public EditorInspectorPlugin {
++	GDCLASS(EditorInspectorPluginAnimationNodeAnimation, EditorInspectorPlugin);
++
++public:
++	virtual bool can_handle(Object *p_object) override;
++	virtual bool parse_property(Object *p_object, const Variant::Type p_type, const String &p_path, const PropertyHint p_hint, const String &p_hint_text, const BitField<PropertyUsageFlags> p_usage, const bool p_wide) override;
++};
++
++class AnimationNodeAnimationEditorDialog : public ConfirmationDialog {
++	GDCLASS(AnimationNodeAnimationEditorDialog, ConfirmationDialog);
++
++	friend class AnimationNodeAnimationEditor;
++
++	OptionButton *select_start = nullptr;
++	OptionButton *select_end = nullptr;
++
++public:
++	AnimationNodeAnimationEditorDialog();
++	~AnimationNodeAnimationEditorDialog();
++};
++
++class AnimationNodeAnimationEditor : public VBoxContainer {
++	GDCLASS(AnimationNodeAnimationEditor, VBoxContainer);
++
++	Ref<AnimationNodeAnimation> animation_node_animation;
++	Button *button = nullptr;
++	AnimationNodeAnimationEditorDialog *dialog = nullptr;
++	void _open_set_custom_timeline_from_marker_dialog();
++	void _validate_markers(int p_id);
++	void _confirm_set_custom_timeline_from_marker_dialog();
++
++public:
++	AnimationNodeAnimationEditor(Ref<AnimationNodeAnimation> p_animation_node_animation);
++	~AnimationNodeAnimationEditor();
++
++protected:
++	void _notification(int p_what);
+ };
+ 
+ #endif // ANIMATION_BLEND_TREE_EDITOR_PLUGIN_H
+diff --git a/editor/plugins/animation_player_editor_plugin.cpp b/editor/plugins/animation_player_editor_plugin.cpp
+index 5cb558abbe..e6afc85e9e 100644
+--- a/editor/plugins/animation_player_editor_plugin.cpp
++++ b/editor/plugins/animation_player_editor_plugin.cpp
+@@ -41,6 +41,7 @@
+ #include "editor/editor_undo_redo_manager.h"
+ #include "editor/gui/editor_bottom_panel.h"
+ #include "editor/gui/editor_file_dialog.h"
++#include "editor/gui/editor_validation_panel.h"
+ #include "editor/inspector_dock.h"
+ #include "editor/plugins/canvas_item_editor_plugin.h" // For onion skinning.
+ #include "editor/plugins/node_3d_editor_plugin.h" // For onion skinning.
+@@ -295,7 +296,14 @@ void AnimationPlayerEditor::_play_pressed() {
+ 			player->stop(); //so it won't blend with itself
+ 		}
+ 		ERR_FAIL_COND_EDMSG(!_validate_tracks(player->get_animation(current)), "Animation tracks may have any invalid key, abort playing.");
+-		player->play(current);
++		PackedStringArray markers = track_editor->get_selected_section();
++		if (markers.size() == 2) {
++			StringName start_marker = markers[0];
++			StringName end_marker = markers[1];
++			player->play_section_with_markers(current, start_marker, end_marker);
++		} else {
++			player->play(current);
++		}
+ 	}
+ 
+ 	//unstop
+@@ -312,7 +320,14 @@ void AnimationPlayerEditor::_play_from_pressed() {
+ 		}
+ 		ERR_FAIL_COND_EDMSG(!_validate_tracks(player->get_animation(current)), "Animation tracks may have any invalid key, abort playing.");
+ 		player->seek_internal(time, true, true, true);
+-		player->play(current);
++		PackedStringArray markers = track_editor->get_selected_section();
++		if (markers.size() == 2) {
++			StringName start_marker = markers[0];
++			StringName end_marker = markers[1];
++			player->play_section_with_markers(current, start_marker, end_marker);
++		} else {
++			player->play(current);
++		}
+ 	}
+ 
+ 	//unstop
+@@ -333,7 +348,14 @@ void AnimationPlayerEditor::_play_bw_pressed() {
+ 			player->stop(); //so it won't blend with itself
+ 		}
+ 		ERR_FAIL_COND_EDMSG(!_validate_tracks(player->get_animation(current)), "Animation tracks may have any invalid key, abort playing.");
+-		player->play_backwards(current);
++		PackedStringArray markers = track_editor->get_selected_section();
++		if (markers.size() == 2) {
++			StringName start_marker = markers[0];
++			StringName end_marker = markers[1];
++			player->play_section_with_markers_backwards(current, start_marker, end_marker);
++		} else {
++			player->play_backwards(current);
++		}
+ 	}
+ 
+ 	//unstop
+@@ -350,7 +372,14 @@ void AnimationPlayerEditor::_play_bw_from_pressed() {
+ 		}
+ 		ERR_FAIL_COND_EDMSG(!_validate_tracks(player->get_animation(current)), "Animation tracks may have any invalid key, abort playing.");
+ 		player->seek_internal(time, true, true, true);
+-		player->play_backwards(current);
++		PackedStringArray markers = track_editor->get_selected_section();
++		if (markers.size() == 2) {
++			StringName start_marker = markers[0];
++			StringName end_marker = markers[1];
++			player->play_section_with_markers_backwards(current, start_marker, end_marker);
++		} else {
++			player->play_backwards(current);
++		}
+ 	}
+ 
+ 	//unstop
+@@ -2397,3 +2426,24 @@ AnimationTrackKeyEditEditorPlugin::AnimationTrackKeyEditEditorPlugin() {
+ bool AnimationTrackKeyEditEditorPlugin::handles(Object *p_object) const {
+ 	return p_object->is_class("AnimationTrackKeyEdit");
+ }
++
++bool EditorInspectorPluginAnimationMarkerKeyEdit::can_handle(Object *p_object) {
++	return Object::cast_to<AnimationMarkerKeyEdit>(p_object) != nullptr;
++}
++
++void EditorInspectorPluginAnimationMarkerKeyEdit::parse_begin(Object *p_object) {
++	AnimationMarkerKeyEdit *amk = Object::cast_to<AnimationMarkerKeyEdit>(p_object);
++	ERR_FAIL_NULL(amk);
++
++	amk_editor = memnew(AnimationMarkerKeyEditEditor(amk->animation, amk->marker_name, amk->use_fps));
++	add_custom_control(amk_editor);
++}
++
++AnimationMarkerKeyEditEditorPlugin::AnimationMarkerKeyEditEditorPlugin() {
++	amk_plugin = memnew(EditorInspectorPluginAnimationMarkerKeyEdit);
++	EditorInspector::add_inspector_plugin(amk_plugin);
++}
++
++bool AnimationMarkerKeyEditEditorPlugin::handles(Object *p_object) const {
++	return p_object->is_class("AnimationMarkerKeyEdit");
++}
+diff --git a/editor/plugins/animation_player_editor_plugin.h b/editor/plugins/animation_player_editor_plugin.h
+index e4ca6c17c3..349ed7b5cd 100644
+--- a/editor/plugins/animation_player_editor_plugin.h
++++ b/editor/plugins/animation_player_editor_plugin.h
+@@ -338,4 +338,30 @@ public:
+ 	AnimationTrackKeyEditEditorPlugin();
+ };
+ 
++// AnimationMarkerKeyEditEditorPlugin
++
++class EditorInspectorPluginAnimationMarkerKeyEdit : public EditorInspectorPlugin {
++	GDCLASS(EditorInspectorPluginAnimationMarkerKeyEdit, EditorInspectorPlugin);
++
++	AnimationMarkerKeyEditEditor *amk_editor = nullptr;
++
++public:
++	virtual bool can_handle(Object *p_object) override;
++	virtual void parse_begin(Object *p_object) override;
++};
++
++class AnimationMarkerKeyEditEditorPlugin : public EditorPlugin {
++	GDCLASS(AnimationMarkerKeyEditEditorPlugin, EditorPlugin);
++
++	EditorInspectorPluginAnimationMarkerKeyEdit *amk_plugin = nullptr;
++
++public:
++	bool has_main_screen() const override { return false; }
++	virtual bool handles(Object *p_object) const override;
++
++	virtual String get_name() const override { return "AnimationMarkerKeyEdit"; }
++
++	AnimationMarkerKeyEditEditorPlugin();
++};
++
+ #endif // ANIMATION_PLAYER_EDITOR_PLUGIN_H
+diff --git a/scene/animation/animation_blend_tree.cpp b/scene/animation/animation_blend_tree.cpp
+index a96417738f..a2aef60417 100644
+--- a/scene/animation/animation_blend_tree.cpp
++++ b/scene/animation/animation_blend_tree.cpp
+@@ -245,6 +245,8 @@ AnimationNode::NodeTimeInfo AnimationNodeAnimation::_process(const AnimationMixe
+ 
+ 	if (!p_test_only) {
+ 		AnimationMixer::PlaybackInfo pi = p_playback_info;
++		pi.start = 0.0;
++		pi.end = cur_len;
+ 		if (play_mode == PLAY_MODE_FORWARD) {
+ 			pi.time = cur_playback_time;
+ 			pi.delta = cur_delta;
+diff --git a/scene/animation/animation_mixer.cpp b/scene/animation/animation_mixer.cpp
+index 664302d45e..eb8bc8c382 100644
+--- a/scene/animation/animation_mixer.cpp
++++ b/scene/animation/animation_mixer.cpp
+@@ -1117,6 +1117,8 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 		Ref<Animation> a = ai.animation_data.animation;
+ 		double time = ai.playback_info.time;
+ 		double delta = ai.playback_info.delta;
++		double start = ai.playback_info.start;
++		double end = ai.playback_info.end;
+ 		bool seeked = ai.playback_info.seeked;
+ 		Animation::LoopedFlag looped_flag = ai.playback_info.looped_flag;
+ 		bool is_external_seeking = ai.playback_info.is_external_seeking;
+@@ -1168,32 +1170,32 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 					if (track->root_motion && calc_root) {
+ 						double prev_time = time - delta;
+ 						if (!backward) {
+-							if (Animation::is_less_approx(prev_time, 0)) {
++							if (Animation::is_less_approx(prev_time, start)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = 0;
++										prev_time = start;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+ 								}
+ 							}
+ 						} else {
+-							if (Animation::is_greater_approx(prev_time, (double)a_length)) {
++							if (Animation::is_greater_approx(prev_time, end)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = (double)a_length;
++										prev_time = end;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+@@ -1208,10 +1210,10 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								loc[0] = post_process_key_value(a, i, loc[0], t->object_id, t->bone_idx);
+-								a->try_position_track_interpolate(i, (double)a_length, &loc[1]);
++								a->try_position_track_interpolate(i, end, &loc[1]);
+ 								loc[1] = post_process_key_value(a, i, loc[1], t->object_id, t->bone_idx);
+ 								root_motion_cache.loc += (loc[1] - loc[0]) * blend;
+-								prev_time = 0;
++								prev_time = start;
+ 							}
+ 						} else {
+ 							if (Animation::is_less_approx(prev_time, time)) {
+@@ -1220,10 +1222,10 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								loc[0] = post_process_key_value(a, i, loc[0], t->object_id, t->bone_idx);
+-								a->try_position_track_interpolate(i, 0, &loc[1]);
++								a->try_position_track_interpolate(i, start, &loc[1]);
+ 								loc[1] = post_process_key_value(a, i, loc[1], t->object_id, t->bone_idx);
+ 								root_motion_cache.loc += (loc[1] - loc[0]) * blend;
+-								prev_time = (double)a_length;
++								prev_time = end;
+ 							}
+ 						}
+ 						Error err = a->try_position_track_interpolate(i, prev_time, &loc[0]);
+@@ -1234,7 +1236,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 						a->try_position_track_interpolate(i, time, &loc[1]);
+ 						loc[1] = post_process_key_value(a, i, loc[1], t->object_id, t->bone_idx);
+ 						root_motion_cache.loc += (loc[1] - loc[0]) * blend;
+-						prev_time = !backward ? 0 : (double)a_length;
++						prev_time = !backward ? start : end;
+ 					}
+ 					{
+ 						Vector3 loc;
+@@ -1256,32 +1258,32 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 					if (track->root_motion && calc_root) {
+ 						double prev_time = time - delta;
+ 						if (!backward) {
+-							if (Animation::is_less_approx(prev_time, 0)) {
++							if (Animation::is_less_approx(prev_time, start)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = 0;
++										prev_time = start;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+ 								}
+ 							}
+ 						} else {
+-							if (Animation::is_greater_approx(prev_time, (double)a_length)) {
++							if (Animation::is_greater_approx(prev_time, end)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = (double)a_length;
++										prev_time = end;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+@@ -1296,10 +1298,10 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								rot[0] = post_process_key_value(a, i, rot[0], t->object_id, t->bone_idx);
+-								a->try_rotation_track_interpolate(i, (double)a_length, &rot[1]);
++								a->try_rotation_track_interpolate(i, end, &rot[1]);
+ 								rot[1] = post_process_key_value(a, i, rot[1], t->object_id, t->bone_idx);
+ 								root_motion_cache.rot = (root_motion_cache.rot * Quaternion().slerp(rot[0].inverse() * rot[1], blend)).normalized();
+-								prev_time = 0;
++								prev_time = start;
+ 							}
+ 						} else {
+ 							if (Animation::is_less_approx(prev_time, time)) {
+@@ -1308,9 +1310,9 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								rot[0] = post_process_key_value(a, i, rot[0], t->object_id, t->bone_idx);
+-								a->try_rotation_track_interpolate(i, 0, &rot[1]);
++								a->try_rotation_track_interpolate(i, start, &rot[1]);
+ 								root_motion_cache.rot = (root_motion_cache.rot * Quaternion().slerp(rot[0].inverse() * rot[1], blend)).normalized();
+-								prev_time = (double)a_length;
++								prev_time = end;
+ 							}
+ 						}
+ 						Error err = a->try_rotation_track_interpolate(i, prev_time, &rot[0]);
+@@ -1321,7 +1323,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 						a->try_rotation_track_interpolate(i, time, &rot[1]);
+ 						rot[1] = post_process_key_value(a, i, rot[1], t->object_id, t->bone_idx);
+ 						root_motion_cache.rot = (root_motion_cache.rot * Quaternion().slerp(rot[0].inverse() * rot[1], blend)).normalized();
+-						prev_time = !backward ? 0 : (double)a_length;
++						prev_time = !backward ? start : end;
+ 					}
+ 					{
+ 						Quaternion rot;
+@@ -1343,32 +1345,32 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 					if (track->root_motion && calc_root) {
+ 						double prev_time = time - delta;
+ 						if (!backward) {
+-							if (Animation::is_less_approx(prev_time, 0)) {
++							if (Animation::is_less_approx(prev_time, start)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = 0;
++										prev_time = start;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+ 								}
+ 							}
+ 						} else {
+-							if (Animation::is_greater_approx(prev_time, (double)a_length)) {
++							if (Animation::is_greater_approx(prev_time, end)) {
+ 								switch (a->get_loop_mode()) {
+ 									case Animation::LOOP_NONE: {
+-										prev_time = (double)a_length;
++										prev_time = end;
+ 									} break;
+ 									case Animation::LOOP_LINEAR: {
+-										prev_time = Math::fposmod(prev_time, (double)a_length);
++										prev_time = Math::fposmod(prev_time - start, end - start) + start;
+ 									} break;
+ 									case Animation::LOOP_PINGPONG: {
+-										prev_time = Math::pingpong(prev_time, (double)a_length);
++										prev_time = Math::pingpong(prev_time - start, end - start) + start;
+ 									} break;
+ 									default:
+ 										break;
+@@ -1383,10 +1385,10 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								scale[0] = post_process_key_value(a, i, scale[0], t->object_id, t->bone_idx);
+-								a->try_scale_track_interpolate(i, (double)a_length, &scale[1]);
++								a->try_scale_track_interpolate(i, end, &scale[1]);
+ 								root_motion_cache.scale += (scale[1] - scale[0]) * blend;
+ 								scale[1] = post_process_key_value(a, i, scale[1], t->object_id, t->bone_idx);
+-								prev_time = 0;
++								prev_time = start;
+ 							}
+ 						} else {
+ 							if (Animation::is_less_approx(prev_time, time)) {
+@@ -1395,10 +1397,10 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 									continue;
+ 								}
+ 								scale[0] = post_process_key_value(a, i, scale[0], t->object_id, t->bone_idx);
+-								a->try_scale_track_interpolate(i, 0, &scale[1]);
++								a->try_scale_track_interpolate(i, start, &scale[1]);
+ 								scale[1] = post_process_key_value(a, i, scale[1], t->object_id, t->bone_idx);
+ 								root_motion_cache.scale += (scale[1] - scale[0]) * blend;
+-								prev_time = (double)a_length;
++								prev_time = end;
+ 							}
+ 						}
+ 						Error err = a->try_scale_track_interpolate(i, prev_time, &scale[0]);
+@@ -1409,7 +1411,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 						a->try_scale_track_interpolate(i, time, &scale[1]);
+ 						scale[1] = post_process_key_value(a, i, scale[1], t->object_id, t->bone_idx);
+ 						root_motion_cache.scale += (scale[1] - scale[0]) * blend;
+-						prev_time = !backward ? 0 : (double)a_length;
++						prev_time = !backward ? start : end;
+ 					}
+ 					{
+ 						Vector3 scale;
+@@ -1671,6 +1673,7 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 					if (!player2) {
+ 						continue;
+ 					}
++					// TODO: Make it possible to embed section info in animation track keys.
+ 					if (seeked) {
+ 						// Seek.
+ 						int idx = a->track_find_key(i, time, Animation::FIND_MODE_NEAREST, true);
+@@ -1683,19 +1686,19 @@ void AnimationMixer::_blend_process(double p_delta, bool p_update_only) {
+ 							continue;
+ 						}
+ 						Ref<Animation> anim = player2->get_animation(anim_name);
+-						double at_anim_pos = 0.0;
++						double at_anim_pos = start;
+ 						switch (anim->get_loop_mode()) {
+ 							case Animation::LOOP_NONE: {
+-								if (!is_external_seeking && ((!backward && Animation::is_greater_or_equal_approx(time, pos + (double)anim->get_length())) || (backward && Animation::is_less_or_equal_approx(time, pos)))) {
++								if (!is_external_seeking && ((!backward && Animation::is_greater_or_equal_approx(time, pos + end)) || (backward && Animation::is_less_or_equal_approx(time, pos + start)))) {
+ 									continue; // Do nothing if current time is outside of length when started.
+ 								}
+-								at_anim_pos = MIN((double)anim->get_length(), time - pos); // Seek to end.
++								at_anim_pos = MIN(end, time - pos); // Seek to end.
+ 							} break;
+ 							case Animation::LOOP_LINEAR: {
+-								at_anim_pos = Math::fposmod(time - pos, (double)anim->get_length()); // Seek to loop.
++								at_anim_pos = Math::fposmod(time - pos - start, end - start) + start; // Seek to loop.
+ 							} break;
+ 							case Animation::LOOP_PINGPONG: {
+-								at_anim_pos = Math::pingpong(time - pos, (double)a_length);
++								at_anim_pos = Math::pingpong(time - pos - start, end - start) + start;
+ 							} break;
+ 							default:
+ 								break;
+@@ -2092,6 +2095,8 @@ Ref<AnimatedValuesBackup> AnimationMixer::make_backup() {
+ 	PlaybackInfo pi;
+ 	pi.time = 0;
+ 	pi.delta = 0;
++	pi.start = 0;
++	pi.end = reset_anim->get_length();
+ 	pi.seeked = true;
+ 	pi.weight = 1.0;
+ 	make_animation_instance(SceneStringName(RESET), pi);
+diff --git a/scene/animation/animation_mixer.h b/scene/animation/animation_mixer.h
+index 5482197fbd..27c9a00a9c 100644
+--- a/scene/animation/animation_mixer.h
++++ b/scene/animation/animation_mixer.h
+@@ -85,6 +85,8 @@ public:
+ 	struct PlaybackInfo {
+ 		double time = 0.0;
+ 		double delta = 0.0;
++		double start = 0.0;
++		double end = 0.0;
+ 		bool seeked = false;
+ 		bool is_external_seeking = false;
+ 		Animation::LoopedFlag looped_flag = Animation::LOOPED_FLAG_NONE;
+diff --git a/scene/animation/animation_player.cpp b/scene/animation/animation_player.cpp
+index a4aa383a9d..bc951e4e14 100644
+--- a/scene/animation/animation_player.cpp
++++ b/scene/animation/animation_player.cpp
+@@ -164,39 +164,41 @@ void AnimationPlayer::_process_playback_data(PlaybackData &cd, double p_delta, f
+ 	double delta = p_started ? 0 : p_delta * speed;
+ 	double next_pos = cd.pos + delta;
+ 
+-	double len = cd.from->animation->get_length();
++	double start = get_section_start_time();
++	double end = get_section_end_time();
++
+ 	Animation::LoopedFlag looped_flag = Animation::LOOPED_FLAG_NONE;
+ 
+ 	switch (cd.from->animation->get_loop_mode()) {
+ 		case Animation::LOOP_NONE: {
+-			if (Animation::is_less_approx(next_pos, 0)) {
+-				next_pos = 0;
+-			} else if (Animation::is_greater_approx(next_pos, len)) {
+-				next_pos = len;
++			if (Animation::is_less_approx(next_pos, start)) {
++				next_pos = start;
++			} else if (Animation::is_greater_approx(next_pos, end)) {
++				next_pos = end;
+ 			}
+ 			delta = next_pos - cd.pos; // Fix delta (after determination of backwards because negative zero is lost here).
+ 		} break;
+ 
+ 		case Animation::LOOP_LINEAR: {
+-			if (Animation::is_less_approx(next_pos, 0) && Animation::is_greater_or_equal_approx(cd.pos, 0)) {
++			if (Animation::is_less_approx(next_pos, start) && Animation::is_greater_or_equal_approx(cd.pos, start)) {
+ 				looped_flag = Animation::LOOPED_FLAG_START;
+ 			}
+-			if (Animation::is_greater_approx(next_pos, len) && Animation::is_less_or_equal_approx(cd.pos, len)) {
++			if (Animation::is_greater_approx(next_pos, end) && Animation::is_less_or_equal_approx(cd.pos, end)) {
+ 				looped_flag = Animation::LOOPED_FLAG_END;
+ 			}
+-			next_pos = Math::fposmod(next_pos, (double)len);
++			next_pos = Math::fposmod(next_pos - start, end - start) + start;
+ 		} break;
+ 
+ 		case Animation::LOOP_PINGPONG: {
+-			if (Animation::is_less_approx(next_pos, 0) && Animation::is_greater_or_equal_approx(cd.pos, 0)) {
++			if (Animation::is_less_approx(next_pos, start) && Animation::is_greater_or_equal_approx(cd.pos, start)) {
+ 				cd.speed_scale *= -1.0;
+ 				looped_flag = Animation::LOOPED_FLAG_START;
+ 			}
+-			if (Animation::is_greater_approx(next_pos, len) && Animation::is_less_or_equal_approx(cd.pos, len)) {
++			if (Animation::is_greater_approx(next_pos, end) && Animation::is_less_or_equal_approx(cd.pos, end)) {
+ 				cd.speed_scale *= -1.0;
+ 				looped_flag = Animation::LOOPED_FLAG_END;
+ 			}
+-			next_pos = Math::pingpong(next_pos, (double)len);
++			next_pos = Math::pingpong(next_pos - start, end - start) + start;
+ 		} break;
+ 
+ 		default:
+@@ -208,18 +210,18 @@ void AnimationPlayer::_process_playback_data(PlaybackData &cd, double p_delta, f
+ 	// End detection.
+ 	if (p_is_current) {
+ 		if (cd.from->animation->get_loop_mode() == Animation::LOOP_NONE) {
+-			if (!backwards && Animation::is_less_or_equal_approx(prev_pos, len) && Math::is_equal_approx(next_pos, len)) {
++			if (!backwards && Animation::is_less_or_equal_approx(prev_pos, end) && Math::is_equal_approx(next_pos, end)) {
+ 				// Playback finished.
+-				next_pos = len; // Snap to the edge.
++				next_pos = end; // Snap to the edge.
+ 				end_reached = true;
+-				end_notify = Animation::is_less_approx(prev_pos, len); // Notify only if not already at the end.
++				end_notify = Animation::is_less_approx(prev_pos, end); // Notify only if not already at the end.
+ 				p_blend = 1.0;
+ 			}
+-			if (backwards && Animation::is_greater_or_equal_approx(prev_pos, 0) && Math::is_equal_approx(next_pos, 0)) {
++			if (backwards && Animation::is_greater_or_equal_approx(prev_pos, start) && Math::is_equal_approx(next_pos, start)) {
+ 				// Playback finished.
+-				next_pos = 0; // Snap to the edge.
++				next_pos = start; // Snap to the edge.
+ 				end_reached = true;
+-				end_notify = Animation::is_greater_approx(prev_pos, 0); // Notify only if not already at the beginning.
++				end_notify = Animation::is_greater_approx(prev_pos, start); // Notify only if not already at the beginning.
+ 				p_blend = 1.0;
+ 			}
+ 		}
+@@ -231,10 +233,14 @@ void AnimationPlayer::_process_playback_data(PlaybackData &cd, double p_delta, f
+ 	if (p_started) {
+ 		pi.time = prev_pos;
+ 		pi.delta = 0;
++		pi.start = start;
++		pi.end = end;
+ 		pi.seeked = true;
+ 	} else {
+ 		pi.time = next_pos;
+ 		pi.delta = delta;
++		pi.start = start;
++		pi.end = end;
+ 		pi.seeked = p_seeked;
+ 	}
+ 	if (Math::is_zero_approx(pi.delta) && backwards) {
+@@ -378,6 +384,14 @@ void AnimationPlayer::play_backwards(const StringName &p_name, double p_custom_b
+ 	play(p_name, p_custom_blend, -1, true);
+ }
+ 
++void AnimationPlayer::play_section_with_markers_backwards(const StringName &p_name, const StringName &p_start_marker, const StringName &p_end_marker, double p_custom_blend) {
++	play_section_with_markers(p_name, p_start_marker, p_end_marker, p_custom_blend, -1, true);
++}
++
++void AnimationPlayer::play_section_backwards(const StringName &p_name, double p_start_time, double p_end_time, double p_custom_blend) {
++	play_section(p_name, p_start_time, p_end_time, -1, true);
++}
++
+ void AnimationPlayer::play(const StringName &p_name, double p_custom_blend, float p_custom_scale, bool p_from_end) {
+ 	if (auto_capture) {
+ 		play_with_capture(p_name, auto_capture_duration, p_custom_blend, p_custom_scale, p_from_end, auto_capture_transition_type, auto_capture_ease_type);
+@@ -387,6 +401,10 @@ void AnimationPlayer::play(const StringName &p_name, double p_custom_blend, floa
+ }
+ 
+ void AnimationPlayer::_play(const StringName &p_name, double p_custom_blend, float p_custom_scale, bool p_from_end) {
++	play_section_with_markers(p_name, StringName(), StringName(), p_custom_blend, p_custom_scale, p_from_end);
++}
++
++void AnimationPlayer::play_section_with_markers(const StringName &p_name, const StringName &p_start_marker, const StringName &p_end_marker, double p_custom_blend, float p_custom_scale, bool p_from_end) {
+ 	StringName name = p_name;
+ 
+ 	if (name == StringName()) {
+@@ -395,6 +413,38 @@ void AnimationPlayer::_play(const StringName &p_name, double p_custom_blend, flo
+ 
+ 	ERR_FAIL_COND_MSG(!animation_set.has(name), vformat("Animation not found: %s.", name));
+ 
++	Ref<Animation> animation = animation_set[name].animation;
++
++	ERR_FAIL_COND_MSG(p_start_marker == p_end_marker && p_start_marker, vformat("Start marker and end marker cannot be the same marker: %s.", p_start_marker));
++	ERR_FAIL_COND_MSG(p_start_marker && !animation->has_marker(p_start_marker), vformat("Marker %s not found in animation: %s.", p_start_marker, name));
++	ERR_FAIL_COND_MSG(p_end_marker && !animation->has_marker(p_end_marker), vformat("Marker %s not found in animation: %s.", p_end_marker, name));
++
++	double start_time = p_start_marker ? animation->get_marker_time(p_start_marker) : -1;
++	double end_time = p_end_marker ? animation->get_marker_time(p_end_marker) : -1;
++
++	ERR_FAIL_COND_MSG(p_start_marker && p_end_marker && Animation::is_greater_approx(start_time, end_time), vformat("End marker %s is placed earlier than start marker %s in animation: %s.", p_end_marker, p_start_marker, name));
++
++	if (p_start_marker && Animation::is_less_approx(start_time, 0)) {
++		WARN_PRINT_ED(vformat("Negative time start marker: %s is invalid in the section, so the start of the animation: %s is used instead.", p_start_marker, playback.current.from->animation->get_name()));
++	}
++	if (p_end_marker && Animation::is_less_approx(end_time, 0)) {
++		WARN_PRINT_ED(vformat("Negative time end marker: %s is invalid in the section, so the end of the animation: %s is used instead.", p_end_marker, playback.current.from->animation->get_name()));
++	}
++
++	play_section(name, start_time, end_time, p_custom_blend, p_custom_scale, p_from_end);
++}
++
++void AnimationPlayer::play_section(const StringName &p_name, double p_start_time, double p_end_time, double p_custom_blend, float p_custom_scale, bool p_from_end) {
++	StringName name = p_name;
++
++	if (name == StringName()) {
++		name = playback.assigned;
++	}
++
++	ERR_FAIL_COND_MSG(!animation_set.has(name), vformat("Animation not found: %s.", name));
++	ERR_FAIL_COND_MSG(p_start_time >= 0 && p_end_time >= 0 && Math::is_equal_approx(p_start_time, p_end_time), "Start time and end time must not equal to each other.");
++	ERR_FAIL_COND_MSG(p_start_time >= 0 && p_end_time >= 0 && Animation::is_greater_approx(p_start_time, p_end_time), vformat("Start time %f is greater than end time %f.", p_start_time, p_end_time));
++
+ 	Playback &c = playback;
+ 
+ 	if (c.current.from) {
+@@ -442,22 +492,27 @@ void AnimationPlayer::_play(const StringName &p_name, double p_custom_blend, flo
+ 
+ 	c.current.from = &animation_set[name];
+ 	c.current.speed_scale = p_custom_scale;
++	c.current.start_time = p_start_time;
++	c.current.end_time = p_end_time;
++
++	double start = get_section_start_time();
++	double end = get_section_end_time();
+ 
+ 	if (!end_reached) {
+ 		playback_queue.clear();
+ 	}
+ 
+ 	if (c.assigned != name) { // Reset.
+-		c.current.pos = p_from_end ? c.current.from->animation->get_length() : 0;
++		c.current.pos = p_from_end ? end : start;
+ 		c.assigned = name;
+ 		emit_signal(SNAME("current_animation_changed"), c.assigned);
+ 	} else {
+-		if (p_from_end && Math::is_zero_approx(c.current.pos)) {
++		if (p_from_end && Math::is_equal_approx(c.current.pos, start)) {
+ 			// Animation reset but played backwards, set position to the end.
+-			seek_internal(c.current.from->animation->get_length(), true, true, true);
+-		} else if (!p_from_end && Math::is_equal_approx(c.current.pos, (double)c.current.from->animation->get_length())) {
++			seek_internal(end, true, true, true);
++		} else if (!p_from_end && Math::is_equal_approx(c.current.pos, end)) {
+ 			// Animation resumed but already ended, set position to the beginning.
+-			seek_internal(0, true, true, true);
++			seek_internal(start, true, true, true);
+ 		} else if (playing) {
+ 			return;
+ 		}
+@@ -551,6 +606,8 @@ void AnimationPlayer::set_assigned_animation(const String &p_animation) {
+ 		ERR_FAIL_COND_MSG(!animation_set.has(p_animation), vformat("Animation not found: %s.", p_animation));
+ 		playback.current.pos = 0;
+ 		playback.current.from = &animation_set[p_animation];
++		playback.current.start_time = -1;
++		playback.current.end_time = -1;
+ 		playback.assigned = p_animation;
+ 		emit_signal(SNAME("current_animation_changed"), playback.assigned);
+ 	}
+@@ -603,6 +660,12 @@ void AnimationPlayer::seek_internal(double p_time, bool p_update, bool p_update_
+ 		}
+ 	}
+ 
++	double start = get_section_start_time();
++	double end = get_section_end_time();
++
++	// Clamp the seek position.
++	p_time = CLAMP(p_time, start, end);
++
+ 	playback.seeked = true;
+ 	playback.internal_seeked = p_is_internal_seek;
+ 
+@@ -641,6 +704,55 @@ double AnimationPlayer::get_current_animation_length() const {
+ 	return playback.current.from->animation->get_length();
+ }
+ 
++void AnimationPlayer::set_section_with_markers(const StringName &p_start_marker, const StringName &p_end_marker) {
++	ERR_FAIL_NULL_MSG(playback.current.from, "AnimationPlayer has no current animation.");
++	ERR_FAIL_COND_MSG(p_start_marker == p_end_marker && p_start_marker, vformat("Start marker and end marker cannot be the same marker: %s.", p_start_marker));
++	ERR_FAIL_COND_MSG(p_start_marker && !playback.current.from->animation->has_marker(p_start_marker), vformat("Marker %s not found in animation: %s.", p_start_marker, playback.current.from->animation->get_name()));
++	ERR_FAIL_COND_MSG(p_end_marker && !playback.current.from->animation->has_marker(p_end_marker), vformat("Marker %s not found in animation: %s.", p_end_marker, playback.current.from->animation->get_name()));
++	double start_time = p_start_marker ? playback.current.from->animation->get_marker_time(p_start_marker) : -1;
++	double end_time = p_end_marker ? playback.current.from->animation->get_marker_time(p_end_marker) : -1;
++	if (p_start_marker && Animation::is_less_approx(start_time, 0)) {
++		WARN_PRINT_ONCE_ED(vformat("Marker %s time must be positive in animation: %s.", p_start_marker, playback.current.from->animation->get_name()));
++	}
++	if (p_end_marker && Animation::is_less_approx(end_time, 0)) {
++		WARN_PRINT_ONCE_ED(vformat("Marker %s time must be positive in animation: %s.", p_end_marker, playback.current.from->animation->get_name()));
++	}
++	set_section(start_time, end_time);
++}
++
++void AnimationPlayer::set_section(double p_start_time, double p_end_time) {
++	ERR_FAIL_NULL_MSG(playback.current.from, "AnimationPlayer has no current animation.");
++	ERR_FAIL_COND_MSG(Animation::is_greater_or_equal_approx(p_start_time, 0) && Animation::is_greater_or_equal_approx(p_end_time, 0) && Animation::is_greater_or_equal_approx(p_start_time, p_end_time), vformat("Start time %f is greater than end time %f.", p_start_time, p_end_time));
++	playback.current.start_time = p_start_time;
++	playback.current.end_time = p_end_time;
++	playback.current.pos = CLAMP(playback.current.pos, get_section_start_time(), get_section_end_time());
++}
++
++void AnimationPlayer::reset_section() {
++	playback.current.start_time = -1;
++	playback.current.end_time = -1;
++}
++
++double AnimationPlayer::get_section_start_time() const {
++	ERR_FAIL_NULL_V_MSG(playback.current.from, playback.current.start_time, "AnimationPlayer has no current animation.");
++	if (Animation::is_less_approx(playback.current.start_time, 0) || playback.current.start_time > playback.current.from->animation->get_length()) {
++		return 0;
++	}
++	return playback.current.start_time;
++}
++
++double AnimationPlayer::get_section_end_time() const {
++	ERR_FAIL_NULL_V_MSG(playback.current.from, playback.current.end_time, "AnimationPlayer has no current animation.");
++	if (Animation::is_less_approx(playback.current.end_time, 0) || playback.current.end_time > playback.current.from->animation->get_length()) {
++		return playback.current.from->animation->get_length();
++	}
++	return playback.current.end_time;
++}
++
++bool AnimationPlayer::has_section() const {
++	return Animation::is_greater_or_equal_approx(playback.current.start_time, 0) || Animation::is_greater_or_equal_approx(playback.current.end_time, 0);
++}
++
+ void AnimationPlayer::set_autoplay(const String &p_name) {
+ 	if (is_inside_tree() && !Engine::get_singleton()->is_editor_hint()) {
+ 		WARN_PRINT("Setting autoplay after the node has been added to the scene has no effect.");
+@@ -665,13 +777,14 @@ void AnimationPlayer::_stop_internal(bool p_reset, bool p_keep_state) {
+ 	_clear_caches();
+ 	Playback &c = playback;
+ 	// c.blend.clear();
++	double start = get_section_start_time();
+ 	if (p_reset) {
+ 		c.blend.clear();
+ 		if (p_keep_state) {
+-			c.current.pos = 0;
++			c.current.pos = start;
+ 		} else {
+ 			is_stopping = true;
+-			seek_internal(0, true, true, true);
++			seek_internal(start, true, true, true);
+ 			is_stopping = false;
+ 		}
+ 		c.current.from = nullptr;
+@@ -763,20 +876,6 @@ Tween::EaseType AnimationPlayer::get_auto_capture_ease_type() const {
+ 	return auto_capture_ease_type;
+ }
+ 
+-#ifdef TOOLS_ENABLED
+-void AnimationPlayer::get_argument_options(const StringName &p_function, int p_idx, List<String> *r_options) const {
+-	const String pf = p_function;
+-	if (p_idx == 0 && (pf == "play" || pf == "play_backwards" || pf == "has_animation" || pf == "queue")) {
+-		List<StringName> al;
+-		get_animation_list(&al);
+-		for (const StringName &name : al) {
+-			r_options->push_back(String(name).quote());
+-		}
+-	}
+-	AnimationMixer::get_argument_options(p_function, p_idx, r_options);
+-}
+-#endif
+-
+ void AnimationPlayer::_animation_removed(const StringName &p_name, const StringName &p_library) {
+ 	AnimationMixer::_animation_removed(p_name, p_library);
+ 
+@@ -863,7 +962,11 @@ void AnimationPlayer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_auto_capture_ease_type"), &AnimationPlayer::get_auto_capture_ease_type);
+ 
+ 	ClassDB::bind_method(D_METHOD("play", "name", "custom_blend", "custom_speed", "from_end"), &AnimationPlayer::play, DEFVAL(StringName()), DEFVAL(-1), DEFVAL(1.0), DEFVAL(false));
++	ClassDB::bind_method(D_METHOD("play_section_with_markers", "name", "start_marker", "end_marker", "custom_blend", "custom_speed", "from_end"), &AnimationPlayer::play_section_with_markers, DEFVAL(StringName()), DEFVAL(StringName()), DEFVAL(StringName()), DEFVAL(-1), DEFVAL(1.0), DEFVAL(false));
++	ClassDB::bind_method(D_METHOD("play_section", "name", "start_time", "end_time", "custom_blend", "custom_speed", "from_end"), &AnimationPlayer::play_section, DEFVAL(StringName()), DEFVAL(-1), DEFVAL(-1), DEFVAL(-1), DEFVAL(1.0), DEFVAL(false));
+ 	ClassDB::bind_method(D_METHOD("play_backwards", "name", "custom_blend"), &AnimationPlayer::play_backwards, DEFVAL(StringName()), DEFVAL(-1));
++	ClassDB::bind_method(D_METHOD("play_section_with_markers_backwards", "name", "start_marker", "end_marker", "custom_blend"), &AnimationPlayer::play_section_with_markers_backwards, DEFVAL(StringName()), DEFVAL(StringName()), DEFVAL(StringName()), DEFVAL(-1));
++	ClassDB::bind_method(D_METHOD("play_section_backwards", "name", "start_time", "end_time", "custom_blend"), &AnimationPlayer::play_section_backwards, DEFVAL(StringName()), DEFVAL(-1), DEFVAL(-1), DEFVAL(-1));
+ 	ClassDB::bind_method(D_METHOD("play_with_capture", "name", "duration", "custom_blend", "custom_speed", "from_end", "trans_type", "ease_type"), &AnimationPlayer::play_with_capture, DEFVAL(StringName()), DEFVAL(-1.0), DEFVAL(-1), DEFVAL(1.0), DEFVAL(false), DEFVAL(Tween::TRANS_LINEAR), DEFVAL(Tween::EASE_IN));
+ 	ClassDB::bind_method(D_METHOD("pause"), &AnimationPlayer::pause);
+ 	ClassDB::bind_method(D_METHOD("stop", "keep_state"), &AnimationPlayer::stop, DEFVAL(false));
+@@ -893,6 +996,14 @@ void AnimationPlayer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("get_current_animation_position"), &AnimationPlayer::get_current_animation_position);
+ 	ClassDB::bind_method(D_METHOD("get_current_animation_length"), &AnimationPlayer::get_current_animation_length);
+ 
++	ClassDB::bind_method(D_METHOD("set_section_with_markers", "start_marker", "end_marker"), &AnimationPlayer::set_section_with_markers, DEFVAL(StringName()), DEFVAL(StringName()));
++	ClassDB::bind_method(D_METHOD("set_section", "start_time", "end_time"), &AnimationPlayer::set_section, DEFVAL(-1), DEFVAL(-1));
++	ClassDB::bind_method(D_METHOD("reset_section"), &AnimationPlayer::reset_section);
++
++	ClassDB::bind_method(D_METHOD("get_section_start_time"), &AnimationPlayer::get_section_start_time);
++	ClassDB::bind_method(D_METHOD("get_section_end_time"), &AnimationPlayer::get_section_end_time);
++	ClassDB::bind_method(D_METHOD("has_section"), &AnimationPlayer::has_section);
++
+ 	ClassDB::bind_method(D_METHOD("seek", "seconds", "update", "update_only"), &AnimationPlayer::seek, DEFVAL(false), DEFVAL(false));
+ 
+ 	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "current_animation", PROPERTY_HINT_ENUM, "", PROPERTY_USAGE_EDITOR), "set_current_animation", "get_current_animation");
+diff --git a/scene/animation/animation_player.h b/scene/animation/animation_player.h
+index e05a2c9935..3223e2522d 100644
+--- a/scene/animation/animation_player.h
++++ b/scene/animation/animation_player.h
+@@ -68,6 +68,8 @@ private:
+ 		AnimationData *from = nullptr;
+ 		double pos = 0.0;
+ 		float speed_scale = 1.0;
++		double start_time = 0.0;
++		double end_time = 0.0;
+ 	};
+ 
+ 	struct Blend {
+@@ -177,7 +179,11 @@ public:
+ 	Tween::EaseType get_auto_capture_ease_type() const;
+ 
+ 	void play(const StringName &p_name = StringName(), double p_custom_blend = -1, float p_custom_scale = 1.0, bool p_from_end = false);
++	void play_section_with_markers(const StringName &p_name = StringName(), const StringName &p_start_marker = StringName(), const StringName &p_end_marker = StringName(), double p_custom_blend = -1, float p_custom_scale = 1.0, bool p_from_end = false);
++	void play_section(const StringName &p_name = StringName(), double p_start_time = -1, double p_end_time = -1, double p_custom_blend = -1, float p_custom_scale = 1.0, bool p_from_end = false);
+ 	void play_backwards(const StringName &p_name = StringName(), double p_custom_blend = -1);
++	void play_section_with_markers_backwards(const StringName &p_name = StringName(), const StringName &p_start_marker = StringName(), const StringName &p_end_marker = StringName(), double p_custom_blend = -1);
++	void play_section_backwards(const StringName &p_name = StringName(), double p_start_time = -1, double p_end_time = -1, double p_custom_blend = -1);
+ 	void play_with_capture(const StringName &p_name = StringName(), double p_duration = -1.0, double p_custom_blend = -1, float p_custom_scale = 1.0, bool p_from_end = false, Tween::TransitionType p_trans_type = Tween::TRANS_LINEAR, Tween::EaseType p_ease_type = Tween::EASE_IN);
+ 	void queue(const StringName &p_name);
+ 	Vector<String> get_queue();
+@@ -207,9 +213,13 @@ public:
+ 	double get_current_animation_position() const;
+ 	double get_current_animation_length() const;
+ 
+-#ifdef TOOLS_ENABLED
+-	void get_argument_options(const StringName &p_function, int p_idx, List<String> *r_options) const override;
+-#endif
++	void set_section_with_markers(const StringName &p_start_marker = StringName(), const StringName &p_end_marker = StringName());
++	void set_section(double p_start_time = -1, double p_end_time = -1);
++	void reset_section();
++
++	double get_section_start_time() const;
++	double get_section_end_time() const;
++	bool has_section() const;
+ 
+ 	virtual void advance(double p_time) override;
+ 
+diff --git a/scene/resources/animation.cpp b/scene/resources/animation.cpp
+index 1dac4b97ad..57a4e35f7a 100644
+--- a/scene/resources/animation.cpp
++++ b/scene/resources/animation.cpp
+@@ -62,6 +62,23 @@ bool Animation::_set(const StringName &p_name, const Variant &p_value) {
+ 			compression.pages[i].time_offset = page["time_offset"];
+ 		}
+ 		compression.enabled = true;
++		return true;
++	} else if (prop_name == SNAME("markers")) {
++		Array markers = p_value;
++		for (const Dictionary marker : markers) {
++			ERR_FAIL_COND_V(!marker.has("name"), false);
++			ERR_FAIL_COND_V(!marker.has("time"), false);
++			StringName marker_name = marker["name"];
++			double time = marker["time"];
++			_marker_insert(time, marker_names, MarkerKey(time, marker_name));
++			marker_times.insert(marker_name, time);
++			Color color = Color(1, 1, 1);
++			if (marker.has("color")) {
++				color = marker["color"];
++			}
++			marker_colors.insert(marker_name, color);
++		}
++
+ 		return true;
+ 	} else if (prop_name.begins_with("tracks/")) {
+ 		int track = prop_name.get_slicec('/', 1).to_int();
+@@ -470,6 +487,18 @@ bool Animation::_get(const StringName &p_name, Variant &r_ret) const {
+ 
+ 		r_ret = comp;
+ 		return true;
++	} else if (prop_name == SNAME("markers")) {
++		Array markers;
++
++		for (HashMap<StringName, double>::ConstIterator E = marker_times.begin(); E; ++E) {
++			Dictionary d;
++			d["name"] = E->key;
++			d["time"] = E->value;
++			d["color"] = marker_colors[E->key];
++			markers.push_back(d);
++		}
++
++		r_ret = markers;
+ 	} else if (prop_name == "length") {
+ 		r_ret = length;
+ 	} else if (prop_name == "loop_mode") {
+@@ -839,6 +868,7 @@ void Animation::_get_property_list(List<PropertyInfo> *p_list) const {
+ 	if (compression.enabled) {
+ 		p_list->push_back(PropertyInfo(Variant::DICTIONARY, "_compression", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NO_EDITOR | PROPERTY_USAGE_INTERNAL));
+ 	}
++	p_list->push_back(PropertyInfo(Variant::ARRAY, "markers", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NO_EDITOR | PROPERTY_USAGE_INTERNAL));
+ 	for (int i = 0; i < tracks.size(); i++) {
+ 		p_list->push_back(PropertyInfo(Variant::STRING, "tracks/" + itos(i) + "/type", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NO_EDITOR | PROPERTY_USAGE_INTERNAL));
+ 		p_list->push_back(PropertyInfo(Variant::BOOL, "tracks/" + itos(i) + "/imported", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NO_EDITOR | PROPERTY_USAGE_INTERNAL));
+@@ -1087,6 +1117,27 @@ int Animation::_insert(double p_time, T &p_keys, const V &p_value) {
+ 	return -1;
+ }
+ 
++int Animation::_marker_insert(double p_time, Vector<MarkerKey> &p_keys, const MarkerKey &p_value) {
++	int idx = p_keys.size();
++
++	while (true) {
++		// Condition for replacement.
++		if (idx > 0 && Math::is_equal_approx((double)p_keys[idx - 1].time, p_time)) {
++			p_keys.write[idx - 1] = p_value;
++			return idx - 1;
++
++			// Condition for insert.
++		} else if (idx == 0 || p_keys[idx - 1].time < p_time) {
++			p_keys.insert(idx, p_value);
++			return idx;
++		}
++
++		idx--;
++	}
++
++	return -1;
++}
++
+ template <typename T>
+ void Animation::_clear(T &p_keys) {
+ 	p_keys.clear();
+@@ -3163,6 +3214,90 @@ void Animation::track_get_key_indices_in_range(int p_track, double p_time, doubl
+ 	}
+ }
+ 
++void Animation::add_marker(const StringName &p_name, double p_time) {
++	int idx = _find(marker_names, p_time);
++
++	if (idx >= 0 && idx < marker_names.size() && Math::is_equal_approx(p_time, marker_names[idx].time)) {
++		marker_times.erase(marker_names[idx].name);
++		marker_colors.erase(marker_names[idx].name);
++		marker_names.write[idx].name = p_name;
++		marker_times.insert(p_name, p_time);
++		marker_colors.insert(p_name, Color(1, 1, 1));
++	} else {
++		_marker_insert(p_time, marker_names, MarkerKey(p_time, p_name));
++		marker_times.insert(p_name, p_time);
++		marker_colors.insert(p_name, Color(1, 1, 1));
++	}
++}
++
++void Animation::remove_marker(const StringName &p_name) {
++	HashMap<StringName, double>::Iterator E = marker_times.find(p_name);
++	ERR_FAIL_COND(!E);
++	int idx = _find(marker_names, E->value);
++	bool success = idx >= 0 && idx < marker_names.size() && Math::is_equal_approx(marker_names[idx].time, E->value);
++	ERR_FAIL_COND(!success);
++	marker_names.remove_at(idx);
++	marker_times.remove(E);
++	marker_colors.erase(p_name);
++}
++
++bool Animation::has_marker(const StringName &p_name) const {
++	return marker_times.has(p_name);
++}
++
++StringName Animation::get_marker_at_time(double p_time) const {
++	int idx = _find(marker_names, p_time);
++
++	if (idx >= 0 && idx < marker_names.size() && Math::is_equal_approx(marker_names[idx].time, p_time)) {
++		return marker_names[idx].name;
++	}
++
++	return StringName();
++}
++
++StringName Animation::get_next_marker(double p_time) const {
++	int idx = _find(marker_names, p_time);
++
++	if (idx >= -1 && idx < marker_names.size() - 1) {
++		// _find ensures that the time at idx is always the closest time to p_time that is also smaller to it.
++		// So we add 1 to get the next marker.
++		return marker_names[idx + 1].name;
++	}
++	return StringName();
++}
++
++StringName Animation::get_prev_marker(double p_time) const {
++	int idx = _find(marker_names, p_time);
++
++	if (idx >= 0 && idx < marker_names.size()) {
++		return marker_names[idx].name;
++	}
++	return StringName();
++}
++
++double Animation::get_marker_time(const StringName &p_name) const {
++	ERR_FAIL_COND_V(!marker_times.has(p_name), -1);
++	return marker_times.get(p_name);
++}
++
++PackedStringArray Animation::get_marker_names() const {
++	PackedStringArray names;
++	// We iterate on marker_names so the result is sorted by time.
++	for (const MarkerKey &marker_name : marker_names) {
++		names.push_back(marker_name.name);
++	}
++	return names;
++}
++
++Color Animation::get_marker_color(const StringName &p_name) const {
++	ERR_FAIL_COND_V(!marker_colors.has(p_name), Color());
++	return marker_colors[p_name];
++}
++
++void Animation::set_marker_color(const StringName &p_name, const Color &p_color) {
++	marker_colors[p_name] = p_color;
++}
++
+ Vector<Variant> Animation::method_track_get_params(int p_track, int p_key_idx) const {
+ 	ERR_FAIL_INDEX_V(p_track, tracks.size(), Vector<Variant>());
+ 	Track *t = tracks[p_track];
+@@ -3894,6 +4029,17 @@ void Animation::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("animation_track_set_key_animation", "track_idx", "key_idx", "animation"), &Animation::animation_track_set_key_animation);
+ 	ClassDB::bind_method(D_METHOD("animation_track_get_key_animation", "track_idx", "key_idx"), &Animation::animation_track_get_key_animation);
+ 
++	ClassDB::bind_method(D_METHOD("add_marker", "name", "time"), &Animation::add_marker);
++	ClassDB::bind_method(D_METHOD("remove_marker", "name"), &Animation::remove_marker);
++	ClassDB::bind_method(D_METHOD("has_marker", "name"), &Animation::has_marker);
++	ClassDB::bind_method(D_METHOD("get_marker_at_time", "time"), &Animation::get_marker_at_time);
++	ClassDB::bind_method(D_METHOD("get_next_marker", "time"), &Animation::get_next_marker);
++	ClassDB::bind_method(D_METHOD("get_prev_marker", "time"), &Animation::get_prev_marker);
++	ClassDB::bind_method(D_METHOD("get_marker_time", "name"), &Animation::get_marker_time);
++	ClassDB::bind_method(D_METHOD("get_marker_names"), &Animation::get_marker_names);
++	ClassDB::bind_method(D_METHOD("get_marker_color", "name"), &Animation::get_marker_color);
++	ClassDB::bind_method(D_METHOD("set_marker_color", "name", "color"), &Animation::set_marker_color);
++
+ 	ClassDB::bind_method(D_METHOD("set_length", "time_sec"), &Animation::set_length);
+ 	ClassDB::bind_method(D_METHOD("get_length"), &Animation::get_length);
+ 
+diff --git a/scene/resources/animation.h b/scene/resources/animation.h
+index 0c29790ea4..618dc9ca17 100644
+--- a/scene/resources/animation.h
++++ b/scene/resources/animation.h
+@@ -237,6 +237,20 @@ private:
+ 		}
+ 	};
+ 
++	/* Marker */
++
++	struct MarkerKey {
++		double time;
++		StringName name;
++		MarkerKey(double p_time, const StringName &p_name) :
++				time(p_time), name(p_name) {}
++		MarkerKey() = default;
++	};
++
++	Vector<MarkerKey> marker_names; // time -> name
++	HashMap<StringName, double> marker_times; // name -> time
++	HashMap<StringName, Color> marker_colors; // name -> color
++
+ 	Vector<Track *> tracks;
+ 
+ 	template <typename T>
+@@ -245,6 +259,8 @@ private:
+ 	template <typename T, typename V>
+ 	int _insert(double p_time, T &p_keys, const V &p_value);
+ 
++	int _marker_insert(double p_time, Vector<MarkerKey> &p_keys, const MarkerKey &p_value);
++
+ 	template <typename K>
+ 
+ 	inline int _find(const Vector<K> &p_keys, double p_time, bool p_backward = false, bool p_limit = false) const;
+@@ -501,6 +517,17 @@ public:
+ 
+ 	void track_get_key_indices_in_range(int p_track, double p_time, double p_delta, List<int> *p_indices, Animation::LoopedFlag p_looped_flag = Animation::LOOPED_FLAG_NONE) const;
+ 
++	void add_marker(const StringName &p_name, double p_time);
++	void remove_marker(const StringName &p_name);
++	bool has_marker(const StringName &p_name) const;
++	StringName get_marker_at_time(double p_time) const;
++	StringName get_next_marker(double p_time) const;
++	StringName get_prev_marker(double p_time) const;
++	double get_marker_time(const StringName &p_time) const;
++	PackedStringArray get_marker_names() const;
++	Color get_marker_color(const StringName &p_name) const;
++	void set_marker_color(const StringName &p_name, const Color &p_color);
++
+ 	void set_length(real_t p_length);
+ 	real_t get_length() const;
+ 

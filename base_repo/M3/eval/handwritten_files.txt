@@ -1,0 +1,9 @@
+docs/features/compress-dense.md
+docs/features/compress-tensor.md
+mindspeed/core/memory/compress/adaptor.py
+mindspeed/core/memory/compress/compress_activation.py
+mindspeed/core/memory/compress/compress_optimizer.py
+mindspeed/core/memory/compress/utils.py
+mindspeed/features_manager/__init__.py
+mindspeed/features_manager/compress/__init__.py
+mindspeed/features_manager/compress/compress.py

@@ -1,0 +1,6 @@
+docs/features/reset-bucket-group-order.md
+mindspeed/core/distributed/reset_bucket_group_order_feature/__init__.py
+mindspeed/core/distributed/reset_bucket_group_order_feature/distributed_data_parallel.py
+mindspeed/core/distributed/reset_bucket_group_order_feature/distributed_data_parallel_config.py
+mindspeed/features_manager/__init__.py
+mindspeed/features_manager/distributed/reset_bucket_group_order_feature.py

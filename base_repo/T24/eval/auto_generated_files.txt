@@ -1,0 +1,4 @@
+Include/internal/pycore_opcode.h
+Include/opcode.h
+Python/generated_cases.c.h
+Python/opcode_metadata.h

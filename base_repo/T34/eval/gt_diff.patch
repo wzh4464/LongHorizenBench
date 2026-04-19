@@ -1,0 +1,3977 @@
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index b90041f9fb2..999746ea933 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -673,6 +673,12 @@ const (
+ 	// resume work after restarts.
+ 	NominatedNodeNameForExpectation featuregate.Feature = "NominatedNodeNameForExpectation"
+ 
++	// owner: @bwsalmon
++	// kep: https://kep.k8s.io/5598
++	//
++	// Enables opportunistic batching in the scheduler.
++	OpportunisticBatching featuregate.Feature = "OpportunisticBatching"
++
+ 	// owner: @cici37
+ 	// kep: https://kep.k8s.io/5080
+ 	//
+@@ -1579,6 +1585,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
+ 		{Version: version.MustParse("1.35"), Default: true, PreRelease: featuregate.Beta},
+ 	},
+ 
++	OpportunisticBatching: {
++		{Version: version.MustParse("1.35"), Default: true, PreRelease: featuregate.Beta},
++	},
++
+ 	OrderedNamespaceDeletion: {
+ 		{Version: version.MustParse("1.30"), Default: false, PreRelease: featuregate.Beta},
+ 		{Version: version.MustParse("1.33"), Default: true, PreRelease: featuregate.Beta},
+@@ -2344,6 +2354,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
+ 
+ 	NominatedNodeNameForExpectation: {},
+ 
++	OpportunisticBatching: {},
++
+ 	OrderedNamespaceDeletion: {},
+ 
+ 	PodAndContainerStatsFromCRI: {},
+diff --git a/pkg/scheduler/framework/interface.go b/pkg/scheduler/framework/interface.go
+index 6f57513b431..bca3dfab900 100644
+--- a/pkg/scheduler/framework/interface.go
++++ b/pkg/scheduler/framework/interface.go
+@@ -153,6 +153,12 @@ func NewPodsToActivate() *PodsToActivate {
+ 	return &PodsToActivate{Map: make(map[string]*v1.Pod)}
+ }
+ 
++// SortedScoredNodes is a list of scored nodes, returned from scheduling.
++type SortedScoredNodes interface {
++	Pop() string
++	Len() int
++}
++
+ // Framework manages the set of plugins in use by the scheduling framework.
+ // Configured plugins are called at specified points in a scheduling context.
+ type Framework interface {
+@@ -167,6 +173,13 @@ type Framework interface {
+ 	// QueueSortFunc returns the function to sort pods in scheduling queue
+ 	QueueSortFunc() fwk.LessFunc
+ 
++	// Create a scheduling signature for a given pod, if possible. Two pods with the same signature
++	// should get the same feasibility and scores for any given set of nodes even after one of them gets assigned. If some plugins
++	// are unable to create a signature, the pod may be "unsignable" which disables results caching
++	// and gang scheduling optimizations.
++	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5598-opportunistic-batching
++	SignPod(ctx context.Context, pod *v1.Pod, recordPluginStats bool) fwk.PodSignature
++
+ 	// RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
+ 	// *fwk.Status and its code is set to non-success if any of the plugins returns
+ 	// anything but Success. If a non-success status is returned, then the scheduling
+@@ -184,6 +197,15 @@ type Framework interface {
+ 	// cluster state to make the pod potentially schedulable in a future scheduling cycle.
+ 	RunPostFilterPlugins(ctx context.Context, state fwk.CycleState, pod *v1.Pod, filteredNodeStatusMap fwk.NodeToStatusReader) (*fwk.PostFilterResult, *fwk.Status)
+ 
++	// Get a "node hint" for a given pod. A node hint is the name of a node provided by the batching code when information
++	// from the previous scheduling cycle can be reused for this cycle.
++	// If the batching code cannot provide a hint, the function returns "".
++	// See git.k8s.io/enhancements/keps/sig-scheduling/5598-opportunistic-batching
++	GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, cycleCount int64) (hint string, signature fwk.PodSignature)
++
++	// StoreScheduleResults stores the results after we have sorted and filtered nodes.
++	StoreScheduleResults(ctx context.Context, signature fwk.PodSignature, hintedNode, chosenNode string, otherNodes SortedScoredNodes, cycleCount int64)
++
+ 	// RunPreBindPlugins runs the set of configured PreBind plugins. It returns
+ 	// *fwk.Status and its code is set to non-success if any of the plugins returns
+ 	// anything but Success. If the Status code is "Unschedulable", it is
+@@ -241,9 +263,6 @@ type Framework interface {
+ 	// ListPlugins returns a map of extension point name to list of configured Plugins.
+ 	ListPlugins() *config.Plugins
+ 
+-	// ProfileName returns the profile name associated to a profile.
+-	ProfileName() string
+-
+ 	// PercentageOfNodesToScore returns percentageOfNodesToScore associated to a profile.
+ 	PercentageOfNodesToScore() *int32
+ 
+diff --git a/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go b/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go
+index b928ec846d9..b92a3e7b057 100644
+--- a/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go
++++ b/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go
+@@ -189,12 +189,23 @@ var _ fwk.ScorePlugin = &DynamicResources{}
+ var _ fwk.ReservePlugin = &DynamicResources{}
+ var _ fwk.EnqueueExtensions = &DynamicResources{}
+ var _ fwk.PreBindPlugin = &DynamicResources{}
++var _ fwk.SignPlugin = &DynamicResources{}
+ 
+ // Name returns name of the plugin. It is used in logs, etc.
+ func (pl *DynamicResources) Name() string {
+ 	return Name
+ }
+ 
++// Because it isn't simple to determine if DRA claims are single host or more complex,
++// we exclude any pod with a DRA claim from signatures. We should improve this.
++// See https://github.com/kubernetes/kubernetes/issues/134986
++func (pl *DynamicResources) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	if len(pod.Spec.ResourceClaims) > 0 {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with dra resource claims are not signable")
++	}
++	return nil, nil
++}
++
+ // EventsToRegister returns the possible events that may make a Pod
+ // failed by this plugin schedulable.
+ func (pl *DynamicResources) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+diff --git a/pkg/scheduler/framework/plugins/imagelocality/image_locality.go b/pkg/scheduler/framework/plugins/imagelocality/image_locality.go
+index c8d8d56a98e..f23d9d9e7e0 100644
+--- a/pkg/scheduler/framework/plugins/imagelocality/image_locality.go
++++ b/pkg/scheduler/framework/plugins/imagelocality/image_locality.go
+@@ -22,6 +22,7 @@ import (
+ 
+ 	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	fwk "k8s.io/kube-scheduler/framework"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+ )
+@@ -40,6 +41,7 @@ type ImageLocality struct {
+ }
+ 
+ var _ fwk.ScorePlugin = &ImageLocality{}
++var _ fwk.SignPlugin = &ImageLocality{}
+ 
+ // Name is the name of the plugin used in the plugin registry and configurations.
+ const Name = names.ImageLocality
+@@ -49,6 +51,21 @@ func (pl *ImageLocality) Name() string {
+ 	return Name
+ }
+ 
++// Filtering and scoring based on container image names.
++func (pl *ImageLocality) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	nameSet := sets.New[string]()
++
++	containers := []v1.Container{}
++	containers = append(containers, pod.Spec.Containers...)
++	containers = append(containers, pod.Spec.InitContainers...)
++
++	for _, container := range containers {
++		nameSet.Insert(normalizedImageName(container.Image))
++	}
++	names := sets.List(nameSet)
++	return []fwk.SignFragment{{Key: fwk.ImageNamesSignerName, Value: names}}, nil
++}
++
+ // Score invoked at the score extension point.
+ func (pl *ImageLocality) Score(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
+ 	nodeInfos, err := pl.handle.SnapshotSharedLister().NodeInfos().List()
+diff --git a/pkg/scheduler/framework/plugins/imagelocality/image_locality_test.go b/pkg/scheduler/framework/plugins/imagelocality/image_locality_test.go
+index bf9c00ac792..27c37be8b3a 100644
+--- a/pkg/scheduler/framework/plugins/imagelocality/image_locality_test.go
++++ b/pkg/scheduler/framework/plugins/imagelocality/image_locality_test.go
+@@ -396,6 +396,82 @@ func TestImageLocalityPriority(t *testing.T) {
+ 	}
+ }
+ 
++func TestImageSignature(t *testing.T) {
++	tests := []struct {
++		name              string
++		pod               *v1.Pod
++		expectedSignature []fwk.SignFragment
++	}{
++		{
++			name: "no images",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{},
++				},
++			},
++			expectedSignature: []fwk.SignFragment{
++				{
++					Key:   fwk.ImageNamesSignerName,
++					Value: []string{},
++				},
++			},
++		},
++		{
++			name: "one image",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{{Name: "c", Image: "myimage"}},
++				},
++			},
++			expectedSignature: []fwk.SignFragment{
++				{
++					Key:   fwk.ImageNamesSignerName,
++					Value: []string{"myimage:latest"},
++				},
++			},
++		},
++		{
++			name: "two images unsorted",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{
++						{Name: "c", Image: "zmyimage"},
++						{Name: "c2", Image: "myimage"},
++					},
++				},
++			},
++			expectedSignature: []fwk.SignFragment{
++				{
++					Key:   fwk.ImageNamesSignerName,
++					Value: []string{"myimage:latest", "zmyimage:latest"},
++				},
++			},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			_, ctx := ktesting.NewTestContext(t)
++			ctx, cancel := context.WithCancel(ctx)
++			defer cancel()
++
++			snapshot := cache.NewSnapshot(nil, nil)
++			fh, _ := runtime.NewFramework(ctx, nil, nil, runtime.WithSnapshotSharedLister(snapshot))
++
++			p, err := New(ctx, nil, fh)
++			if err != nil {
++				t.Fatalf("creating plugin: %v", err)
++			}
++			signature, _ := p.(*ImageLocality).SignPod(ctx, test.pod)
++
++			if diff := cmp.Diff(test.expectedSignature, signature); diff != "" {
++				t.Fatalf("Diff %s", diff)
++			}
++		})
++	}
++
++}
++
+ func TestNormalizedImageName(t *testing.T) {
+ 	for _, testCase := range []struct {
+ 		Name   string
+diff --git a/pkg/scheduler/framework/plugins/interpodaffinity/plugin.go b/pkg/scheduler/framework/plugins/interpodaffinity/plugin.go
+index a0f833b0ca0..e5d8463c724 100644
+--- a/pkg/scheduler/framework/plugins/interpodaffinity/plugin.go
++++ b/pkg/scheduler/framework/plugins/interpodaffinity/plugin.go
+@@ -41,6 +41,7 @@ var _ fwk.FilterPlugin = &InterPodAffinity{}
+ var _ fwk.PreScorePlugin = &InterPodAffinity{}
+ var _ fwk.ScorePlugin = &InterPodAffinity{}
+ var _ fwk.EnqueueExtensions = &InterPodAffinity{}
++var _ fwk.SignPlugin = &InterPodAffinity{}
+ 
+ // InterPodAffinity is a plugin that checks inter pod affinity
+ type InterPodAffinity struct {
+@@ -56,6 +57,27 @@ func (pl *InterPodAffinity) Name() string {
+ 	return Name
+ }
+ 
++// Inter pod affinity make feasibility and scoring dependent on the placement of other
++// pods in addition the current pod and node, so we cannot sign pods with these
++// constraints.
++func (pl *InterPodAffinity) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	if pod.Spec.Affinity != nil && (pod.Spec.Affinity.PodAffinity != nil || pod.Spec.Affinity.PodAntiAffinity != nil) {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with InterPodAffinity are not signable")
++	}
++
++	// If this option is set then we only consider affinity between pods that have affinity configured,
++	// so we can ignore the pods labels if it doesn't have rules set.
++	// Otherwise we need to include the pod's labels to ensure we catch affinity between the pod
++	// and other pods which may have affinity rules set.
++	if pl.args.IgnorePreferredTermsOfExistingPods {
++		return nil, nil
++	}
++
++	return []fwk.SignFragment{
++		{Key: fwk.LabelsSignerName, Value: pod.Labels},
++	}, nil
++}
++
+ // EventsToRegister returns the possible events that may make a failed Pod
+ // schedulable
+ func (pl *InterPodAffinity) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+diff --git a/pkg/scheduler/framework/plugins/interpodaffinity/plugin_test.go b/pkg/scheduler/framework/plugins/interpodaffinity/plugin_test.go
+index 9c6fbc8455e..7e7753a4b92 100644
+--- a/pkg/scheduler/framework/plugins/interpodaffinity/plugin_test.go
++++ b/pkg/scheduler/framework/plugins/interpodaffinity/plugin_test.go
+@@ -259,3 +259,82 @@ func Test_isSchedulableAfterNodeChange(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestPodAffinitySignature(t *testing.T) {
++	tests := []struct {
++		name              string
++		pod               *v1.Pod
++		expectedSignature []fwk.SignFragment
++		schedulable       bool
++		config            config.InterPodAffinityArgs
++	}{
++		{
++			name: "no affinity, default settings",
++			pod: &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Labels: map[string]string{"foo": "bar"},
++				},
++				Spec: v1.PodSpec{},
++			},
++			expectedSignature: []fwk.SignFragment{
++				{
++					Key:   fwk.LabelsSignerName,
++					Value: map[string]string{"foo": "bar"},
++				},
++			},
++			schedulable: true,
++		},
++		{
++			name: "no affinity, ignore setting set",
++			pod: &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Labels: map[string]string{"foo": "bar"},
++				},
++				Spec: v1.PodSpec{},
++			},
++			schedulable: true,
++			config: config.InterPodAffinityArgs{
++				IgnorePreferredTermsOfExistingPods: true,
++			},
++		},
++		{
++			name: "affinity set",
++			pod: &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Labels: map[string]string{"foo": "bar"},
++				},
++				Spec: v1.PodSpec{
++					Affinity: &v1.Affinity{
++						PodAffinity: &v1.PodAffinity{
++							RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{
++								{},
++							},
++						},
++					},
++				},
++			},
++			schedulable: false,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			_, ctx := ktesting.NewTestContext(t)
++			ctx, cancel := context.WithCancel(ctx)
++			defer cancel()
++
++			snapshot := cache.NewSnapshot(nil, nil)
++			pl := plugintesting.SetupPluginWithInformers(ctx, t, schedruntime.FactoryAdapter(feature.Features{}, New), &test.config, snapshot, namespaces)
++			p := pl.(*InterPodAffinity)
++			signature, status := p.SignPod(ctx, test.pod)
++
++			if !status.IsSuccess() && test.schedulable {
++				t.Fatalf("Expected success, got %v", status)
++			}
++
++			if diff := cmp.Diff(test.expectedSignature, signature); diff != "" {
++				t.Fatalf("Diff %s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go b/pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go
+index 72dfb2cbcbd..83cbff01793 100644
+--- a/pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go
++++ b/pkg/scheduler/framework/plugins/nodeaffinity/node_affinity.go
+@@ -48,6 +48,7 @@ var _ fwk.FilterPlugin = &NodeAffinity{}
+ var _ fwk.PreScorePlugin = &NodeAffinity{}
+ var _ fwk.ScorePlugin = &NodeAffinity{}
+ var _ fwk.EnqueueExtensions = &NodeAffinity{}
++var _ fwk.SignPlugin = &NodeAffinity{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -74,6 +75,18 @@ func (pl *NodeAffinity) Name() string {
+ 	return Name
+ }
+ 
++// Node affinity filtering and scoring depend on NodeAffinity and NodeSelectors.
++func (pl *NodeAffinity) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	aff, err := fwk.NodeAffinitySigner(pod)
++	if err != nil {
++		return nil, fwk.AsStatus(err)
++	}
++	return []fwk.SignFragment{
++		{Key: fwk.NodeAffinitySignerName, Value: aff},
++		{Key: fwk.NodeSelectorSignerName, Value: pod.Spec.NodeSelector},
++	}, nil
++}
++
+ type preFilterState struct {
+ 	requiredNodeSelectorAndAffinity nodeaffinity.RequiredNodeAffinity
+ }
+diff --git a/pkg/scheduler/framework/plugins/nodedeclaredfeatures/nodedeclaredfeatures.go b/pkg/scheduler/framework/plugins/nodedeclaredfeatures/nodedeclaredfeatures.go
+index 942675b7ed8..330f8ed7a35 100644
+--- a/pkg/scheduler/framework/plugins/nodedeclaredfeatures/nodedeclaredfeatures.go
++++ b/pkg/scheduler/framework/plugins/nodedeclaredfeatures/nodedeclaredfeatures.go
+@@ -24,6 +24,7 @@ import (
+ 
+ 	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/util/sets"
+ 	versionutil "k8s.io/apimachinery/pkg/util/version"
+ 	"k8s.io/component-base/version"
+ 	ndf "k8s.io/component-helpers/nodedeclaredfeatures"
+@@ -62,6 +63,7 @@ type NodeDeclaredFeatures struct {
+ var _ fwk.PreFilterPlugin = &NodeDeclaredFeatures{}
+ var _ fwk.FilterPlugin = &NodeDeclaredFeatures{}
+ var _ fwk.EnqueueExtensions = &NodeDeclaredFeatures{}
++var _ fwk.SignPlugin = &NodeDeclaredFeatures{}
+ 
+ // Name returns name of the plugin. It is used in logs, etc.
+ func (pl *NodeDeclaredFeatures) Name() string {
+@@ -100,7 +102,7 @@ func (pl *NodeDeclaredFeatures) PreFilter(ctx context.Context, cycleState fwk.Cy
+ 		return nil, fwk.NewStatus(fwk.Skip)
+ 	}
+ 	cycleState.Write(preFilterStateKey, &preFilterState{reqs: reqs})
+-	return nil, fwk.NewStatus(fwk.Success)
++	return nil, nil
+ }
+ 
+ // PreFilterExtensions returns pre-filter extensions, pod add and remove.
+@@ -127,6 +129,18 @@ func (pl *NodeDeclaredFeatures) Filter(ctx context.Context, cycleState fwk.Cycle
+ 	return nil
+ }
+ 
++func (pl *NodeDeclaredFeatures) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	podInfo := &ndf.PodInfo{Spec: &pod.Spec}
++	fs, err := pl.ndfFramework.InferForPodScheduling(podInfo, pl.version)
++	if err != nil {
++		return nil, fwk.AsStatus(err)
++	}
++	featuresList := sets.List(fs.Set)
++	return []fwk.SignFragment{
++		{Key: fwk.FeaturesSignerName, Value: featuresList},
++	}, nil
++}
++
+ // EventsToRegister returns events that may make a pod schedulable. It is required for the EnqueueExtensions interface.
+ func (pl *NodeDeclaredFeatures) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+ 	if !pl.enabled {
+diff --git a/pkg/scheduler/framework/plugins/nodename/node_name.go b/pkg/scheduler/framework/plugins/nodename/node_name.go
+index 7edb1094669..84d73a0598e 100644
+--- a/pkg/scheduler/framework/plugins/nodename/node_name.go
++++ b/pkg/scheduler/framework/plugins/nodename/node_name.go
+@@ -33,6 +33,7 @@ type NodeName struct {
+ 
+ var _ fwk.FilterPlugin = &NodeName{}
+ var _ fwk.EnqueueExtensions = &NodeName{}
++var _ fwk.SignPlugin = &NodeName{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -67,6 +68,13 @@ func (pl *NodeName) Name() string {
+ 	return Name
+ }
+ 
++// NodeName scoring and feasibility are dependent on the NodeName field.
++func (pl *NodeName) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.NodeNameSignerName, Value: pod.Spec.NodeName},
++	}, nil
++}
++
+ // Filter invoked at the filter extension point.
+ func (pl *NodeName) Filter(ctx context.Context, _ fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
+ 
+diff --git a/pkg/scheduler/framework/plugins/nodeports/node_ports.go b/pkg/scheduler/framework/plugins/nodeports/node_ports.go
+index 40bdaf7d613..6e3793fdcc9 100644
+--- a/pkg/scheduler/framework/plugins/nodeports/node_ports.go
++++ b/pkg/scheduler/framework/plugins/nodeports/node_ports.go
+@@ -37,6 +37,7 @@ type NodePorts struct {
+ var _ fwk.PreFilterPlugin = &NodePorts{}
+ var _ fwk.FilterPlugin = &NodePorts{}
+ var _ fwk.EnqueueExtensions = &NodePorts{}
++var _ fwk.SignPlugin = &NodePorts{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -63,6 +64,13 @@ func (pl *NodePorts) Name() string {
+ 	return Name
+ }
+ 
++// NodePort feasibility and scheduling is based on the host ports for the containers.
++func (pl *NodePorts) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.HostPortsSignerName, Value: fwk.HostPortsSigner(pod)},
++	}, nil
++}
++
+ // PreFilter invoked at the prefilter extension point.
+ func (pl *NodePorts) PreFilter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
+ 	s := util.GetHostPorts(pod)
+diff --git a/pkg/scheduler/framework/plugins/noderesources/balanced_allocation.go b/pkg/scheduler/framework/plugins/noderesources/balanced_allocation.go
+index 07fbc01e6d6..035c77b3348 100644
+--- a/pkg/scheduler/framework/plugins/noderesources/balanced_allocation.go
++++ b/pkg/scheduler/framework/plugins/noderesources/balanced_allocation.go
+@@ -41,6 +41,7 @@ type BalancedAllocation struct {
+ 
+ var _ fwk.PreScorePlugin = &BalancedAllocation{}
+ var _ fwk.ScorePlugin = &BalancedAllocation{}
++var _ fwk.SignPlugin = &BalancedAllocation{}
+ 
+ // BalancedAllocationName is the name of the plugin used in the plugin registry and configurations.
+ const (
+@@ -116,6 +117,22 @@ func (ba *BalancedAllocation) Name() string {
+ 	return BalancedAllocationName
+ }
+ 
++// Filtering and scoring based on the container resources and overheads.
++func (pl *BalancedAllocation) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	opts := ResourceRequestsOptions{
++		EnablePodLevelResources:   pl.enablePodLevelResources,
++		EnableDRAExtendedResource: pl.enableDRAExtendedResource,
++	}
++
++	if pl.enableDRAExtendedResource {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "signature disabled when dra extended resources enabled")
++	}
++
++	return []fwk.SignFragment{
++		{Key: fwk.ResourcesSignerName, Value: computePodResourceRequest(pod, opts)},
++	}, nil
++}
++
+ // Score invoked at the score extension point.
+ func (ba *BalancedAllocation) Score(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
+ 	s, err := getBalancedAllocationPreScoreState(state)
+diff --git a/pkg/scheduler/framework/plugins/noderesources/fit.go b/pkg/scheduler/framework/plugins/noderesources/fit.go
+index 2fc3eb19227..a423986d5c4 100644
+--- a/pkg/scheduler/framework/plugins/noderesources/fit.go
++++ b/pkg/scheduler/framework/plugins/noderesources/fit.go
+@@ -46,6 +46,7 @@ var _ fwk.FilterPlugin = &Fit{}
+ var _ fwk.EnqueueExtensions = &Fit{}
+ var _ fwk.PreScorePlugin = &Fit{}
+ var _ fwk.ScorePlugin = &Fit{}
++var _ fwk.SignPlugin = &Fit{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -169,6 +170,20 @@ func (f *Fit) Name() string {
+ 	return Name
+ }
+ 
++// Filtering and scoring based on the container resources and overheads.
++func (pl *Fit) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	opts := ResourceRequestsOptions{
++		EnablePodLevelResources:   pl.enablePodLevelResources,
++		EnableDRAExtendedResource: pl.enableDRAExtendedResource,
++	}
++	if pl.enableDRAExtendedResource {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "signature disabled when dra extended resources enabled")
++	}
++	return []fwk.SignFragment{
++		{Key: fwk.ResourcesSignerName, Value: computePodResourceRequest(pod, opts)},
++	}, nil
++}
++
+ // NewFit initializes a new plugin and returns it.
+ func NewFit(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.Features) (fwk.Plugin, error) {
+ 	args, ok := plArgs.(*config.NodeResourcesFitArgs)
+diff --git a/pkg/scheduler/framework/plugins/nodeunschedulable/node_unschedulable.go b/pkg/scheduler/framework/plugins/nodeunschedulable/node_unschedulable.go
+index 741d6cfeb58..345cc73aff1 100644
+--- a/pkg/scheduler/framework/plugins/nodeunschedulable/node_unschedulable.go
++++ b/pkg/scheduler/framework/plugins/nodeunschedulable/node_unschedulable.go
+@@ -39,6 +39,7 @@ type NodeUnschedulable struct {
+ 
+ var _ fwk.FilterPlugin = &NodeUnschedulable{}
+ var _ fwk.EnqueueExtensions = &NodeUnschedulable{}
++var _ fwk.SignPlugin = &NodeUnschedulable{}
+ 
+ // Name is the name of the plugin used in the plugin registry and configurations.
+ const Name = names.NodeUnschedulable
+@@ -130,6 +131,13 @@ func (pl *NodeUnschedulable) Name() string {
+ 	return Name
+ }
+ 
++// Feasibility and scoring based on the pod's tolerations.
++func (pl *NodeUnschedulable) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.TolerationsSignerName, Value: fwk.TolerationsSigner(pod)},
++	}, nil
++}
++
+ // Filter invoked at the filter extension point.
+ func (pl *NodeUnschedulable) Filter(ctx context.Context, _ fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
+ 	node := nodeInfo.Node()
+diff --git a/pkg/scheduler/framework/plugins/nodevolumelimits/csi.go b/pkg/scheduler/framework/plugins/nodevolumelimits/csi.go
+index ecedfcc1db2..07be0e040b7 100644
+--- a/pkg/scheduler/framework/plugins/nodevolumelimits/csi.go
++++ b/pkg/scheduler/framework/plugins/nodevolumelimits/csi.go
+@@ -73,6 +73,7 @@ type CSILimits struct {
+ var _ fwk.PreFilterPlugin = &CSILimits{}
+ var _ fwk.FilterPlugin = &CSILimits{}
+ var _ fwk.EnqueueExtensions = &CSILimits{}
++var _ fwk.SignPlugin = &CSILimits{}
+ 
+ // CSIName is the name of the plugin used in the plugin registry and configurations.
+ const CSIName = names.NodeVolumeLimits
+@@ -658,3 +659,10 @@ func (pl *CSILimits) getNodeVolumeAttachmentInfo(logger klog.Logger, nodeName st
+ func getVolumeUniqueName(driverName, volumeHandle string) string {
+ 	return fmt.Sprintf("%s/%s", driverName, volumeHandle)
+ }
++
++// Feasibility and scoring based on the non-synthetic volume sources.
++func (pl *CSILimits) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.VolumesSignerName, Value: fwk.VolumesSigner(pod)},
++	}, nil
++}
+diff --git a/pkg/scheduler/framework/plugins/podtopologyspread/filtering_test.go b/pkg/scheduler/framework/plugins/podtopologyspread/filtering_test.go
+index 25586b20fc7..03fe66078f3 100644
+--- a/pkg/scheduler/framework/plugins/podtopologyspread/filtering_test.go
++++ b/pkg/scheduler/framework/plugins/podtopologyspread/filtering_test.go
+@@ -3457,3 +3457,78 @@ func mustNewPodInfo(t *testing.T, pod *v1.Pod) *framework.PodInfo {
+ 	}
+ 	return podInfo
+ }
++
++func TestPodTopoSignatures(t *testing.T) {
++	tests := []struct {
++		name              string
++		pod               *v1.Pod
++		expectedSignature []fwk.SignFragment
++		scheduleable      bool
++		config            config.PodTopologySpreadArgs
++	}{
++		{
++			name: "pod w constraints",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					TopologySpreadConstraints: []v1.TopologySpreadConstraint{
++						{
++							TopologyKey: "test",
++						},
++					},
++				},
++			},
++			config: config.PodTopologySpreadArgs{
++				DefaultingType: "System",
++			},
++			scheduleable: false,
++		},
++		{
++			name: "pod no constraints but default",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{},
++			},
++			config: config.PodTopologySpreadArgs{
++				DefaultingType: "System",
++			},
++			scheduleable: false,
++		},
++		{
++			name: "pod no constraints no default",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{},
++			},
++			config: config.PodTopologySpreadArgs{
++				DefaultingType:     "List",
++				DefaultConstraints: []v1.TopologySpreadConstraint{},
++			},
++			scheduleable: true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			_, ctx := ktesting.NewTestContext(t)
++			ctx, cancel := context.WithCancel(ctx)
++			defer cancel()
++
++			snapshot := cache.NewSnapshot(nil, nil)
++			state := framework.NewCycleState()
++			pl := plugintesting.SetupPluginWithInformers(ctx, t, frameworkruntime.FactoryAdapter(feature.Features{}, New), &test.config, snapshot, nil)
++			p := pl.(*PodTopologySpread)
++			_, status := p.PreFilter(ctx, state, test.pod, []fwk.NodeInfo{})
++			if status.Code() == fwk.Error {
++				t.Fatalf("Expected success, got error")
++			}
++
++			signature, status := p.SignPod(ctx, test.pod)
++
++			if !status.IsSuccess() && test.scheduleable {
++				t.Fatalf("Expected success, got %v", status)
++			}
++
++			if diff := cmp.Diff(test.expectedSignature, signature); diff != "" {
++				t.Fatalf("Diff %s", diff)
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/framework/plugins/podtopologyspread/plugin.go b/pkg/scheduler/framework/plugins/podtopologyspread/plugin.go
+index 5f1cdf70d32..18e7be733d5 100644
+--- a/pkg/scheduler/framework/plugins/podtopologyspread/plugin.go
++++ b/pkg/scheduler/framework/plugins/podtopologyspread/plugin.go
+@@ -77,6 +77,7 @@ var _ fwk.FilterPlugin = &PodTopologySpread{}
+ var _ fwk.PreScorePlugin = &PodTopologySpread{}
+ var _ fwk.ScorePlugin = &PodTopologySpread{}
+ var _ fwk.EnqueueExtensions = &PodTopologySpread{}
++var _ fwk.SignPlugin = &PodTopologySpread{}
+ 
+ // Name is the name of the plugin used in the plugin registry and configurations.
+ const Name = names.PodTopologySpread
+@@ -86,6 +87,21 @@ func (pl *PodTopologySpread) Name() string {
+ 	return Name
+ }
+ 
++// Pod topology spread is not localized to a pod and node, so we cannot
++// sign pods that have topology spread constraints, either explicit or
++// defaulted.
++func (pl *PodTopologySpread) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	if len(pod.Spec.TopologySpreadConstraints) > 0 {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with topology constraints are not signable")
++	}
++
++	if len(pl.defaultConstraints) > 0 {
++		return nil, fwk.NewStatus(fwk.Unschedulable, "pods with default topology constraints are not signable")
++	}
++
++	return nil, nil
++}
++
+ // New initializes a new plugin and returns it.
+ func New(_ context.Context, plArgs runtime.Object, h fwk.Handle, fts feature.Features) (fwk.Plugin, error) {
+ 	if h.SnapshotSharedLister() == nil {
+diff --git a/pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go b/pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go
+index 3d7a3e57195..8dfe2b172f3 100644
+--- a/pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go
++++ b/pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go
+@@ -42,6 +42,7 @@ var _ fwk.FilterPlugin = &TaintToleration{}
+ var _ fwk.PreScorePlugin = &TaintToleration{}
+ var _ fwk.ScorePlugin = &TaintToleration{}
+ var _ fwk.EnqueueExtensions = &TaintToleration{}
++var _ fwk.SignPlugin = &TaintToleration{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -57,6 +58,13 @@ func (pl *TaintToleration) Name() string {
+ 	return Name
+ }
+ 
++// Feasibility and scoring based on the pod's tolerations.
++func (pl *TaintToleration) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.TolerationsSignerName, Value: fwk.TolerationsSigner(pod)},
++	}, nil
++}
++
+ // EventsToRegister returns the possible events that may make a Pod
+ // failed by this plugin schedulable.
+ func (pl *TaintToleration) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+diff --git a/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go b/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go
+index 7031590aa47..0774ea78108 100644
+--- a/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go
++++ b/pkg/scheduler/framework/plugins/volumebinding/volume_binding.go
+@@ -85,6 +85,7 @@ var _ fwk.PreBindPlugin = &VolumeBinding{}
+ var _ fwk.PreScorePlugin = &VolumeBinding{}
+ var _ fwk.ScorePlugin = &VolumeBinding{}
+ var _ fwk.EnqueueExtensions = &VolumeBinding{}
++var _ fwk.SignPlugin = &VolumeBinding{}
+ 
+ // Name is the name of the plugin used in Registry and configurations.
+ const Name = names.VolumeBinding
+@@ -94,6 +95,13 @@ func (pl *VolumeBinding) Name() string {
+ 	return Name
+ }
+ 
++// Feasibility and scoring based on the non-synthetic volume sources.
++func (pl *VolumeBinding) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.VolumesSignerName, Value: fwk.VolumesSigner(pod)},
++	}, nil
++}
++
+ // EventsToRegister returns the possible events that may make a Pod
+ // failed by this plugin schedulable.
+ func (pl *VolumeBinding) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+diff --git a/pkg/scheduler/framework/plugins/volumebinding/volume_binding_test.go b/pkg/scheduler/framework/plugins/volumebinding/volume_binding_test.go
+index 3f0ad1530fb..13f29239190 100644
+--- a/pkg/scheduler/framework/plugins/volumebinding/volume_binding_test.go
++++ b/pkg/scheduler/framework/plugins/volumebinding/volume_binding_test.go
+@@ -1154,7 +1154,7 @@ func Test_PreBindPreFlight(t *testing.T) {
+ 					"node-a": {},
+ 				},
+ 			},
+-			want: fwk.NewStatus(fwk.Success),
++			want: nil,
+ 		},
+ 		{
+ 			name:     "error: state is nil",
+diff --git a/pkg/scheduler/framework/plugins/volumerestrictions/volume_restrictions.go b/pkg/scheduler/framework/plugins/volumerestrictions/volume_restrictions.go
+index 44f2bd5e048..ec4c2556570 100644
+--- a/pkg/scheduler/framework/plugins/volumerestrictions/volume_restrictions.go
++++ b/pkg/scheduler/framework/plugins/volumerestrictions/volume_restrictions.go
+@@ -45,6 +45,7 @@ var _ fwk.PreFilterPlugin = &VolumeRestrictions{}
+ var _ fwk.FilterPlugin = &VolumeRestrictions{}
+ var _ fwk.EnqueueExtensions = &VolumeRestrictions{}
+ var _ fwk.StateData = &preFilterState{}
++var _ fwk.SignPlugin = &VolumeRestrictions{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -100,6 +101,13 @@ func (pl *VolumeRestrictions) Name() string {
+ 	return Name
+ }
+ 
++// Feasibility and scoring based on the non-synthetic volume sources.
++func (pl *VolumeRestrictions) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.VolumesSignerName, Value: fwk.VolumesSigner(pod)},
++	}, nil
++}
++
+ func isVolumeConflict(volume *v1.Volume, pod *v1.Pod) bool {
+ 	for _, existingVolume := range pod.Spec.Volumes {
+ 		// Same GCE disk mounted by multiple pods conflicts unless all pods mount it read-only.
+diff --git a/pkg/scheduler/framework/plugins/volumezone/volume_zone.go b/pkg/scheduler/framework/plugins/volumezone/volume_zone.go
+index e78d2411fff..d9968aed727 100644
+--- a/pkg/scheduler/framework/plugins/volumezone/volume_zone.go
++++ b/pkg/scheduler/framework/plugins/volumezone/volume_zone.go
+@@ -49,6 +49,7 @@ type VolumeZone struct {
+ var _ fwk.FilterPlugin = &VolumeZone{}
+ var _ fwk.PreFilterPlugin = &VolumeZone{}
+ var _ fwk.EnqueueExtensions = &VolumeZone{}
++var _ fwk.SignPlugin = &VolumeZone{}
+ 
+ const (
+ 	// Name is the name of the plugin used in the plugin registry and configurations.
+@@ -102,6 +103,13 @@ func (pl *VolumeZone) Name() string {
+ 	return Name
+ }
+ 
++// Feasibility and scoring based on the non-synthetic volume sources.
++func (pl *VolumeZone) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return []fwk.SignFragment{
++		{Key: fwk.VolumesSignerName, Value: fwk.VolumesSigner(pod)},
++	}, nil
++}
++
+ // PreFilter invoked at the prefilter extension point
+ //
+ // # It finds the topology of the PersistentVolumes corresponding to the volumes a pod requests
+diff --git a/pkg/scheduler/framework/runtime/batch.go b/pkg/scheduler/framework/runtime/batch.go
+new file mode 100644
+index 00000000000..ad296f8a010
+--- /dev/null
++++ b/pkg/scheduler/framework/runtime/batch.go
+@@ -0,0 +1,240 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package runtime
++
++import (
++	"bytes"
++	"context"
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/klog/v2"
++	fwk "k8s.io/kube-scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/metrics"
++)
++
++// OpportunisticBatching caches results from filtering and scoring when possible to optimize
++// scheduling of common pods.
++type OpportunisticBatch struct {
++	state         *batchState
++	lastCycle     schedulingCycle
++	signatureFunc SignatureFunc
++	handle        fwk.Handle
++
++	// Used primarily for tests, count the total pods we
++	// have successfully batched.
++	batchedPods int64
++}
++
++type batchState struct {
++	signature    fwk.PodSignature
++	sortedNodes  framework.SortedScoredNodes
++	creationTime time.Time
++}
++
++type schedulingCycle struct {
++	cycleCount int64
++	chosenNode string
++	succeeded  bool
++}
++
++const (
++	maxBatchAge = 500 * time.Millisecond
++)
++
++type SignatureFunc func(h fwk.Handle, ctx context.Context, p *v1.Pod, recordPluginStats bool) fwk.PodSignature
++
++func signUsingFramework(h fwk.Handle, ctx context.Context, p *v1.Pod, recordPluginStats bool) fwk.PodSignature {
++	return h.SignPod(ctx, p, recordPluginStats)
++}
++
++// Provide a hint for the pod based on filtering an scoring results of previous cycles. Caching works only for consecutive pods
++// with the same signature that are scheduled in 1-pod-per-node manner (otherwise previous scores could not be reused).
++// It's assured by checking the top rated node is no longer feasible (meaning the previous pod was successfully scheduled and the
++// current one does not fit).
++func (b *OpportunisticBatch) GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, cycleCount int64) (string, fwk.PodSignature) {
++	logger := klog.FromContext(ctx)
++	var hint string
++
++	startTime := time.Now()
++	defer func() {
++		hinted := "hint"
++		if hint == "" {
++			hinted = "no_hint"
++		}
++		metrics.GetNodeHintDuration.WithLabelValues(hinted, b.handle.ProfileName()).Observe(metrics.SinceInSeconds(startTime))
++	}()
++
++	signature := b.signatureFunc(b.handle, ctx, pod, state.ShouldRecordPluginMetrics())
++
++	nodeInfos := b.handle.SnapshotSharedLister().NodeInfos()
++
++	// If we don't have state that we can use, then return an empty hint.
++	if !b.batchStateCompatible(ctx, logger, pod, signature, cycleCount, state, nodeInfos) {
++		metrics.BatchAttemptStats.WithLabelValues(b.handle.ProfileName(), metrics.BatchAttemptNoHint).Inc()
++		logger.V(4).Info("OpportunisticBatch no node hint available for pod",
++			"profile", b.handle.ProfileName(), "pod", klog.KObj(pod), "cycleCount", cycleCount)
++		return "", signature
++	}
++
++	// Otherwise, pop the head of the list in our state and return it as
++	// a hint. Also record it in our data to compare on storage.
++	hint = b.state.sortedNodes.Pop()
++	logger.V(3).Info("OpportunisticBatch provided node hint",
++		"profile", b.handle.ProfileName(), "pod", klog.KObj(pod), "cycleCount", cycleCount, "hint", hint,
++		"remainingNodes", b.state.sortedNodes.Len())
++
++	return hint, signature
++}
++
++// Store results from scheduling for use as a batch later.
++func (b *OpportunisticBatch) StoreScheduleResults(ctx context.Context, signature fwk.PodSignature, hintedNode, chosenNode string, otherNodes framework.SortedScoredNodes, cycleCount int64) {
++	logger := klog.FromContext(ctx)
++
++	startTime := time.Now()
++	defer metrics.StoreScheduleResultsDuration.WithLabelValues(b.handle.ProfileName()).Observe(metrics.SinceInSeconds(startTime))
++
++	// Set our cycle information for next time.
++	b.lastCycle = schedulingCycle{
++		cycleCount: cycleCount,
++		chosenNode: chosenNode,
++		succeeded:  true,
++	}
++	logger.V(4).Info("OpportunisticBatch set cycle state",
++		"profile", b.handle.ProfileName(), "cycleCount", cycleCount, "hintedNode", hintedNode, "chosenNode", chosenNode)
++
++	if hintedNode == chosenNode {
++		logger.V(4).Info("OpportunisticBatch skipping set state because hint was provided",
++			"profile", b.handle.ProfileName(), "cycleCount", cycleCount, "chosenNode", chosenNode)
++		metrics.BatchAttemptStats.WithLabelValues(b.handle.ProfileName(), metrics.BatchAttemptHintUsed).Inc()
++		b.batchedPods++
++		return
++	}
++
++	// Only store new results if we didn't give a hint or it wasn't used.
++	// Track the somewhat unusual case where we gave a hint and it wasn't used.
++	if hintedNode != "" {
++		metrics.BatchAttemptStats.WithLabelValues(b.handle.ProfileName(), metrics.BatchAttemptHintNotUsed).Inc()
++		logger.V(4).Info("OpportunisticBatch hint not used",
++			"profile", b.handle.ProfileName(), "cycleCount", b.lastCycle.cycleCount, "hint", hintedNode, "chosen", chosenNode)
++	}
++
++	// If this pod is batchable, set our results as state.
++	// We will check this against the next pod when we give the
++	// next hint.
++	if signature != nil && otherNodes != nil && otherNodes.Len() > 0 {
++		b.state = &batchState{
++			signature:    signature,
++			sortedNodes:  otherNodes,
++			creationTime: time.Now(),
++		}
++		if loggerV := logger.V(6); loggerV.Enabled() {
++			loggerV.Info("OpportunisticBatch set batch information",
++				"profile", b.handle.ProfileName(), "signature", b.state.signature, "nodes", otherNodes.Len(), "cycleCount", cycleCount)
++		} else {
++			logger.V(4).Info("OpportunisticBatch set batch information",
++				"profile", b.handle.ProfileName(), "nodes", otherNodes.Len(), "cycleCount", cycleCount)
++		}
++	} else {
++		reason := metrics.BatchFlushPodNotBatchable
++		if otherNodes == nil || otherNodes.Len() == 0 {
++			reason = metrics.BatchFlushEmptyList
++		}
++
++		b.logUnusableState(logger, cycleCount, reason)
++		b.state = nil
++	}
++}
++
++// logUnusableState our batch state because we can't keep it up to date.
++// Record the reason for our invalidation in the stats.
++func (b *OpportunisticBatch) logUnusableState(logger klog.Logger, cycleCount int64, reason string) {
++	metrics.BatchCacheFlushed.WithLabelValues(b.handle.ProfileName(), reason).Inc()
++	logger.V(4).Info("OpportunisticBatch found unusable state",
++		"profile", b.handle.ProfileName(), "cycleCount", cycleCount, "reason", reason)
++}
++
++// Update the batch state based on a the arrival of a new pod and the chosen node from the last pod.
++func (b *OpportunisticBatch) batchStateCompatible(ctx context.Context, logger klog.Logger, pod *v1.Pod, signature fwk.PodSignature, cycleCount int64, state fwk.CycleState, nodeInfos fwk.NodeInfoLister) bool {
++	// Just return if we don't have any state to use.
++	if b.stateEmpty() {
++		return false
++	}
++
++	// In this case, a previous pod was scheduled by another profile, meaning we can't use the state anymore.
++	if cycleCount != b.lastCycle.cycleCount+1 {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushPodSkipped)
++		return false
++	}
++
++	// If our last pod failed we can't use the state.
++	if !b.lastCycle.succeeded {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushPodFailed)
++		return false
++	}
++
++	// If the new pod is incompatible with the current state, throw the state away.
++	if signature == nil || !bytes.Equal(signature, b.state.signature) {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushPodIncompatible)
++		return false
++	}
++
++	// If the state is too old, throw the state away. This is to avoid
++	// cases where we either have huge numbers of compatible pods in a
++	// row or we have a long wait between pods.
++	if time.Now().After((b.state.creationTime.Add(maxBatchAge))) {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushExpired)
++		return false
++	}
++
++	// We can only reuse the previous state if the new pod will not
++	// fit on the node we used for the last pod. If the node we
++	// chose last time can't host this pod, then we know
++	// that the next best should be the next node in the list.
++	// If we *could* put this pod on the node we just used, then we can't
++	// use our cache because we don't know how to rescore the used node; it
++	// could be the best, or it could be somewhere else.
++	// See git.k8s.io/enhancements/keps/sig-scheduling/5598-opportunistic-batching
++	lastChosenNode, err := nodeInfos.Get(b.lastCycle.chosenNode)
++	if lastChosenNode == nil || err != nil {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushNodeMissing)
++		return false
++	}
++
++	status := b.handle.RunFilterPlugins(ctx, state, pod, lastChosenNode)
++	if !status.IsRejected() {
++		b.logUnusableState(logger, cycleCount, metrics.BatchFlushNodeNotFull)
++		return false
++	}
++
++	// Our state matches with our new pod and is useable
++	return true
++}
++
++// Irritatingly we can end up with a variety of different configurations that are all "empty".
++// Rather than trying to normalize all cases when they happen, we just check them all.
++func (b *OpportunisticBatch) stateEmpty() bool {
++	return b.state == nil || b.state.sortedNodes == nil || b.state.sortedNodes.Len() == 0
++}
++
++func newOpportunisticBatch(h fwk.Handle, signatureFunc SignatureFunc) *OpportunisticBatch {
++	return &OpportunisticBatch{
++		signatureFunc: signatureFunc,
++		handle:        h,
++	}
++}
+diff --git a/pkg/scheduler/framework/runtime/batch_test.go b/pkg/scheduler/framework/runtime/batch_test.go
+new file mode 100644
+index 00000000000..b053fb6bebd
+--- /dev/null
++++ b/pkg/scheduler/framework/runtime/batch_test.go
+@@ -0,0 +1,388 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package runtime
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"log"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/klog/v2/ktesting"
++	fwk "k8s.io/kube-scheduler/framework"
++	"k8s.io/kubernetes/pkg/scheduler/apis/config"
++	"k8s.io/kubernetes/pkg/scheduler/framework"
++)
++
++// nodeInfoLister declares a fwk.NodeInfo type for testing.
++type nodeInfoLister []fwk.NodeInfo
++
++// Get returns a fake node object in the fake nodes.
++func (nodes nodeInfoLister) Get(nodeName string) (fwk.NodeInfo, error) {
++	for _, node := range nodes {
++		if node != nil && node.Node().Name == nodeName {
++			return node, nil
++		}
++	}
++	return nil, fmt.Errorf("unable to find node: %s", nodeName)
++}
++
++// List lists all nodes.
++func (nodes nodeInfoLister) List() ([]fwk.NodeInfo, error) {
++	return nodes, nil
++}
++
++// HavePodsWithAffinityList is supposed to list nodes with at least one pod with affinity. For the fake lister
++// we just return everything.
++func (nodes nodeInfoLister) HavePodsWithAffinityList() ([]fwk.NodeInfo, error) {
++	return nodes, nil
++}
++
++// HavePodsWithRequiredAntiAffinityList is supposed to list nodes with at least one pod with
++// required anti-affinity. For the fake lister we just return everything.
++func (nodes nodeInfoLister) HavePodsWithRequiredAntiAffinityList() ([]fwk.NodeInfo, error) {
++	return nodes, nil
++}
++
++type sharedLister struct {
++	nodes nodeInfoLister
++}
++
++func (s sharedLister) NodeInfos() fwk.NodeInfoLister {
++	return s.nodes
++}
++
++type storageInfoListerContract struct{}
++
++func (c *storageInfoListerContract) IsPVCUsedByPods(_ string) bool {
++	return false
++}
++
++func (s sharedLister) StorageInfos() fwk.StorageInfoLister {
++	return &storageInfoListerContract{}
++}
++
++var batchRegistry = func() Registry {
++	r := make(Registry)
++	err := r.Register("batchTest", newBatchTestPlugin)
++	if err != nil {
++		log.Fatal("Couldn't register test.")
++	}
++	err = r.Register(queueSortPlugin, newQueueSortPlugin)
++	if err != nil {
++		log.Fatal("Couldn't register test.")
++	}
++	err = r.Register(bindPlugin, newBindPlugin)
++	if err != nil {
++		log.Fatal("Couldn't register test.")
++	}
++	return r
++}()
++
++type BatchTestPlugin struct{}
++
++func (pl *BatchTestPlugin) Name() string {
++	return "batchTest"
++}
++
++const blockingPodPrefix = 'b'
++
++func blockingPodID(suffix string) string {
++	return fmt.Sprintf("%c-%s", blockingPodPrefix, suffix)
++}
++
++const nonBlockingPodPrefix = 'a'
++
++func nonBlockingPodID(suffix string) string {
++	return fmt.Sprintf("%c-%s", nonBlockingPodPrefix, suffix)
++}
++
++// Test plugin assumes that each node can hold only one pod whose id begins with blockingPrefix. This allows
++// us to construct pods that block future selves or not.
++func (pl *BatchTestPlugin) Filter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
++	podID := pod.GetUID()
++	for _, nodePod := range nodeInfo.GetPods() {
++		npid := nodePod.GetPod().GetUID()
++		if podID[0] == blockingPodPrefix && npid[0] == blockingPodPrefix {
++			return fwk.NewStatus(fwk.Unschedulable, "unsched")
++		}
++	}
++	return nil
++}
++
++func newBatchTestPlugin(_ context.Context, injArgs runtime.Object, f fwk.Handle) (fwk.Plugin, error) {
++	return &BatchTestPlugin{}, nil
++}
++
++func newBatchTestFramework(ctx context.Context, r Registry) (framework.Framework, *sharedLister, error) {
++	plugins := &config.Plugins{}
++	profile := config.KubeSchedulerProfile{Plugins: plugins}
++
++	if _, ok := r[queueSortPlugin]; !ok {
++		r[queueSortPlugin] = newQueueSortPlugin
++	}
++	if _, ok := r[bindPlugin]; !ok {
++		r[bindPlugin] = newBindPlugin
++	}
++
++	if len(profile.Plugins.QueueSort.Enabled) == 0 {
++		profile.Plugins.QueueSort.Enabled = append(profile.Plugins.QueueSort.Enabled, config.Plugin{Name: queueSortPlugin})
++	}
++	if len(profile.Plugins.Bind.Enabled) == 0 {
++		profile.Plugins.Bind.Enabled = append(profile.Plugins.Bind.Enabled, config.Plugin{Name: bindPlugin})
++	}
++	profile.Plugins.Filter.Enabled = []config.Plugin{{Name: "batchTest"}}
++
++	lister := &sharedLister{nodes: nodeInfoLister{}}
++
++	ret, err := NewFramework(ctx, r, &profile, WithSnapshotSharedLister(lister))
++
++	return ret, lister, err
++}
++
++type testSortedScoredNodes struct {
++	Nodes []string
++}
++
++var _ framework.SortedScoredNodes = &testSortedScoredNodes{}
++
++func (t *testSortedScoredNodes) Pop() string {
++	ret := t.Nodes[0]
++	t.Nodes = t.Nodes[1:]
++	return ret
++}
++
++func (t *testSortedScoredNodes) Len() int {
++	return len(t.Nodes)
++}
++
++func newTestNodes(n []string) *testSortedScoredNodes {
++	return &testSortedScoredNodes{Nodes: n}
++}
++
++func newTestSigFunc(sig *fwk.PodSignature) SignatureFunc {
++	return func(h fwk.Handle, ctx context.Context, p *v1.Pod, shouldRecordStats bool) fwk.PodSignature {
++		return *sig
++	}
++}
++
++func TestBatchBasic(t *testing.T) {
++	// This test first let OpportunisticBatch handle the first pod, and then see how it behaves with the second pod.
++	tests := []struct {
++		name                          string
++		firstPodID                    string
++		firstSig                      string
++		firstPodScheduledSuccessfully bool
++		// firstChosenNode is supposed to set only if firstPodScheduledSuccessfully is true.
++		firstChosenNode string
++		// firstOtherNodes is supposed to set only if firstPodScheduledSuccessfully is true.
++		firstOtherNodes framework.SortedScoredNodes
++		// if it's true, the test case behaves as if there is another pod handled by another profile between the first and second pod.
++		skipPod          bool
++		secondPodID      string
++		secondSig        string
++		secondChosenNode string
++		secondOtherNodes framework.SortedScoredNodes
++		expectedHint     string
++		expectedState    *batchState
++	}{
++		{
++			name:                          "a second pod with the same signature gets a hint",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1"}),
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n1",
++			expectedHint:                  "n1",
++		},
++		{
++			name:                          "a second pod with a different signature doesn't get a hint",
++			firstPodID:                    nonBlockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1"}),
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   nonBlockingPodID("2"),
++			secondSig:                     "sig2",
++			secondChosenNode:              "n1",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "a second pod doesn't get a hint if it's not 1-pod-per-node",
++			firstPodID:                    nonBlockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1"}),
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   nonBlockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n1",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "pod doesn't get hint if previous pod didn't scheduled",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1"}),
++			firstPodScheduledSuccessfully: false,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n1",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "empty list",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{}),
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n4",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "nil list",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               nil,
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n4",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "pod doesn't get hint because the previous pod is to a different profile",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1"}),
++			firstPodScheduledSuccessfully: true,
++			skipPod:                       true,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n1",
++			expectedHint:                  "",
++		},
++		{
++			name:                          "pod uses batch from preceding pod and leaves remaining batch to next pod",
++			firstPodID:                    blockingPodID("1"),
++			firstSig:                      "sig",
++			firstChosenNode:               "n3",
++			firstOtherNodes:               newTestNodes([]string{"n1", "n2"}),
++			firstPodScheduledSuccessfully: true,
++			secondPodID:                   blockingPodID("2"),
++			secondSig:                     "sig",
++			secondChosenNode:              "n1",
++			expectedHint:                  "n1",
++			expectedState: &batchState{
++				signature:   []byte("sig"),
++				sortedNodes: newTestNodes([]string{"n2"}),
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, ctx := ktesting.NewTestContext(t)
++			ctx, cancel := context.WithCancel(ctx)
++			defer cancel()
++			testFwk, lister, err := newBatchTestFramework(ctx, batchRegistry)
++			if err != nil {
++				t.Fatalf("Failed to create framework for testing: %v", err)
++			}
++
++			pod := &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: "pod",
++					UID:  types.UID(tt.firstPodID),
++				},
++			}
++
++			signature := fwk.PodSignature(tt.firstSig)
++			batch := newOpportunisticBatch(testFwk, newTestSigFunc(&signature))
++			state := framework.NewCycleState()
++
++			// Run the first "pod" through
++			hint, _ := batch.GetNodeHint(ctx, pod, state, 1)
++			if hint != "" {
++				t.Fatalf("Got unexpected hint %s", hint)
++			}
++			if tt.firstPodScheduledSuccessfully {
++				batch.StoreScheduleResults(ctx, []byte(tt.firstSig), hint, tt.firstChosenNode, tt.firstOtherNodes, 1)
++			}
++
++			var cycleCount int64 = 2
++			if tt.skipPod {
++				cycleCount = 3
++			}
++
++			// Run the second pod
++			pod2 := &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: "pod2",
++					UID:  types.UID(tt.secondPodID),
++				},
++			}
++
++			lastChosenNode := framework.NewNodeInfo(pod)
++			lastChosenNode.SetNode(&v1.Node{ObjectMeta: metav1.ObjectMeta{
++				Name: tt.firstChosenNode,
++				UID:  types.UID(tt.firstChosenNode),
++			}})
++			lister.nodes = nodeInfoLister{lastChosenNode}
++
++			signature = fwk.PodSignature(tt.secondSig)
++			hint, _ = batch.GetNodeHint(ctx, pod2, state, cycleCount)
++
++			if hint != tt.expectedHint {
++				t.Fatalf("Got hint '%s' expected '%s' for test '%s'", hint, tt.expectedHint, tt.name)
++			}
++
++			batch.StoreScheduleResults(ctx, []byte(tt.secondSig), hint, tt.secondChosenNode, tt.secondOtherNodes, cycleCount)
++
++			batchEmpty := batch.state == nil || batch.state.sortedNodes == nil || batch.state.sortedNodes.Len() == 0
++			expectedEmpty := tt.expectedState == nil
++
++			if batchEmpty != expectedEmpty {
++				t.Fatalf("Expected empty %t, got empty %t for %s", expectedEmpty, batchEmpty, tt.name)
++			}
++			if !expectedEmpty {
++				if !bytes.Equal(batch.state.signature, []byte(tt.expectedState.signature)) {
++					t.Fatalf("Got state signature '%s' expected '%s' for test '%s'", batch.state.signature, tt.expectedState.signature, tt.name)
++				}
++				nodesDiff := cmp.Diff(tt.expectedState.sortedNodes, batch.state.sortedNodes)
++				if nodesDiff != "" {
++					t.Fatalf("Diff between sortedNodes (-want,+got):\n%s", nodesDiff)
++				}
++			}
++		})
++	}
++}
+diff --git a/pkg/scheduler/framework/runtime/framework.go b/pkg/scheduler/framework/runtime/framework.go
+index 5b36590f938..350c8e0c7fe 100644
+--- a/pkg/scheduler/framework/runtime/framework.go
++++ b/pkg/scheduler/framework/runtime/framework.go
+@@ -18,6 +18,7 @@ package runtime
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -29,6 +30,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	"k8s.io/client-go/informers"
+ 	clientset "k8s.io/client-go/kubernetes"
+ 	restclient "k8s.io/client-go/rest"
+@@ -36,6 +38,7 @@ import (
+ 	"k8s.io/component-helpers/scheduling/corev1"
+ 	"k8s.io/klog/v2"
+ 	fwk "k8s.io/kube-scheduler/framework"
++	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+ 	apidispatcher "k8s.io/kubernetes/pkg/scheduler/backend/api_dispatcher"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework"
+@@ -69,6 +72,7 @@ type frameworkImpl struct {
+ 	bindPlugins          []fwk.BindPlugin
+ 	postBindPlugins      []fwk.PostBindPlugin
+ 	permitPlugins        []fwk.PermitPlugin
++	batchablePlugins     []fwk.SignPlugin
+ 
+ 	// pluginsMap contains all plugins, by name.
+ 	pluginsMap map[string]fwk.Plugin
+@@ -94,6 +98,10 @@ type frameworkImpl struct {
+ 	apiCacher     fwk.APICacher
+ 
+ 	parallelizer fwk.Parallelizer
++
++	batch *OpportunisticBatch
++
++	enableSignatures bool
+ }
+ 
+ // extensionPoint encapsulates desired and applied set of plugins at a specific extension
+@@ -326,6 +334,10 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
+ 		logger:               logger,
+ 	}
+ 
++	if utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching) {
++		f.batch = newOpportunisticBatch(f, signUsingFramework)
++	}
++
+ 	if len(f.extenders) > 0 {
+ 		// Extender doesn't support any kind of requeueing feature like EnqueueExtensions in the scheduling framework.
+ 		// We register a defaultEnqueueExtension to fwk.ExtenderName here.
+@@ -418,6 +430,10 @@ func NewFramework(ctx context.Context, r Registry, profile *config.KubeScheduler
+ 		}
+ 	}
+ 
++	if utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching) {
++		f.computeBatchablePlugins()
++	}
++
+ 	if options.captureProfile != nil {
+ 		if len(outputProfile.PluginConfig) != 0 {
+ 			sort.Slice(outputProfile.PluginConfig, func(i, j int) bool {
+@@ -738,6 +754,105 @@ func (f *frameworkImpl) QueueSortFunc() fwk.LessFunc {
+ 	return f.queueSortPlugins[0].Less
+ }
+ 
++// If any of our preFilter, filter, preScore or score plugins haven't
++// implemented a signature, then disable the cache.
++func (f *frameworkImpl) computeBatchablePlugins() {
++	f.enableSignatures = true
++
++	if len(f.extenders) > 0 {
++		f.logger.Info("Disabling signatures for profile because it has extenders configured.",
++			"profile", f.profileName)
++
++		f.enableSignatures = false
++	}
++
++	// Get all plugins of compatible types.
++	candidatePlugins := []fwk.Plugin{}
++	for _, pl := range f.preFilterPlugins {
++		candidatePlugins = append(candidatePlugins, pl)
++	}
++	for _, pl := range f.filterPlugins {
++		candidatePlugins = append(candidatePlugins, pl)
++	}
++	for _, pl := range f.preScorePlugins {
++		candidatePlugins = append(candidatePlugins, pl)
++	}
++	for _, pl := range f.scorePlugins {
++		candidatePlugins = append(candidatePlugins, pl)
++	}
++
++	// Get signature elements from plugins.
++	plugins := map[string]fwk.SignPlugin{}
++	unsupportedPlugins := sets.New[string]()
++	for _, pl := range candidatePlugins {
++		if _, found := plugins[pl.Name()]; !found {
++			if _, implements := pl.(fwk.SignPlugin); implements {
++				f.batchablePlugins = append(f.batchablePlugins, pl.(fwk.SignPlugin))
++				plugins[pl.Name()] = pl.(fwk.SignPlugin)
++			} else {
++				unsupportedPlugins.Insert(pl.Name())
++				f.enableSignatures = false
++			}
++		}
++	}
++
++	if !f.enableSignatures {
++		f.logger.Info("Disabling signatures for profile because plugins do not support it.",
++			"profile", f.profileName, "plugins", unsupportedPlugins.UnsortedList())
++	}
++}
++
++// SignPod returns a signature for a given pod. Any two pods with the same signature should get
++// the same feasibility and scoring for the same set of nodes in the same state. If one or more plugins
++// is unable to construct a signature for the pod, the result will be nil, which means
++// there is no way to compare this pod against others, and will turn off a number of optimizations
++// for this pod.
++func (f *frameworkImpl) SignPod(ctx context.Context, pod *v1.Pod, recordPluginStats bool) fwk.PodSignature {
++	logger := klog.FromContext(ctx)
++	var status *fwk.Status
++
++	if recordPluginStats {
++		startTime := time.Now()
++		defer func() {
++			metrics.FrameworkExtensionPointDuration.WithLabelValues(metrics.Sign, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
++		}()
++	}
++
++	if !f.enableSignatures {
++		return nil
++	}
++
++	sig := map[string]any{
++		fwk.SchedulerNameSignerName: pod.Spec.SchedulerName,
++	}
++
++	for _, plugin := range f.batchablePlugins {
++		startTime := time.Now()
++		fragments, status := plugin.SignPod(ctx, pod)
++		f.metricsRecorder.ObservePluginDurationAsync(metrics.Sign, plugin.Name(), status.Code().String(), metrics.SinceInSeconds(startTime))
++
++		if !status.IsSuccess() {
++			if status.Code() == fwk.Error {
++				logger.Error(status.AsError(), "SignPod failed for plugin", "plugin", plugin.Name())
++			}
++			logger.V(5).Info("SignPod can't sign pod due to plugin", "plugin", plugin.Name(), "status", status)
++			return nil
++		}
++
++		for _, elem := range fragments {
++			sig[elem.Key] = elem.Value
++		}
++	}
++
++	sigBytes, err := json.Marshal(sig)
++	if err != nil {
++		logger.Error(err, "SignPod failed to marshal signature object")
++		return nil
++	}
++
++	return sigBytes
++}
++
+ // RunPreFilterPlugins runs the set of configured PreFilter plugins. It returns
+ // *Status and its code is set to non-success if any of the plugins returns
+ // anything but Success/Skip.
+@@ -1284,6 +1399,14 @@ func (f *frameworkImpl) runScoreExtension(ctx context.Context, pl fwk.ScorePlugi
+ 	return status
+ }
+ 
++func (f *frameworkImpl) GetNodeHint(ctx context.Context, pod *v1.Pod, state fwk.CycleState, cycleCount int64) (hint string, signature fwk.PodSignature) {
++	return f.batch.GetNodeHint(ctx, pod, state, cycleCount)
++}
++
++func (f *frameworkImpl) StoreScheduleResults(ctx context.Context, signature fwk.PodSignature, hintedNode, chosenNode string, otherNodes framework.SortedScoredNodes, cycleCount int64) {
++	f.batch.StoreScheduleResults(ctx, signature, hintedNode, chosenNode, otherNodes, cycleCount)
++}
++
+ // RunPreBindPlugins runs the set of configured prebind plugins. It returns a
+ // failure (bool) if any of the plugins returns an error. It also returns an
+ // error containing the rejection message or the error occurred in the plugin.
+@@ -1807,3 +1930,8 @@ func (f *frameworkImpl) APICacher() fwk.APICacher {
+ 	}
+ 	return f.apiCacher
+ }
++
++// Used only for tests
++func (f *frameworkImpl) TotalBatchedPods() int64 {
++	return f.batch.batchedPods
++}
+diff --git a/pkg/scheduler/metrics/metrics.go b/pkg/scheduler/metrics/metrics.go
+index 30671ee71fa..8fbdc0d98ab 100644
+--- a/pkg/scheduler/metrics/metrics.go
++++ b/pkg/scheduler/metrics/metrics.go
+@@ -62,6 +62,7 @@ var ExtensionPoints = []string{
+ 	Reserve,
+ 	Unreserve,
+ 	Permit,
++	Sign,
+ }
+ 
+ const (
+@@ -80,6 +81,7 @@ const (
+ 	Reserve                     = "Reserve"
+ 	Unreserve                   = "Unreserve"
+ 	Permit                      = "Permit"
++	Sign                        = "Sign"
+ )
+ 
+ const (
+@@ -92,17 +94,40 @@ const (
+ 	PodPoppedInFlightEvent = "PodPopped"
+ )
+ 
++// Possible batch attempt results
++const (
++	BatchAttemptNoHint      = "no_hint"
++	BatchAttemptHintUsed    = "hint_used"
++	BatchAttemptHintNotUsed = "hint_not_used"
++)
++
++// Possible batch cache flush reasons
++const (
++	BatchFlushPodFailed       = "pod_failed"
++	BatchFlushPodSkipped      = "pod_skipped"
++	BatchFlushNodeMissing     = "node_missing"
++	BatchFlushNodeNotFull     = "node_not_full"
++	BatchFlushEmptyList       = "empty_list"
++	BatchFlushExpired         = "expired"
++	BatchFlushPodIncompatible = "pod_incompatible"
++	BatchFlushPodNotBatchable = "pod_not_batchable"
++)
++
+ // All the histogram based metrics have 1ms as size for the smallest bucket.
+ var (
+-	scheduleAttempts           *metrics.CounterVec
+-	EventHandlingLatency       *metrics.HistogramVec
+-	schedulingLatency          *metrics.HistogramVec
+-	SchedulingAlgorithmLatency *metrics.Histogram
+-	PreemptionVictims          *metrics.Histogram
+-	PreemptionAttempts         *metrics.Counter
+-	pendingPods                *metrics.GaugeVec
+-	InFlightEvents             *metrics.GaugeVec
+-	Goroutines                 *metrics.GaugeVec
++	scheduleAttempts             *metrics.CounterVec
++	EventHandlingLatency         *metrics.HistogramVec
++	schedulingLatency            *metrics.HistogramVec
++	SchedulingAlgorithmLatency   *metrics.Histogram
++	PreemptionVictims            *metrics.Histogram
++	PreemptionAttempts           *metrics.Counter
++	pendingPods                  *metrics.GaugeVec
++	InFlightEvents               *metrics.GaugeVec
++	Goroutines                   *metrics.GaugeVec
++	BatchAttemptStats            *metrics.CounterVec
++	BatchCacheFlushed            *metrics.CounterVec
++	GetNodeHintDuration          *metrics.HistogramVec
++	StoreScheduleResultsDuration *metrics.HistogramVec
+ 
+ 	PodSchedulingSLIDuration        *metrics.HistogramVec
+ 	PodSchedulingAttempts           *metrics.Histogram
+@@ -236,6 +261,20 @@ func InitMetrics() {
+ 			Help:           "Number of running goroutines split by the work they do such as binding.",
+ 			StabilityLevel: metrics.ALPHA,
+ 		}, []string{"operation"})
++	BatchAttemptStats = metrics.NewCounterVec(
++		&metrics.CounterOpts{
++			Subsystem:      SchedulerSubsystem,
++			Name:           "batch_attempts_total",
++			Help:           "Counts of results when we attempt to use batching.",
++			StabilityLevel: metrics.ALPHA,
++		}, []string{"profile", "result"})
++	BatchCacheFlushed = metrics.NewCounterVec(
++		&metrics.CounterOpts{
++			Subsystem:      SchedulerSubsystem,
++			Name:           "batch_cache_flushed_total",
++			Help:           "Counts of cache flushes by reason.",
++			StabilityLevel: metrics.ALPHA,
++		}, []string{"profile", "reason"})
+ 
+ 	PodSchedulingSLIDuration = metrics.NewHistogramVec(
+ 		&metrics.HistogramOpts{
+@@ -392,6 +431,28 @@ func InitMetrics() {
+ 		},
+ 		[]string{"status"})
+ 
++	GetNodeHintDuration = metrics.NewHistogramVec(
++		&metrics.HistogramOpts{
++			Subsystem: SchedulerSubsystem,
++			Name:      "get_node_hint_duration_seconds",
++			Help:      "Latency for getting a node hint.",
++			// Start with 0.01ms with the last bucket being [~200ms, Inf)
++			Buckets:        metrics.ExponentialBuckets(0.00001, 2, 12),
++			StabilityLevel: metrics.ALPHA,
++		},
++		[]string{"hinted", "profile"})
++
++	StoreScheduleResultsDuration = metrics.NewHistogramVec(
++		&metrics.HistogramOpts{
++			Subsystem: SchedulerSubsystem,
++			Name:      "store_schedule_results_duration_seconds",
++			Help:      "Latency for getting a no.",
++			// Start with 0.01ms with the last bucket being [~200ms, Inf)
++			Buckets:        metrics.ExponentialBuckets(0.00001, 2, 12),
++			StabilityLevel: metrics.ALPHA,
++		},
++		[]string{"profile"})
++
+ 	metricsList = []metrics.Registerable{
+ 		scheduleAttempts,
+ 		schedulingLatency,
+@@ -410,6 +471,10 @@ func InitMetrics() {
+ 		CacheSize,
+ 		unschedulableReasons,
+ 		PluginEvaluationTotal,
++		BatchAttemptStats,
++		BatchCacheFlushed,
++		GetNodeHintDuration,
++		StoreScheduleResultsDuration,
+ 	}
+ }
+ 
+diff --git a/pkg/scheduler/schedule_one.go b/pkg/scheduler/schedule_one.go
+index feac13fc289..683bfaed690 100644
+--- a/pkg/scheduler/schedule_one.go
++++ b/pkg/scheduler/schedule_one.go
+@@ -31,12 +31,14 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	clientset "k8s.io/client-go/kubernetes"
+ 	"k8s.io/klog/v2"
+ 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
+ 	fwk "k8s.io/kube-scheduler/framework"
+ 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
+ 	"k8s.io/kubernetes/pkg/apis/core/validation"
++	"k8s.io/kubernetes/pkg/features"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework"
+ 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
+ 	"k8s.io/kubernetes/pkg/scheduler/metrics"
+@@ -57,9 +59,6 @@ const (
+ 	// to ensure that a certain minimum of nodes are checked for feasibility.
+ 	// This in turn helps ensure a minimum level of spreading.
+ 	minFeasibleNodesPercentageToFind = 5
+-	// numberOfHighestScoredNodesToReport is the number of node scores
+-	// to be included in ScheduleResult.
+-	numberOfHighestScoredNodesToReport = 3
+ )
+ 
+ // ScheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
+@@ -431,7 +430,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
+ 		return result, ErrNoNodesAvailable
+ 	}
+ 
+-	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
++	feasibleNodes, diagnosis, nodeHint, signature, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+ 	if err != nil {
+ 		return result, err
+ 	}
+@@ -447,8 +446,12 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
+ 
+ 	// When only one node after predicate, just use it.
+ 	if len(feasibleNodes) == 1 {
++		node := feasibleNodes[0].Node().Name
++		if utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching) {
++			fwk.StoreScheduleResults(ctx, signature, nodeHint, node, nil, sched.CurrentCycle())
++		}
+ 		return ScheduleResult{
+-			SuggestedHost:  feasibleNodes[0].Node().Name,
++			SuggestedHost:  node,
+ 			EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(),
+ 			FeasibleNodes:  1,
+ 		}, nil
+@@ -459,11 +462,16 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
+ 		return result, err
+ 	}
+ 
+-	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
++	sortedPrioritizedNodes := newSortedNodeScores(priorityList)
++	node := sortedPrioritizedNodes.Pop()
+ 	trace.Step("Prioritizing done")
+ 
++	if utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching) {
++		fwk.StoreScheduleResults(ctx, signature, nodeHint, node, sortedPrioritizedNodes, sched.CurrentCycle())
++	}
++
+ 	return ScheduleResult{
+-		SuggestedHost:  host,
++		SuggestedHost:  node,
+ 		EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(),
+ 		FeasibleNodes:  len(feasibleNodes),
+ 	}, err
+@@ -471,7 +479,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
+ 
+ // Filters the nodes to find the ones that fit the pod based on the framework
+ // filter plugins and filter extenders.
+-func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, pod *v1.Pod) ([]fwk.NodeInfo, framework.Diagnosis, error) {
++func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, pod *v1.Pod) ([]fwk.NodeInfo, framework.Diagnosis, string, fwk.PodSignature, error) {
+ 	logger := klog.FromContext(ctx)
+ 	diagnosis := framework.Diagnosis{
+ 		NodeToStatus: framework.NewDefaultNodeToStatus(),
+@@ -479,14 +487,14 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework
+ 
+ 	allNodes, err := sched.nodeInfoSnapshot.NodeInfos().List()
+ 	if err != nil {
+-		return nil, diagnosis, err
++		return nil, diagnosis, "", nil, err
+ 	}
+ 	// Run "prefilter" plugins.
+ 	preRes, s, unscheduledPlugins := schedFramework.RunPreFilterPlugins(ctx, state, pod)
+ 	diagnosis.UnschedulablePlugins = unscheduledPlugins
+ 	if !s.IsSuccess() {
+ 		if !s.IsRejected() {
+-			return nil, diagnosis, s.AsError()
++			return nil, diagnosis, "", nil, s.AsError()
+ 		}
+ 		// All nodes in NodeToStatus will have the same status so that they can be handled in the preemption.
+ 		diagnosis.NodeToStatus.SetAbsentNodesStatus(s)
+@@ -496,19 +504,28 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework
+ 		diagnosis.PreFilterMsg = msg
+ 		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+ 		diagnosis.AddPluginStatus(s)
+-		return nil, diagnosis, nil
++		return nil, diagnosis, "", nil, nil
++	}
++
++	var nodeHint string
++	var signature fwk.PodSignature
++	if utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching) {
++		// We get the node hint even if we have a nominated name for simplicity, but we could potentially avoid it
++		// in this scenario in the future.
++		nodeHint, signature = schedFramework.GetNodeHint(ctx, pod, state, sched.CurrentCycle())
+ 	}
+ 
+ 	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
+ 	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+-	if len(pod.Status.NominatedNodeName) > 0 {
+-		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, diagnosis)
++	// We take the same tack for hinted nodes from the batch module.
++	if len(pod.Status.NominatedNodeName) > 0 || len(nodeHint) > 0 {
++		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, schedFramework, state, nodeHint, diagnosis)
+ 		if err != nil {
+ 			utilruntime.HandleErrorWithContext(ctx, err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+ 		}
+ 		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+ 		if len(feasibleNodes) != 0 {
+-			return feasibleNodes, diagnosis, nil
++			return feasibleNodes, diagnosis, nodeHint, signature, nil
+ 		}
+ 	}
+ 
+@@ -530,12 +547,12 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework
+ 	processedNodes := len(feasibleNodes) + diagnosis.NodeToStatus.Len()
+ 	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(allNodes)
+ 	if err != nil {
+-		return nil, diagnosis, err
++		return nil, diagnosis, nodeHint, signature, err
+ 	}
+ 
+ 	feasibleNodesAfterExtender, err := findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatus)
+ 	if err != nil {
+-		return nil, diagnosis, err
++		return nil, diagnosis, nodeHint, signature, err
+ 	}
+ 	if len(feasibleNodesAfterExtender) != len(feasibleNodes) {
+ 		// Extenders filtered out some nodes.
+@@ -552,11 +569,17 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, schedFramework
+ 		diagnosis.UnschedulablePlugins.Insert(framework.ExtenderName)
+ 	}
+ 
+-	return feasibleNodesAfterExtender, diagnosis, nil
++	return feasibleNodesAfterExtender, diagnosis, nodeHint, signature, nil
+ }
+ 
+-func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, diagnosis framework.Diagnosis) ([]fwk.NodeInfo, error) {
++func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, schedFramework framework.Framework, state fwk.CycleState, nodeHint string, diagnosis framework.Diagnosis) ([]fwk.NodeInfo, error) {
++	// In the future we could potentially use the hint if the nominated node failed.
++	// https://github.com/kubernetes/kubernetes/issues/135163
+ 	nnn := pod.Status.NominatedNodeName
++	if len(nnn) == 0 {
++		nnn = nodeHint
++	}
++
+ 	nodeInfo, err := sched.nodeInfoSnapshot.Get(nnn)
+ 	if err != nil {
+ 		return nil, err
+@@ -865,6 +888,7 @@ func prioritizeNodes(
+ 			if score, ok := allNodeExtendersScores[nodes[i].Node().Name]; ok {
+ 				nodesScores[i].Scores = append(nodesScores[i].Scores, score.Scores...)
+ 				nodesScores[i].TotalScore += score.TotalScore
++				nodesScores[i].Randomizer = rand.Int()
+ 			}
+ 		}
+ 	}
+@@ -877,59 +901,29 @@ func prioritizeNodes(
+ 	return nodesScores, nil
+ }
+ 
+-var errEmptyPriorityList = errors.New("empty priorityList")
+-
+-// selectHost takes a prioritized list of nodes and then picks one
+-// in a reservoir sampling manner from the nodes that had the highest score.
+-// It also returns the top {count} Nodes,
+-// and the top of the list will be always the selected host.
+-func selectHost(nodeScoreList []fwk.NodePluginScores, count int) (string, []fwk.NodePluginScores, error) {
+-	if len(nodeScoreList) == 0 {
+-		return "", nil, errEmptyPriorityList
+-	}
++type sortedNodeScores struct {
++	nodes nodeScoreHeap
++}
+ 
++func newSortedNodeScores(nodeScoreList []fwk.NodePluginScores) *sortedNodeScores {
+ 	var h nodeScoreHeap = nodeScoreList
+ 	heap.Init(&h)
+-	cntOfMaxScore := 1
+-	selectedIndex := 0
+-	// The top of the heap is the NodeScoreResult with the highest score.
+-	sortedNodeScoreList := make([]fwk.NodePluginScores, 0, count)
+-	sortedNodeScoreList = append(sortedNodeScoreList, heap.Pop(&h).(fwk.NodePluginScores))
+-
+-	// This for-loop will continue until all Nodes with the highest scores get checked for a reservoir sampling,
+-	// and sortedNodeScoreList gets (count - 1) elements.
+-	for ns := heap.Pop(&h).(fwk.NodePluginScores); ; ns = heap.Pop(&h).(fwk.NodePluginScores) {
+-		if ns.TotalScore != sortedNodeScoreList[0].TotalScore && len(sortedNodeScoreList) == count {
+-			break
+-		}
+-
+-		if ns.TotalScore == sortedNodeScoreList[0].TotalScore {
+-			cntOfMaxScore++
+-			if rand.Intn(cntOfMaxScore) == 0 {
+-				// Replace the candidate with probability of 1/cntOfMaxScore
+-				selectedIndex = cntOfMaxScore - 1
+-			}
+-		}
+-
+-		sortedNodeScoreList = append(sortedNodeScoreList, ns)
+-
+-		if h.Len() == 0 {
+-			break
+-		}
+-	}
++	return &sortedNodeScores{nodes: h}
++}
+ 
+-	if selectedIndex != 0 {
+-		// replace the first one with selected one
+-		previous := sortedNodeScoreList[0]
+-		sortedNodeScoreList[0] = sortedNodeScoreList[selectedIndex]
+-		sortedNodeScoreList[selectedIndex] = previous
+-	}
++func (s *sortedNodeScores) Pop() string {
++	ent := heap.Pop(&s.nodes).(fwk.NodePluginScores)
++	return ent.Name
++}
+ 
+-	if len(sortedNodeScoreList) > count {
+-		sortedNodeScoreList = sortedNodeScoreList[:count]
+-	}
++// Used only for unit tests.
++func (s *sortedNodeScores) PopScore() fwk.NodePluginScores {
++	ent := heap.Pop(&s.nodes).(fwk.NodePluginScores)
++	return ent
++}
+ 
+-	return sortedNodeScoreList[0].Name, sortedNodeScoreList, nil
++func (s *sortedNodeScores) Len() int {
++	return s.nodes.Len()
+ }
+ 
+ // nodeScoreHeap is a heap of fwk.NodePluginScores.
+@@ -938,9 +932,12 @@ type nodeScoreHeap []fwk.NodePluginScores
+ // nodeScoreHeap implements heap.Interface.
+ var _ heap.Interface = &nodeScoreHeap{}
+ 
+-func (h nodeScoreHeap) Len() int           { return len(h) }
+-func (h nodeScoreHeap) Less(i, j int) bool { return h[i].TotalScore > h[j].TotalScore }
+-func (h nodeScoreHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
++func (h nodeScoreHeap) Len() int { return len(h) }
++func (h nodeScoreHeap) Less(i, j int) bool {
++	return (h[i].TotalScore > h[j].TotalScore ||
++		(h[i].TotalScore == h[j].TotalScore && h[i].Randomizer > h[j].Randomizer))
++}
++func (h nodeScoreHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+ 
+ func (h *nodeScoreHeap) Push(x interface{}) {
+ 	*h = append(*h, x.(fwk.NodePluginScores))
+diff --git a/pkg/scheduler/schedule_one_test.go b/pkg/scheduler/schedule_one_test.go
+index c4546707b98..592ff01a84e 100644
+--- a/pkg/scheduler/schedule_one_test.go
++++ b/pkg/scheduler/schedule_one_test.go
+@@ -17,6 +17,7 @@ limitations under the License.
+ package scheduler
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+@@ -1094,6 +1095,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
+ 						}
+ 						informerFactory.Start(ctx.Done())
+ 						informerFactory.WaitForCacheSync(ctx.Done())
++						sched.nodeInfoSnapshot = internalcache.NewEmptySnapshot()
+ 						sched.ScheduleOne(ctx)
+ 
+ 						if item.podToAdmit != nil {
+@@ -1173,6 +1175,230 @@ func TestSchedulerScheduleOne(t *testing.T) {
+ 	}
+ }
+ 
++type constSigPluginConfig struct {
++	name       string
++	signature  []fwk.SignFragment
++	status     *fwk.Status
++	pluginType string
++}
++
++type constantSigPlugin struct {
++	config *constSigPluginConfig
++}
++
++var _ fwk.FilterPlugin = &constantSigPlugin{}
++var _ fwk.PreFilterPlugin = &constantSigPlugin{}
++var _ fwk.ScorePlugin = &constantSigPlugin{}
++var _ fwk.PreScorePlugin = &constantSigPlugin{}
++
++func (pl *constantSigPlugin) Name() string {
++	return pl.config.name
++}
++
++func (pl *constantSigPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
++	return fwk.NewStatus(fwk.Success)
++}
++
++func (pl *constantSigPlugin) PreFilter(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
++	return nil, fwk.NewStatus(fwk.Success)
++}
++
++func (pl *constantSigPlugin) PreFilterExtensions() fwk.PreFilterExtensions {
++	return nil
++}
++
++func (pl *constantSigPlugin) PreScore(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) *fwk.Status {
++	return fwk.NewStatus(fwk.Success)
++}
++
++func (pl *constantSigPlugin) Score(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeInfo fwk.NodeInfo) (int64, *fwk.Status) {
++	return 1, fwk.NewStatus(fwk.Success)
++}
++
++func (pl *constantSigPlugin) ScoreExtensions() fwk.ScoreExtensions {
++	return nil
++}
++
++func (pl *constantSigPlugin) SignPod(_ context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return pl.config.signature, pl.config.status
++}
++
++func newConstSigFactory(config *constSigPluginConfig) frameworkruntime.PluginFactory {
++	return func(_ context.Context, _ runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
++		return &constantSigPlugin{config: config}, nil
++	}
++}
++
++func TestSignatures(t *testing.T) {
++	table := []struct {
++		name              string
++		plugins           []*constSigPluginConfig
++		expectedSignature []byte
++	}{
++		{
++			name:              "no plugins",
++			expectedSignature: []byte(`{"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "single filter",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "filter",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "single prefilter",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "prefilter",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "single score",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "score",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "single prescore",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "prescore",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "two plugins",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "filter",
++				},
++				{
++					name:       "ConstSig2",
++					signature:  []fwk.SignFragment{{Key: "test2", Value: 17}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "score",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"test2":17,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "plugin with multiple fragments",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}, {Key: "test2", Value: 17}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "filter",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"test2":17,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "overlapping fragments",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "filter",
++				},
++				{
++					name:       "ConstSig2",
++					signature:  []fwk.SignFragment{{Key: "test", Value: 16}},
++					status:     fwk.NewStatus(fwk.Success),
++					pluginType: "score",
++				},
++			},
++			expectedSignature: []byte(`{"test":16,"v1.Pod.Spec.SchedulerName":"test-scheduler"}`),
++		},
++		{
++			name: "unsignable plugin",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					status:     fwk.NewStatus(fwk.Unschedulable),
++					pluginType: "filter",
++				},
++			},
++			expectedSignature: nil,
++		},
++		{
++			name: "error plugin",
++			plugins: []*constSigPluginConfig{
++				{
++					name:       "ConstSig",
++					status:     fwk.NewStatus(fwk.Error),
++					pluginType: "filter",
++				},
++			},
++			expectedSignature: nil,
++		},
++	}
++	for _, item := range table {
++		t.Run(item.name, func(t *testing.T) {
++			_, ctx := ktesting.NewTestContext(t)
++			snapshot := internalcache.NewSnapshot([]*v1.Pod{}, []*v1.Node{})
++			informerFactory := informers.NewSharedInformerFactory(nil, 0)
++
++			plugins := []tf.RegisterPluginFunc{
++				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
++				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
++			}
++
++			for _, pl := range item.plugins {
++				switch pl.pluginType {
++				case "filter":
++					plugins = append(plugins, tf.RegisterFilterPlugin(pl.name, newConstSigFactory(pl)))
++				case "prefilter":
++					plugins = append(plugins, tf.RegisterPreFilterPlugin(pl.name, newConstSigFactory(pl)))
++				case "score":
++					plugins = append(plugins, tf.RegisterScorePlugin(pl.name, newConstSigFactory(pl), 1))
++				case "prescore":
++					plugins = append(plugins, tf.RegisterPreScorePlugin(pl.name, newConstSigFactory(pl)))
++				}
++			}
++
++			schedFramework, err := tf.NewFramework(ctx,
++				plugins,
++				testSchedulerName,
++				frameworkruntime.WithSnapshotSharedLister(snapshot),
++				frameworkruntime.WithInformerFactory(informerFactory),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			signature := schedFramework.SignPod(ctx, podWithID("foo", ""), true)
++			if !bytes.Equal(signature, item.expectedSignature) {
++				t.Fatal(fmt.Errorf("Test %s got signature %s, expected %s", item.name, signature, item.expectedSignature))
++			}
++		})
++	}
++}
++
+ // Tests the logic removing pods from inFlightPods after Permit (needed to fix issue https://github.com/kubernetes/kubernetes/issues/129967).
+ // This needs to be a separate test case, because it mocks the waitOnPermit and runPrebindPlugins functions.
+ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
+@@ -1447,6 +1673,7 @@ func TestScheduleOneMarksPodAsProcessedBeforePreBind(t *testing.T) {
+ 					if err != nil {
+ 						t.Fatal(err)
+ 					}
++					sched.nodeInfoSnapshot = internalcache.NewEmptySnapshot()
+ 					sched.ScheduleOne(ctx)
+ 					<-called
+ 
+@@ -2322,12 +2549,10 @@ func TestUpdatePodStatus(t *testing.T) {
+ 
+ func Test_SelectHost(t *testing.T) {
+ 	tests := []struct {
+-		name              string
+-		list              []fwk.NodePluginScores
+-		topNodesCnt       int
+-		possibleNodes     sets.Set[string]
+-		possibleNodeLists [][]fwk.NodePluginScores
+-		wantError         error
++		name             string
++		list             []fwk.NodePluginScores
++		expectedNodeList []fwk.NodePluginScores
++		wantError        error
+ 	}{
+ 		{
+ 			name: "unique properly ordered scores",
+@@ -2335,122 +2560,54 @@ func Test_SelectHost(t *testing.T) {
+ 				{Name: "node1", TotalScore: 1},
+ 				{Name: "node2", TotalScore: 2},
+ 			},
+-			topNodesCnt:   2,
+-			possibleNodes: sets.New("node2"),
+-			possibleNodeLists: [][]fwk.NodePluginScores{
+-				{
+-					{Name: "node2", TotalScore: 2},
+-					{Name: "node1", TotalScore: 1},
+-				},
+-			},
+-		},
+-		{
+-			name: "numberOfNodeScoresToReturn > len(list)",
+-			list: []fwk.NodePluginScores{
+-				{Name: "node1", TotalScore: 1},
++			expectedNodeList: []fwk.NodePluginScores{
+ 				{Name: "node2", TotalScore: 2},
+-			},
+-			topNodesCnt:   100,
+-			possibleNodes: sets.New("node2"),
+-			possibleNodeLists: [][]fwk.NodePluginScores{
+-				{
+-					{Name: "node2", TotalScore: 2},
+-					{Name: "node1", TotalScore: 1},
+-				},
++				{Name: "node1", TotalScore: 1},
+ 			},
+ 		},
+ 		{
+ 			name: "equal scores",
+ 			list: []fwk.NodePluginScores{
+-				{Name: "node2.1", TotalScore: 2},
+-				{Name: "node2.2", TotalScore: 2},
+-				{Name: "node2.3", TotalScore: 2},
++				{Name: "node2.2", TotalScore: 2, Randomizer: 2},
++				{Name: "node2.1", TotalScore: 2, Randomizer: 1},
++				{Name: "node2.3", TotalScore: 2, Randomizer: 3},
+ 			},
+-			topNodesCnt:   2,
+-			possibleNodes: sets.New("node2.1", "node2.2", "node2.3"),
+-			possibleNodeLists: [][]fwk.NodePluginScores{
+-				{
+-					{Name: "node2.1", TotalScore: 2},
+-					{Name: "node2.2", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node2.1", TotalScore: 2},
+-					{Name: "node2.3", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node2.2", TotalScore: 2},
+-					{Name: "node2.1", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node2.2", TotalScore: 2},
+-					{Name: "node2.3", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node2.3", TotalScore: 2},
+-					{Name: "node2.1", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node2.3", TotalScore: 2},
+-					{Name: "node2.2", TotalScore: 2},
+-				},
++			expectedNodeList: []fwk.NodePluginScores{
++				{Name: "node2.3", TotalScore: 2, Randomizer: 3},
++				{Name: "node2.2", TotalScore: 2, Randomizer: 2},
++				{Name: "node2.1", TotalScore: 2, Randomizer: 1},
+ 			},
+ 		},
+ 		{
+ 			name: "out of order scores",
+ 			list: []fwk.NodePluginScores{
+-				{Name: "node3.1", TotalScore: 3},
++				{Name: "node3.1", TotalScore: 3, Randomizer: 1},
+ 				{Name: "node2.1", TotalScore: 2},
+ 				{Name: "node1.1", TotalScore: 1},
+-				{Name: "node3.2", TotalScore: 3},
++				{Name: "node3.2", TotalScore: 3, Randomizer: 2},
+ 			},
+-			topNodesCnt:   3,
+-			possibleNodes: sets.New("node3.1", "node3.2"),
+-			possibleNodeLists: [][]fwk.NodePluginScores{
+-				{
+-					{Name: "node3.1", TotalScore: 3},
+-					{Name: "node3.2", TotalScore: 3},
+-					{Name: "node2.1", TotalScore: 2},
+-				},
+-				{
+-					{Name: "node3.2", TotalScore: 3},
+-					{Name: "node3.1", TotalScore: 3},
+-					{Name: "node2.1", TotalScore: 2},
+-				},
++			expectedNodeList: []fwk.NodePluginScores{
++				{Name: "node3.2", TotalScore: 3, Randomizer: 2},
++				{Name: "node3.1", TotalScore: 3, Randomizer: 1},
++				{Name: "node2.1", TotalScore: 2},
++				{Name: "node1.1", TotalScore: 1},
+ 			},
+ 		},
+-		{
+-			name:          "empty priority list",
+-			list:          []fwk.NodePluginScores{},
+-			possibleNodes: sets.Set[string]{},
+-			wantError:     errEmptyPriorityList,
+-		},
+ 	}
+ 
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+-			// increase the randomness
+-			for i := 0; i < 10; i++ {
+-				got, scoreList, err := selectHost(test.list, test.topNodesCnt)
+-				if err != test.wantError {
+-					t.Fatalf("unexpected error is returned from selectHost: got: %v want: %v", err, test.wantError)
+-				}
+-				if test.possibleNodes.Len() == 0 {
+-					if got != "" {
+-						t.Fatalf("expected nothing returned as selected Node, but actually %s is returned from selectHost", got)
+-					}
+-					return
+-				}
+-				if !test.possibleNodes.Has(got) {
+-					t.Errorf("got %s is not in the possible map %v", got, test.possibleNodes)
+-				}
+-				if got != scoreList[0].Name {
+-					t.Errorf("The head of list should be the selected Node's score: got: %v, expected: %v", scoreList[0], got)
+-				}
+-				for _, list := range test.possibleNodeLists {
+-					if cmp.Equal(list, scoreList) {
+-						return
+-					}
+-				}
++			var err error
++			var scoreList = []fwk.NodePluginScores{}
++			h := newSortedNodeScores(test.list)
++			for range len(test.list) {
++				gotNode := h.PopScore()
++				scoreList = append(scoreList, gotNode)
++			}
++			if !errors.Is(err, test.wantError) {
++				t.Fatalf("unexpected error is returned from selectHost: got: %v want: %v", err, test.wantError)
++			}
++			if !cmp.Equal(test.expectedNodeList, scoreList) {
+ 				t.Errorf("Unexpected scoreList: %v", scoreList)
+ 			}
+ 		})
+@@ -3520,7 +3677,7 @@ func TestFindFitAllError(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 
+-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), &v1.Pod{})
++	_, diagnosis, _, _, err := scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), &v1.Pod{})
+ 	if err != nil {
+ 		t.Errorf("unexpected error: %v", err)
+ 	}
+@@ -3566,7 +3723,7 @@ func TestFindFitSomeError(t *testing.T) {
+ 	}
+ 
+ 	pod := st.MakePod().Name("1").UID("1").Obj()
+-	_, diagnosis, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), pod)
++	_, diagnosis, _, _, err := scheduler.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), pod)
+ 	if err != nil {
+ 		t.Errorf("unexpected error: %v", err)
+ 	}
+@@ -3661,7 +3818,7 @@ func TestFindFitPredicateCallCounts(t *testing.T) {
+ 			}
+ 			schedFramework.AddNominatedPod(logger, podinfo, &fwk.NominatingInfo{NominatingMode: fwk.ModeOverride, NominatedNodeName: "1"})
+ 
+-			_, _, err = scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), test.pod)
++			_, _, _, _, err = scheduler.findNodesThatFitPod(ctx, schedFramework, framework.NewCycleState(), test.pod)
+ 			if err != nil {
+ 				t.Errorf("unexpected error: %v", err)
+ 			}
+@@ -3800,7 +3957,7 @@ func TestZeroRequest(t *testing.T) {
+ 			sched.applyDefaultHandlers()
+ 
+ 			state := framework.NewCycleState()
+-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, state, test.pod)
++			_, _, _, _, err = sched.findNodesThatFitPod(ctx, fwk, state, test.pod)
+ 			if err != nil {
+ 				t.Fatalf("error filtering nodes: %+v", err)
+ 			}
+@@ -4214,6 +4371,9 @@ func Test_prioritizeNodes(t *testing.T) {
+ 			if err != nil {
+ 				t.Errorf("unexpected error: %v", err)
+ 			}
++			for i := range nodesscores {
++				nodesscores[i].Randomizer = 0
++			}
+ 			for i := range nodesscores {
+ 				sort.Slice(nodesscores[i].Scores, func(j, k int) bool {
+ 					return nodesscores[i].Scores[j].Name < nodesscores[i].Scores[k].Name
+@@ -4331,7 +4491,7 @@ func TestFairEvaluationForNodes(t *testing.T) {
+ 
+ 	// Iterating over all nodes more than twice
+ 	for i := 0; i < 2*(numAllNodes/nodesToFind+1); i++ {
+-		nodesThatFit, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), &v1.Pod{})
++		nodesThatFit, _, _, _, err := sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), &v1.Pod{})
+ 		if err != nil {
+ 			t.Errorf("unexpected error: %v", err)
+ 		}
+@@ -4415,7 +4575,7 @@ func TestPreferNominatedNodeFilterCallCounts(t *testing.T) {
+ 			}
+ 			sched.applyDefaultHandlers()
+ 
+-			_, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
++			_, _, _, _, err = sched.findNodesThatFitPod(ctx, fwk, framework.NewCycleState(), test.pod)
+ 			if err != nil {
+ 				t.Errorf("unexpected error: %v", err)
+ 			}
+diff --git a/pkg/scheduler/scheduler.go b/pkg/scheduler/scheduler.go
+index d5c849af3aa..7c289c15414 100644
+--- a/pkg/scheduler/scheduler.go
++++ b/pkg/scheduler/scheduler.go
+@@ -668,3 +668,10 @@ func newPodInformer(cs clientset.Interface, resyncPeriod time.Duration) cache.Sh
+ 	informer.SetTransform(trim)
+ 	return informer
+ }
++
++func (sched *Scheduler) CurrentCycle() int64 {
++	if sched.SchedulingQueue != nil {
++		return sched.SchedulingQueue.SchedulingCycle()
++	}
++	return 0
++}
+diff --git a/staging/src/k8s.io/kube-scheduler/framework/interface.go b/staging/src/k8s.io/kube-scheduler/framework/interface.go
+index 0c0fce69ad0..dff535cb4c6 100644
+--- a/staging/src/k8s.io/kube-scheduler/framework/interface.go
++++ b/staging/src/k8s.io/kube-scheduler/framework/interface.go
+@@ -273,6 +273,9 @@ type NodePluginScores struct {
+ 	Scores []PluginScore
+ 	// TotalScore is the total score in Scores.
+ 	TotalScore int64
++	// Randomizer is used to provide randomness
++	// when randomizing nodes within a common score.
++	Randomizer int
+ }
+ 
+ // PluginScore is a struct with plugin/extender name and score.
+@@ -435,7 +438,8 @@ type PreFilterExtensions interface {
+ }
+ 
+ // PreFilterPlugin is an interface that must be implemented by "PreFilter" plugins.
+-// These plugins are called at the beginning of the scheduling cycle.
++// These plugins are called at the beginning of the scheduling cycle. Plugins that implement PreFilterPlugin should
++// also implement SignPlugin to enable batching optimizations.
+ type PreFilterPlugin interface {
+ 	Plugin
+ 	// PreFilter is called at the beginning of the scheduling cycle. All PreFilter
+@@ -463,7 +467,8 @@ type PreFilterPlugin interface {
+ // These plugins should return "Success", "Unschedulable" or "Error" in Status.code.
+ // However, the scheduler accepts other valid codes as well.
+ // Anything other than "Success" will lead to exclusion of the given host from
+-// running the pod.
++// running the pod. Plugins that implement FilterPlugin should
++// also implement SignPlugin to enable batching optimizations.
+ type FilterPlugin interface {
+ 	Plugin
+ 	// Filter is called by the scheduling framework.
+@@ -518,7 +523,8 @@ type PostFilterPlugin interface {
+ // PreScorePlugin is an interface for "PreScore" plugin. PreScore is an
+ // informational extension point. Plugins will be called with a list of nodes
+ // that passed the filtering phase. A plugin may use this data to update internal
+-// state or to generate logs/metrics.
++// state or to generate logs/metrics. Plugins that implement PreScorePlugin should
++// also implement SignPlugin to enable batching optimizations.
+ type PreScorePlugin interface {
+ 	Plugin
+ 	// PreScore is called by the scheduling framework after a list of nodes
+@@ -538,7 +544,8 @@ type ScoreExtensions interface {
+ }
+ 
+ // ScorePlugin is an interface that must be implemented by "Score" plugins to rank
+-// nodes that passed the filtering phase.
++// nodes that passed the filtering phase. Plugins that implement ScorePlugin should
++// also implement SignPlugin to enable batching optimizations.
+ type ScorePlugin interface {
+ 	Plugin
+ 	// Score is called on each filtered node. It must return success and an integer
+@@ -622,6 +629,59 @@ type BindPlugin interface {
+ 	Bind(ctx context.Context, state CycleState, p *v1.Pod, nodeName string) *Status
+ }
+ 
++// A portion of a pod signature. The sign fragments from all plugins are combined
++// together to create a unified signature.
++type SignFragment struct {
++	// Pod signature fragments are identified by a key, i.e., fragments with the same key
++	// should contain the same value for the same pod. Plugin authors can return the same SignFragment
++	// from multiple plugins, the framework just ignores duplicates. This allows plugins to share signers easily.
++	//
++	// Fragment names can be found in k8s.io/kube-scheduler/framework/signers.go. New fragment names for
++	// in-tree plugins should be added there, and custom plugins can also use them.
++	// Simple SignFragments which return a field should have names that follow the field name they return.
++	// So a SignFragment that returns NodeName would have the key:
++	//
++	//	"v1.Pod.Spec.NodeName"
++	//
++	// If a SignFragment does some processing on the resource, its name should include the path to the base of the state it uses,
++	// and then suffix this with a descriptive function name followed by (). So, for example, a SignFragment that only returns
++	// Ephemeral volumes might use the key:
++	//
++	//	"v1.Pod.Volumes.EphemeralVolumes()"
++	Key string
++
++	// The value of a SignFragment must be a json-marshallable object. Remember that we need to compare these across pods, so
++	// plugins should ensure that lists where order doesn't matter are sorted, for example.
++	Value any
++}
++
++// The signature for a given pod after all of the results from plugins are consolidated.
++type PodSignature []byte
++
++// SignPlugin is an interface that should be implemented by plugins that either filter or score
++// pods to enable batching and gang scheduling optimizations.
++// Each plugin returns SignFragments used to build a single signature per pod entering the scheduling cycle,
++// and the scheduler uses signatures to determine whether it can use a cached scheduling result, or needs to
++// recompute the prioritized nodes.
++//
++// If an enabled plugin that does Scoring, Prescoring, Filtering or Prefiltering does not implement this interface we will turn off batching for all pods.
++type SignPlugin interface {
++	Plugin
++	// SignPod returns SignFragments for use in batching. This is called at every scheduling cycle
++	// and is used to construct a signature builder used for pods. (KEP-5598).
++	//
++	// The sign fragments from all the plugins are combined to create a single signature. Only one fragment
++	// with a given key will be included.
++	//
++	// Status means:
++	//   - Success: the signer can sign the pod, accompanied by a set of signature fragments to be included.
++	//   - Unschedulable: the signer refuses to sign the pod, meaning the pod is not eligible for opportunistic batching optimization.
++	//   - Error: the signer hits something _unexpected_ and cannot build sign(s). A framework runtime just
++	//     proceeds with scheduling this pod without opportunistic batching optimization like Unschedulable,
++	//     but just report errors to logs.
++	SignPod(ctx context.Context, pod *v1.Pod) ([]SignFragment, *Status)
++}
++
+ // Handle provides data and some tools that plugins can use. It is
+ // passed to the plugin factories at the time of plugin initialization. Plugins
+ // must store and use this handle to call framework functions.
+@@ -694,8 +754,14 @@ type Handle interface {
+ 	// This is non-nil if the SchedulerAsyncAPICalls feature gate is enabled.
+ 	APICacher() APICacher
+ 
++	// ProfileName returns the profile name associated to a profile.
++	ProfileName() string
++
+ 	// WorkloadManager can be used to provide workload-aware scheduling.
+ 	WorkloadManager() WorkloadManager
++
++	// Sign a pod.
++	SignPod(ctx context.Context, pod *v1.Pod, recordPluginStats bool) PodSignature
+ }
+ 
+ // Parallelizer helps run scheduling operations in parallel chunks where possible, to improve performance and CPU utilization.
+diff --git a/staging/src/k8s.io/kube-scheduler/framework/signers.go b/staging/src/k8s.io/kube-scheduler/framework/signers.go
+new file mode 100644
+index 00000000000..934864aa754
+--- /dev/null
++++ b/staging/src/k8s.io/kube-scheduler/framework/signers.go
+@@ -0,0 +1,217 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package framework
++
++import (
++	"encoding/json"
++	"sort"
++
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++)
++
++// This file contains the names and implementations of various functions used
++// to compute pod signatures for use in batching and other scheduling optimizations.
++// See the definition of BatchablePlugin for more details.
++
++// Signer names
++const (
++	DynamicResourcesSignerName = "v1.Pod.Spec.DynamicResources"
++	ImageNamesSignerName       = "v1.Pod.Spec.CanonicalImageNames()"
++	LabelsSignerName           = "v1.Pod.Labels"
++	NodeNameSignerName         = "v1.Pod.Spec.NodeName"
++	NodeAffinitySignerName     = "v1.Pod.Spec.Affinity.NodeAffinity"
++	NodeSelectorSignerName     = "v1.Pod.Spec.Affinity.NodeSelector"
++	HostPortsSignerName        = "v1.Pod.Spec.HostPorts()"
++	ResourcesSignerName        = "v1.Pod.Spec.ContainerRequestsAndOverheads()"
++	SchedulerNameSignerName    = "v1.Pod.Spec.SchedulerName"
++	TolerationsSignerName      = "v1.Pod.Spec.Tolerations"
++	VolumesSignerName          = "v1.Pod.Spec.Volumes.NonSyntheticSources()"
++	FeaturesSignerName         = "v1.Pod.Spec.RequiredFeatures()"
++)
++
++// Common signers. These are either generic or shared across plugins.
++
++func HostPortsSigner(pod *v1.Pod) any {
++	portSet := sets.New[int32]()
++	containers := []v1.Container{}
++	containers = append(containers, pod.Spec.Containers...)
++	containers = append(containers, pod.Spec.InitContainers...)
++	for _, container := range containers {
++		for _, port := range container.Ports {
++			if port.HostPort != 0 {
++				portSet.Insert(port.HostPort)
++			}
++		}
++	}
++	ports := portSet.UnsortedList()
++	sort.Slice(ports, func(i, j int) bool {
++		return ports[i] < ports[j]
++	})
++	return ports
++}
++
++func NodeSelectorRequirementsSigner(reqs []v1.NodeSelectorRequirement) ([]string, error) {
++	ret := make([]string, len(reqs))
++	for i, req := range reqs {
++		t := req.DeepCopy()
++		sort.Slice(t.Values, func(i, j int) bool {
++			return t.Values[i] < t.Values[j]
++		})
++		v, err := json.Marshal(t)
++		if err != nil {
++			return nil, err
++		}
++		ret[i] = string(v)
++	}
++	sort.Slice(ret, func(i, j int) bool {
++		return ret[i] < ret[j]
++	})
++	return ret, nil
++}
++
++type nodeSelTermSignResult struct {
++	MatchExpressions []string
++	MatchFields      []string
++}
++
++func NodeSelectorTermSigner(t *v1.NodeSelectorTerm) (nodeSelTermSignResult, error) {
++	exp, err := NodeSelectorRequirementsSigner(t.MatchExpressions)
++	if err != nil {
++		return nodeSelTermSignResult{}, err
++	}
++	fld, err := NodeSelectorRequirementsSigner(t.MatchFields)
++	if err != nil {
++		return nodeSelTermSignResult{}, err
++	}
++	return nodeSelTermSignResult{
++		MatchExpressions: exp,
++		MatchFields:      fld,
++	}, nil
++}
++
++type prefSchedTermSignResult struct {
++	Weight     int32
++	Preference nodeSelTermSignResult
++}
++
++func PreferredSchedulingTermSigner(terms []v1.PreferredSchedulingTerm) ([]string, error) {
++	newTerms := make([]string, len(terms))
++	for i, t := range terms {
++		pref, err := NodeSelectorTermSigner(&t.Preference)
++		if err != nil {
++			return nil, err
++		}
++		termStr, err := json.Marshal(prefSchedTermSignResult{
++			Weight:     t.Weight,
++			Preference: pref,
++		})
++		if err != nil {
++			return nil, err
++		}
++		newTerms[i] = string(termStr)
++	}
++	sort.Slice(newTerms, func(i, j int) bool {
++		return newTerms[i] < newTerms[j]
++	})
++	return newTerms, nil
++}
++
++func NodeSelectorTermsSigner(terms []v1.NodeSelectorTerm) ([]string, error) {
++	req := make([]string, len(terms))
++	for i, t := range terms {
++		nst, err := NodeSelectorTermSigner(&t)
++		if err != nil {
++			return nil, err
++		}
++		tStr, err := json.Marshal(nst)
++		if err != nil {
++			return nil, err
++		}
++		req[i] = string(tStr)
++	}
++
++	sort.Slice(req, func(i, j int) bool {
++		return req[i] < req[j]
++	})
++
++	return req, nil
++}
++
++type nodeAffinitySignerResult struct {
++	Required  []string
++	Preferred []string
++}
++
++func NodeAffinitySigner(pod *v1.Pod) (any, error) {
++	if pod.Spec.Affinity != nil {
++		if pod.Spec.Affinity.NodeAffinity != nil {
++			n := pod.Spec.Affinity.NodeAffinity
++			pref := []string{}
++			var err error
++			if n.PreferredDuringSchedulingIgnoredDuringExecution != nil {
++				pref, err = PreferredSchedulingTermSigner(n.PreferredDuringSchedulingIgnoredDuringExecution)
++				if err != nil {
++					return nil, err
++				}
++			}
++
++			req := []string{}
++			if n.RequiredDuringSchedulingIgnoredDuringExecution != nil {
++				req, err = NodeSelectorTermsSigner(n.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms)
++				if err != nil {
++					return nil, err
++				}
++			}
++
++			return nodeAffinitySignerResult{
++				Required:  req,
++				Preferred: pref,
++			}, nil
++		}
++	}
++	return nil, nil
++}
++
++func TolerationsSigner(pod *v1.Pod) any {
++	ret := []v1.Toleration{}
++	ret = append(ret, pod.Spec.Tolerations...)
++	sort.Slice(ret, func(i, j int) bool {
++		return ret[i].Key < ret[j].Key || (ret[i].Key == ret[j].Key && ret[i].Value < ret[j].Value)
++	})
++	return ret
++}
++
++// We special case volumes because config and secret volumes don't
++// impact scheduling but are very specific to individual pods. If we
++// don't exclude them no pods will have matching signatures.
++func VolumesSigner(pod *v1.Pod) any {
++	ret := []string{}
++	for _, vol := range pod.Spec.Volumes {
++		if vol.VolumeSource.ConfigMap == nil && vol.VolumeSource.Secret == nil {
++			volStr, err := json.Marshal(vol.VolumeSource)
++			if err != nil {
++				return nil
++			}
++			ret = append(ret, string(volStr))
++		}
++	}
++	sort.Slice(ret, func(i, j int) bool {
++		return ret[i] < ret[j]
++	})
++	return ret
++}
+diff --git a/staging/src/k8s.io/kube-scheduler/framework/signers_test.go b/staging/src/k8s.io/kube-scheduler/framework/signers_test.go
+new file mode 100644
+index 00000000000..79881ffc19f
+--- /dev/null
++++ b/staging/src/k8s.io/kube-scheduler/framework/signers_test.go
+@@ -0,0 +1,309 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package framework
++
++import (
++	"encoding/json"
++	"errors"
++	"reflect"
++	"testing"
++
++	"github.com/google/go-cmp/cmp"
++	v1 "k8s.io/api/core/v1"
++)
++
++func TestHostPortsSigner(t *testing.T) {
++	tests := []struct {
++		name string
++		pod  *v1.Pod
++		want []int32
++	}{
++		{
++			name: "no containers",
++			pod:  &v1.Pod{},
++			want: []int32{},
++		},
++		{
++			name: "containers without host ports",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{
++						{Ports: []v1.ContainerPort{{ContainerPort: 80}}},
++					},
++				},
++			},
++			want: []int32{},
++		},
++		{
++			name: "single container with host port",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{
++						{Ports: []v1.ContainerPort{{HostPort: 8080}}},
++					},
++				},
++			},
++			want: []int32{8080},
++		},
++		{
++			name: "multiple containers, unsorted host ports, duplicates",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					InitContainers: []v1.Container{
++						{Ports: []v1.ContainerPort{{HostPort: 9090}}},
++					},
++					Containers: []v1.Container{
++						{Ports: []v1.ContainerPort{{HostPort: 80}}},
++						{Ports: []v1.ContainerPort{{HostPort: 443}, {HostPort: 80}}}, // duplicate 80
++					},
++				},
++			},
++			want: []int32{80, 443, 9090},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := HostPortsSigner(tt.pod)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("HostPortsSigner() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestTolerationsSigner(t *testing.T) {
++	tests := []struct {
++		name string
++		pod  *v1.Pod
++		want []v1.Toleration
++	}{
++		{
++			name: "no tolerations",
++			pod:  &v1.Pod{},
++			want: []v1.Toleration{},
++		},
++		{
++			name: "single toleration",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Tolerations: []v1.Toleration{
++						{Key: "key1", Value: "value1", Effect: v1.TaintEffectNoSchedule},
++					},
++				},
++			},
++			want: []v1.Toleration{
++				{Key: "key1", Value: "value1", Effect: v1.TaintEffectNoSchedule},
++			},
++		},
++		{
++			name: "multiple tolerations, unsorted",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Tolerations: []v1.Toleration{
++						{Key: "b", Value: "2"},
++						{Key: "a", Value: "1"},
++						{Key: "b", Value: "1"},
++					},
++				},
++			},
++			want: []v1.Toleration{
++				{Key: "a", Value: "1"},
++				{Key: "b", Value: "1"},
++				{Key: "b", Value: "2"},
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := TolerationsSigner(tt.pod)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("TolerationsSigner() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestVolumesSigner(t *testing.T) {
++	hostPath := v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: "/tmp"}}
++	emptyDir := v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}
++	configMap := v1.VolumeSource{ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: "cm"}}}
++	secret := v1.VolumeSource{Secret: &v1.SecretVolumeSource{SecretName: "secret"}}
++
++	marshal := func(vs v1.VolumeSource) string {
++		b, _ := json.Marshal(vs)
++		return string(b)
++	}
++
++	tests := []struct {
++		name string
++		pod  *v1.Pod
++		want []string
++	}{
++		{
++			name: "no volumes",
++			pod:  &v1.Pod{},
++			want: []string{},
++		},
++		{
++			name: "only ignored volumes (ConfigMap, Secret)",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Volumes: []v1.Volume{
++						{Name: "v1", VolumeSource: configMap},
++						{Name: "v2", VolumeSource: secret},
++					},
++				},
++			},
++			want: []string{},
++		},
++		{
++			name: "mixed volumes, should be filtered and sorted",
++			pod: &v1.Pod{
++				Spec: v1.PodSpec{
++					Volumes: []v1.Volume{
++						{Name: "v1", VolumeSource: hostPath},  // e.g. {"hostPath":{"path":"/tmp"}}
++						{Name: "v2", VolumeSource: configMap}, // ignored
++						{Name: "v3", VolumeSource: emptyDir},  // e.g. {"emptyDir":{}}
++					},
++				},
++			},
++			// Expected sort order depends on the exact JSON string.
++			// {"emptyDir":{}} comes before {"hostPath":...} alphabetically.
++			want: []string{marshal(emptyDir), marshal(hostPath)},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := VolumesSigner(tt.pod)
++			if !reflect.DeepEqual(got, tt.want) {
++				t.Errorf("VolumesSigner() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestNodeAffinitySigner(t *testing.T) {
++	table := []struct {
++		name        string
++		input       *v1.Pod
++		expected    any
++		expectedErr error
++	}{
++		{
++			name:        "nil affinity",
++			input:       &v1.Pod{},
++			expected:    nil,
++			expectedErr: nil,
++		},
++		{
++			name: "empty affinity",
++			input: &v1.Pod{
++				Spec: v1.PodSpec{
++					Affinity: &v1.Affinity{
++						NodeAffinity: &v1.NodeAffinity{
++							RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{},
++						},
++					},
++				},
++			},
++			expected:    nodeAffinitySignerResult{Required: []string{}, Preferred: []string{}},
++			expectedErr: nil,
++		},
++		{
++			name: "affinity unsorted",
++			input: &v1.Pod{
++				Spec: v1.PodSpec{
++					Affinity: &v1.Affinity{
++						NodeAffinity: &v1.NodeAffinity{
++							RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
++								NodeSelectorTerms: []v1.NodeSelectorTerm{
++									{
++										MatchExpressions: []v1.NodeSelectorRequirement{
++											{Key: "kk3", Operator: v1.NodeSelectorOpIn, Values: []string{"v3", "kv4"}},
++											{Key: "kk2", Operator: v1.NodeSelectorOpIn, Values: []string{"kv1", "v2"}},
++										},
++										MatchFields: []v1.NodeSelectorRequirement{
++											{Key: "kk1", Operator: v1.NodeSelectorOpIn, Values: []string{"kv3", "v4"}},
++										},
++									},
++									{
++										MatchExpressions: []v1.NodeSelectorRequirement{
++											{Key: "k2", Operator: v1.NodeSelectorOpIn, Values: []string{"v1", "v2"}},
++										},
++										MatchFields: []v1.NodeSelectorRequirement{
++											{Key: "k1", Operator: v1.NodeSelectorOpIn, Values: []string{"v3", "v4"}},
++										},
++									},
++								},
++							},
++							PreferredDuringSchedulingIgnoredDuringExecution: []v1.PreferredSchedulingTerm{
++								{
++									Weight: 3,
++									Preference: v1.NodeSelectorTerm{
++										MatchExpressions: []v1.NodeSelectorRequirement{
++											{Key: "ppk2", Operator: v1.NodeSelectorOpIn, Values: []string{"ppv1", "v2"}},
++										},
++										MatchFields: []v1.NodeSelectorRequirement{
++											{Key: "ppk1", Operator: v1.NodeSelectorOpIn, Values: []string{"ppv3", "v4"}},
++										},
++									},
++								},
++								{
++									Weight: 1,
++									Preference: v1.NodeSelectorTerm{
++										MatchExpressions: []v1.NodeSelectorRequirement{
++											{Key: "pk2", Operator: v1.NodeSelectorOpIn, Values: []string{"pv1", "v2"}},
++										},
++										MatchFields: []v1.NodeSelectorRequirement{
++											{Key: "pk1", Operator: v1.NodeSelectorOpIn, Values: []string{"pv3", "v4"}},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			expected: nodeAffinitySignerResult{
++				Required: []string{
++					`{"MatchExpressions":["{\"key\":\"k2\",\"operator\":\"In\",\"values\":[\"v1\",\"v2\"]}"],"MatchFields":["{\"key\":\"k1\",\"operator\":\"In\",\"values\":[\"v3\",\"v4\"]}"]}`,
++					`{"MatchExpressions":["{\"key\":\"kk2\",\"operator\":\"In\",\"values\":[\"kv1\",\"v2\"]}","{\"key\":\"kk3\",\"operator\":\"In\",\"values\":[\"kv4\",\"v3\"]}"],"MatchFields":["{\"key\":\"kk1\",\"operator\":\"In\",\"values\":[\"kv3\",\"v4\"]}"]}`,
++				},
++				Preferred: []string{
++					`{"Weight":1,"Preference":{"MatchExpressions":["{\"key\":\"pk2\",\"operator\":\"In\",\"values\":[\"pv1\",\"v2\"]}"],"MatchFields":["{\"key\":\"pk1\",\"operator\":\"In\",\"values\":[\"pv3\",\"v4\"]}"]}}`,
++					`{"Weight":3,"Preference":{"MatchExpressions":["{\"key\":\"ppk2\",\"operator\":\"In\",\"values\":[\"ppv1\",\"v2\"]}"],"MatchFields":["{\"key\":\"ppk1\",\"operator\":\"In\",\"values\":[\"ppv3\",\"v4\"]}"]}}`,
++				},
++			},
++			expectedErr: nil,
++		},
++	}
++
++	for _, tt := range table {
++		t.Run(tt.name, func(t *testing.T) {
++			res, err := NodeAffinitySigner(tt.input)
++			if !errors.Is(err, tt.expectedErr) {
++				t.Fatalf("unexpected error %v, expected %v", err, tt.expectedErr)
++			}
++			if diff := cmp.Diff(res, tt.expected); diff != "" {
++				t.Fatalf("unexpected result %s", diff)
++			}
++		})
++	}
++}
+diff --git a/test/compatibility_lifecycle/reference/versioned_feature_list.yaml b/test/compatibility_lifecycle/reference/versioned_feature_list.yaml
+index a7632ff6d7f..ab4ef6505d5 100644
+--- a/test/compatibility_lifecycle/reference/versioned_feature_list.yaml
++++ b/test/compatibility_lifecycle/reference/versioned_feature_list.yaml
+@@ -1219,6 +1219,12 @@
+     lockToDefault: false
+     preRelease: Beta
+     version: "1.24"
++- name: OpportunisticBatching
++  versionedSpecs:
++  - default: true
++    lockToDefault: false
++    preRelease: Beta
++    version: "1.35"
+ - name: OrderedNamespaceDeletion
+   versionedSpecs:
+   - default: false
+diff --git a/test/integration/scheduler/batch/batch_test.go b/test/integration/scheduler/batch/batch_test.go
+new file mode 100644
+index 00000000000..8a06dd412fb
+--- /dev/null
++++ b/test/integration/scheduler/batch/batch_test.go
+@@ -0,0 +1,638 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package batch
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/apimachinery/pkg/api/resource"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	"k8s.io/client-go/informers"
++	restclient "k8s.io/client-go/rest"
++	kubeschedulerconfigv1 "k8s.io/kube-scheduler/config/v1"
++	fwk "k8s.io/kube-scheduler/framework"
++	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
++	"k8s.io/kubernetes/pkg/scheduler/apis/config"
++	kubeschedulerscheme "k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
++	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
++	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
++	"k8s.io/kubernetes/test/integration/framework"
++
++	"k8s.io/kubernetes/pkg/scheduler"
++	st "k8s.io/kubernetes/pkg/scheduler/testing"
++	testutil "k8s.io/kubernetes/test/integration/util"
++	"k8s.io/kubernetes/test/utils/ktesting"
++)
++
++type podDef struct {
++	name                string
++	nodeSelector        map[string]string
++	nodeAffinity        []string
++	expectedNode        string
++	expectBatched       bool
++	scheduler           string
++	expectUnschedulable bool
++	priority            int32
++}
++
++type nodeDef struct {
++	name    string
++	labels  map[string]string
++	maxPods int
++}
++
++type scenario struct {
++	name  string
++	pods  []podDef
++	nodes []nodeDef
++}
++
++func TestBatchScenarios(t *testing.T) {
++	table := []*scenario{
++		{
++			name: "one pod one node",
++			pods: []podDef{
++				{
++					name:         "1ppn-batchp1",
++					expectedNode: "1ppn-batchn1",
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "1ppn-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "distinct pods on distinct nodes",
++			pods: []podDef{
++				{
++					name:         "dpdn-batchp1",
++					nodeSelector: map[string]string{"forpod": "1"},
++					expectedNode: "dpdn-batchn1",
++				},
++				{
++					name:         "dpdn-batchp2",
++					nodeSelector: map[string]string{"forpod": "2"},
++					expectedNode: "dpdn-batchn2",
++				},
++				{
++					name:         "dpdn-batchp3",
++					nodeSelector: map[string]string{"forpod": "3"},
++					expectedNode: "dpdn-batchn3",
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "dpdn-batchn3",
++					maxPods: 10,
++					labels:  map[string]string{"forpod": "3"},
++				},
++				{
++					name:    "dpdn-batchn2",
++					maxPods: 10,
++					labels:  map[string]string{"forpod": "2"},
++				},
++				{
++					name:    "dpdn-batchn1",
++					maxPods: 10,
++					labels:  map[string]string{"forpod": "1"},
++				},
++			},
++		},
++
++		{
++			name: "three pod batch",
++			pods: []podDef{
++				{
++					name:         "tpb-batchp1",
++					expectedNode: "tpb-batchn1",
++					nodeAffinity: []string{"tpb-batchn1", "tpb-batchn2", "tpb-batchn3"},
++				},
++				{
++					name:          "tpb-batchp2",
++					expectedNode:  "tpb-batchn2",
++					nodeAffinity:  []string{"tpb-batchn1", "tpb-batchn2", "tpb-batchn3"},
++					expectBatched: true,
++				},
++				{
++					name:          "tpb-batchp3",
++					expectedNode:  "tpb-batchn3",
++					nodeAffinity:  []string{"tpb-batchn1", "tpb-batchn2", "tpb-batchn3"},
++					expectBatched: true,
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "tpb-batchn3",
++					maxPods: 1,
++				},
++				{
++					name:    "tpb-batchn2",
++					maxPods: 1,
++				},
++				{
++					name:    "tpb-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "two consecutive batches",
++			pods: []podDef{
++				{
++					name:         "tcb-batchp1",
++					expectedNode: "tcb-batchn1",
++					nodeAffinity: []string{"tcb-batchn1", "tcb-batchn2"},
++				},
++				{
++					name:          "tcb-batchp2",
++					expectedNode:  "tcb-batchn2",
++					nodeAffinity:  []string{"tcb-batchn1", "tcb-batchn2"},
++					expectBatched: true,
++				},
++				{
++					name:         "tcb-batchp3",
++					expectedNode: "tcb-batchn4",
++					nodeAffinity: []string{"tcb-batchn4", "tcb-batchn3"},
++				},
++				{
++					name:          "tcb-batchp4",
++					expectedNode:  "tcb-batchn3",
++					nodeAffinity:  []string{"tcb-batchn4", "tcb-batchn3"},
++					expectBatched: true,
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "tcb-batchn4",
++					maxPods: 1,
++				},
++				{
++					name:    "tcb-batchn3",
++					maxPods: 1,
++				},
++				{
++					name:    "tcb-batchn2",
++					maxPods: 1,
++				},
++				{
++					name:    "tcb-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "multiple pods per node means no batching",
++			pods: []podDef{
++				{
++					name:         "mppn-batchp1",
++					expectedNode: "mppn-batchn1",
++					nodeAffinity: []string{"mppn-batchn1", "mppn-batchn2"},
++				},
++				{
++					name:         "mppn-batchp2",
++					expectedNode: "mppn-batchn1",
++					nodeAffinity: []string{"mppn-batchn1", "mppn-batchn2"},
++				},
++				{
++					name:         "mppn-batchp3",
++					expectedNode: "mppn-batchn4",
++					nodeAffinity: []string{"mppn-batchn4", "mppn-batchn3"},
++				},
++				{
++					name:         "mppn-batchp4",
++					expectedNode: "mppn-batchn4",
++					nodeAffinity: []string{"mppn-batchn4", "mppn-batchn3"},
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "mppn-batchn4",
++					maxPods: 2,
++				},
++				{
++					name:    "mppn-batchn3",
++					maxPods: 2,
++				},
++				{
++					name:    "mppn-batchn2",
++					maxPods: 2,
++				},
++				{
++					name:    "mppn-batchn1",
++					maxPods: 2,
++				},
++			},
++		},
++		{
++			name: "no batching between schedulers",
++			pods: []podDef{
++				{
++					name:         "bts--batchp1",
++					expectedNode: "bts--batchn1",
++					nodeAffinity: []string{"bts--batchn1", "bts--batchn2", "bts--batchn3"},
++				},
++				{
++					name:         "bts--batchp2",
++					expectedNode: "bts--batchn2",
++					nodeAffinity: []string{"bts--batchn1", "bts--batchn2", "bts--batchn3"},
++					scheduler:    "mysched",
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "bts--batchn3",
++					maxPods: 1,
++				},
++				{
++					name:    "bts--batchn2",
++					maxPods: 1,
++				},
++				{
++					name:    "bts--batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "no batching missing sign",
++			pods: []podDef{
++				{
++					name:         "nsg-batchp1",
++					expectedNode: "nsg-batchn1",
++					nodeAffinity: []string{"nsg-batchn1", "nsg-batchn2", "nsg-batchn3"},
++					scheduler:    "nosign",
++				},
++				{
++					name:         "nsg-batchp2",
++					expectedNode: "nsg-batchn2",
++					nodeAffinity: []string{"nsg-batchn1", "nsg-batchn2", "nsg-batchn3"},
++					scheduler:    "nosign",
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "nsg-batchn3",
++					maxPods: 1,
++				},
++				{
++					name:    "nsg-batchn2",
++					maxPods: 1,
++				},
++				{
++					name:    "nsg-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "no batching empty sign",
++			pods: []podDef{
++				{
++					name:         "esg-batchp1",
++					expectedNode: "esg-batchn1",
++					nodeAffinity: []string{"esg-batchn1", "esg-batchn2", "esg-batchn3"},
++					scheduler:    "emptysign",
++				},
++				{
++					name:         "esg-batchp2",
++					expectedNode: "esg-batchn2",
++					nodeAffinity: []string{"esg-batchn1", "esg-batchn2", "esg-batchn3"},
++					scheduler:    "emptysign",
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "esg-batchn3",
++					maxPods: 1,
++				},
++				{
++					name:    "esg-batchn2",
++					maxPods: 1,
++				},
++				{
++					name:    "esg-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++		{
++			name: "unschedulable pod",
++			pods: []podDef{
++				{
++					name:         "usp-batchp1",
++					expectedNode: "usp-batchn1",
++				},
++				{
++					name:                "usp-batchp2",
++					expectBatched:       false,
++					expectUnschedulable: true,
++				},
++			},
++			nodes: []nodeDef{
++				{
++					name:    "usp-batchn1",
++					maxPods: 1,
++				},
++			},
++		},
++	}
++
++	for _, tt := range table {
++		t.Run(tt.name, func(t *testing.T) {
++			finalPods, batched := runScenario(t, tt, true)
++			for i, p := range finalPods {
++				if p.Spec.NodeName != tt.pods[i].expectedNode {
++					t.Fatalf("Invalid node '%s' for pod '%s'. Expected '%s'", p.Spec.NodeName, p.Name, tt.pods[i].expectedNode)
++				}
++				if batched[i] != tt.pods[i].expectBatched {
++					t.Fatalf("Expected pod %s batched %t, actually %t", p.Name, tt.pods[i].expectBatched, batched[i])
++				}
++			}
++		})
++	}
++}
++
++func newPod(d *podDef) *v1.Pod {
++	aff := &v1.NodeAffinity{}
++	if len(d.nodeAffinity) > 0 {
++		for i, node := range d.nodeAffinity {
++			a := v1.PreferredSchedulingTerm{
++				Weight: int32(len(d.nodeAffinity) - i),
++				Preference: v1.NodeSelectorTerm{
++					MatchFields: []v1.NodeSelectorRequirement{
++						{
++							Key:      "metadata.name",
++							Operator: v1.NodeSelectorOpIn,
++							Values:   []string{node},
++						},
++					},
++				},
++			}
++			aff.PreferredDuringSchedulingIgnoredDuringExecution = append(aff.PreferredDuringSchedulingIgnoredDuringExecution, a)
++		}
++	}
++
++	ret := testutil.InitPausePod(&testutil.PausePodConfig{
++		Name:      d.name,
++		Affinity:  &v1.Affinity{NodeAffinity: aff},
++		Namespace: "default",
++		Resources: &v1.ResourceRequirements{
++			Requests: v1.ResourceList{
++				v1.ResourceCPU:    *(resource.NewQuantity(10, resource.DecimalSI)),
++				v1.ResourceMemory: *(resource.NewQuantity(4*1024*1024, resource.DecimalSI)),
++			},
++		},
++		NodeSelector:  d.nodeSelector,
++		SchedulerName: d.scheduler,
++	})
++
++	if d.priority != 0 {
++		ret.Spec.Priority = &d.priority
++	}
++
++	return ret
++}
++
++func resources(maxPods int) v1.ResourceList {
++	return v1.ResourceList{
++		v1.ResourceCPU:    *(resource.NewQuantity(100, resource.DecimalSI)),
++		v1.ResourceMemory: *(resource.NewQuantity(4*1024*1024*1024, resource.DecimalSI)),
++		v1.ResourcePods:   *resource.NewQuantity(int64(maxPods), resource.DecimalSI),
++	}
++}
++
++func newNode(d *nodeDef) *v1.Node {
++	n := st.MakeNode()
++	n.Name(d.name)
++	n.Labels = d.labels
++	n.Status.Capacity = resources(d.maxPods)
++	n.Status.Allocatable = resources(d.maxPods)
++	return n.Obj()
++}
++
++func newDefaultComponentConfig() (*config.KubeSchedulerConfiguration, error) {
++	gvk := kubeschedulerconfigv1.SchemeGroupVersion.WithKind("KubeSchedulerConfiguration")
++	cfg := config.KubeSchedulerConfiguration{}
++	_, _, err := kubeschedulerscheme.Codecs.UniversalDecoder().Decode(nil, &gvk, &cfg)
++	if err != nil {
++		return nil, err
++	}
++
++	// Clear pod topo spread defaults.
++	profile := cfg.Profiles[0]
++	for _, cfg := range profile.PluginConfig {
++		if cfg.Name == names.PodTopologySpread {
++			tps := cfg.Args.(*config.PodTopologySpreadArgs)
++			tps.DefaultConstraints = []v1.TopologySpreadConstraint{}
++			tps.DefaultingType = config.ListDefaulting
++		}
++	}
++
++	return &cfg, nil
++}
++
++type testPluginNoSign struct{}
++
++var _ fwk.FilterPlugin = &testPluginNoSign{}
++
++func (pl *testPluginNoSign) Name() string {
++	return "nosign"
++}
++
++func (pl *testPluginNoSign) Filter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
++	return nil
++}
++
++func newNoSignPlugin(_ context.Context, injArgs runtime.Object, f fwk.Handle) (fwk.Plugin, error) {
++	return &testPluginNoSign{}, nil
++}
++
++type testPluginEmptySign struct{}
++
++var _ fwk.FilterPlugin = &testPluginEmptySign{}
++var _ fwk.SignPlugin = &testPluginEmptySign{}
++
++func (pl *testPluginEmptySign) Name() string {
++	return "nosign"
++}
++
++func (pl *testPluginEmptySign) Filter(ctx context.Context, state fwk.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
++	return nil
++}
++
++func (pl *testPluginEmptySign) SignPod(ctx context.Context, pod *v1.Pod) ([]fwk.SignFragment, *fwk.Status) {
++	return nil, fwk.NewStatus(fwk.Unschedulable)
++}
++
++func newEmptySignPlugin(_ context.Context, injArgs runtime.Object, f fwk.Handle) (fwk.Plugin, error) {
++	return &testPluginEmptySign{}, nil
++}
++
++// To access the test-only field in the framework
++type batchGetter interface {
++	TotalBatchedPods() int64
++}
++
++func runScenario(t *testing.T, tt *scenario, batch bool) ([]*v1.Pod, []bool) {
++	_, tCtx := ktesting.NewTestContext(t)
++
++	cfg, err := newDefaultComponentConfig()
++	if err != nil {
++		tCtx.Fatalf("Error creating default component config: %v", err)
++	}
++
++	newProfile := cfg.Profiles[0].DeepCopy()
++	newProfile.SchedulerName = "mysched"
++	cfg.Profiles = append(cfg.Profiles, *newProfile)
++
++	newProfile = cfg.Profiles[0].DeepCopy()
++	newProfile.SchedulerName = "nosign"
++	newProfile.Plugins.Filter.Enabled = append(newProfile.Plugins.Filter.Enabled, config.Plugin{Name: "nosign"})
++	cfg.Profiles = append(cfg.Profiles, *newProfile)
++
++	newProfile = cfg.Profiles[0].DeepCopy()
++	newProfile.SchedulerName = "emptysign"
++	newProfile.Plugins.Filter.Enabled = append(newProfile.Plugins.Filter.Enabled, config.Plugin{Name: "emptysign"})
++	cfg.Profiles = append(cfg.Profiles, *newProfile)
++
++	scheduler, _, testCtx := mustSetupCluster(tCtx, cfg, frameworkruntime.Registry{
++		"nosign":    newNoSignPlugin,
++		"emptysign": newEmptySignPlugin,
++	})
++
++	getter := scheduler.Profiles["default-scheduler"].(batchGetter)
++
++	cs := testCtx.Client()
++
++	// Add nodes.
++	for _, n := range tt.nodes {
++		_, err := testutil.CreateNode(cs, newNode(&n))
++		if err != nil {
++			t.Fatal("Failed adding node", "node", n, err)
++		}
++	}
++
++	finalPods := []*v1.Pod{}
++	batched := []bool{}
++	for _, pd := range tt.pods {
++		prevBatched := getter.TotalBatchedPods()
++
++		p := newPod(&pd)
++		createdPod, err := cs.CoreV1().Pods(p.Namespace).Create(testCtx, p, metav1.CreateOptions{})
++		if err != nil {
++			t.Fatalf("Failed to create pod %s/%s, error: %v",
++				p.Namespace, p.Name, err)
++		}
++
++		if err := testutil.WaitForPodToScheduleWithTimeout(testCtx, cs, createdPod, 5*time.Second); err != nil {
++			if !pd.expectUnschedulable {
++				t.Errorf("Failed to schedule pod %s/%s on the node, err: %v",
++					p.Namespace, p.Name, err)
++			} else {
++				break
++			}
++		}
++
++		if pd.expectUnschedulable {
++			t.Fatalf("Expected pod to be unschedulable but it was scheduled")
++		}
++
++		finalPod, err := cs.CoreV1().Pods(p.Namespace).Get(testCtx, p.Name, metav1.GetOptions{})
++		if err != nil {
++			t.Fatalf("Failed to get pod %v", err)
++		}
++		finalPods = append(finalPods, finalPod)
++
++		currBatched := getter.TotalBatchedPods()
++
++		batched = append(batched, currBatched > prevBatched)
++	}
++
++	return finalPods, batched
++}
++
++// mustSetupCluster starts the following components:
++// - k8s api server
++// - scheduler
++// - some of the kube-controller-manager controllers
++//
++// It returns regular and dynamic clients, and destroyFunc which should be used to
++// remove resources after finished.
++// Notes on rate limiter:
++//   - client rate limit is set to 5000.
++func mustSetupCluster(tCtx ktesting.TContext, config *config.KubeSchedulerConfiguration, outOfTreePluginRegistry frameworkruntime.Registry) (*scheduler.Scheduler, informers.SharedInformerFactory, ktesting.TContext) {
++	var runtimeConfig []string
++	customFlags := []string{
++		// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
++		"--disable-admission-plugins=ServiceAccount,TaintNodesByCondition,Priority",
++		"--runtime-config=" + strings.Join(runtimeConfig, ","),
++	}
++	serverOpts := apiservertesting.NewDefaultTestServerOptions()
++	// Timeout sufficiently long to handle deleting pods of the largest test cases.
++	serverOpts.RequestTimeout = 10 * time.Minute
++	server, err := apiservertesting.StartTestServer(tCtx, serverOpts, customFlags, framework.SharedEtcd())
++	if err != nil {
++		tCtx.Fatalf("start apiserver: %v", err)
++	}
++	// Cleanup will be in reverse order: first the clients by canceling the
++	// child context (happens automatically), then the server.
++	tCtx.Cleanup(server.TearDownFn)
++	tCtx = ktesting.WithCancel(tCtx)
++
++	// TODO: client connection configuration, such as QPS or Burst is configurable in theory, this could be derived from the `config`, need to
++	// support this when there is any testcase that depends on such configuration.
++	cfg := restclient.CopyConfig(server.ClientConfig)
++	cfg.QPS = 5000.0
++	cfg.Burst = 5000
++
++	// use default component config if config here is nil
++	if config == nil {
++		var err error
++		config, err = newDefaultComponentConfig()
++		if err != nil {
++			tCtx.Fatalf("Error creating default component config: %v", err)
++		}
++	}
++
++	tCtx = ktesting.WithRESTConfig(tCtx, cfg)
++
++	// Not all config options will be effective but only those mostly related with scheduler performance will
++	// be applied to start a scheduler, most of them are defined in `scheduler.schedulerOptions`.
++	scheduler, informerFactory := testutil.StartScheduler(tCtx, config, outOfTreePluginRegistry)
++	testutil.StartFakePVController(tCtx, tCtx.Client(), informerFactory)
++	runGC := testutil.CreateGCController(tCtx, tCtx, *cfg, informerFactory)
++	runNS := testutil.CreateNamespaceController(tCtx, tCtx, *cfg, informerFactory)
++
++	runResourceClaimController := func() {}
++
++	informerFactory.Start(tCtx.Done())
++	informerFactory.WaitForCacheSync(tCtx.Done())
++	go runGC()
++	go runNS()
++	go runResourceClaimController()
++
++	return scheduler, informerFactory, tCtx
++
++}
+diff --git a/test/integration/scheduler/batch/main_test.go b/test/integration/scheduler/batch/main_test.go
+new file mode 100644
+index 00000000000..8075d6901a0
+--- /dev/null
++++ b/test/integration/scheduler/batch/main_test.go
+@@ -0,0 +1,27 @@
++/*
++Copyright 2025 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package batch
++
++import (
++	"testing"
++
++	"k8s.io/kubernetes/test/integration/framework"
++)
++
++func TestMain(m *testing.M) {
++	framework.EtcdMain(m.Run)
++}
+diff --git a/test/integration/scheduler_perf/scheduler_perf.go b/test/integration/scheduler_perf/scheduler_perf.go
+index 9174e75f1fe..f69889e111b 100644
+--- a/test/integration/scheduler_perf/scheduler_perf.go
++++ b/test/integration/scheduler_perf/scheduler_perf.go
+@@ -1148,8 +1148,9 @@ func setupTestCase(t testing.TB, tc *testCase, featureGates map[featuregate.Feat
+ 	// Only emulate v1.33 when QueueingHints is explicitly disabled.
+ 	if qhEnabled, exists := featureGates[features.SchedulerQueueingHints]; exists && !qhEnabled {
+ 		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
++	} else if _, found := featureGates[features.OpportunisticBatching]; !found {
++		featureGates[features.OpportunisticBatching] = false
+ 	}
+-
+ 	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featureGates)
+ 
+ 	// 30 minutes should be plenty enough even for the 5000-node tests.

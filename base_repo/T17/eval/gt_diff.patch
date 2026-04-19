@@ -1,0 +1,2136 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 885f8c91a9..f88cde20db 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2023,6 +2023,7 @@ dependencies = [
+  "test-case",
+  "thiserror",
+  "tikv-jemallocator",
++ "toml",
+  "tracing",
+  "walkdir",
+  "wild",
+diff --git a/crates/ruff/Cargo.toml b/crates/ruff/Cargo.toml
+index ccd6a507e2..51516f5059 100644
+--- a/crates/ruff/Cargo.toml
++++ b/crates/ruff/Cargo.toml
+@@ -49,6 +49,7 @@ serde_json = { workspace = true }
+ shellexpand = { workspace = true }
+ strum = { workspace = true, features = [] }
+ thiserror = { workspace = true }
++toml = { workspace = true }
+ tracing = { workspace = true, features = ["log"] }
+ walkdir = { workspace = true }
+ wild = { workspace = true }
+diff --git a/crates/ruff/src/args.rs b/crates/ruff/src/args.rs
+index 26182b037c..e7bb733a79 100644
+--- a/crates/ruff/src/args.rs
++++ b/crates/ruff/src/args.rs
+@@ -1,12 +1,18 @@
+ use std::cmp::Ordering;
+ use std::fmt::Formatter;
+-use std::path::PathBuf;
++use std::ops::Deref;
++use std::path::{Path, PathBuf};
+ use std::str::FromStr;
++use std::sync::Arc;
+ 
++use anyhow::bail;
++use clap::builder::{TypedValueParser, ValueParserFactory};
+ use clap::{command, Parser};
+ use colored::Colorize;
++use path_absolutize::path_dedot;
+ use regex::Regex;
+ use rustc_hash::FxHashMap;
++use toml;
+ 
+ use ruff_linter::line_width::LineLength;
+ use ruff_linter::logging::LogLevel;
+@@ -19,7 +25,7 @@ use ruff_linter::{warn_user, RuleParser, RuleSelector, RuleSelectorParser};
+ use ruff_source_file::{LineIndex, OneIndexed};
+ use ruff_text_size::TextRange;
+ use ruff_workspace::configuration::{Configuration, RuleSelection};
+-use ruff_workspace::options::PycodestyleOptions;
++use ruff_workspace::options::{Options, PycodestyleOptions};
+ use ruff_workspace::resolver::ConfigurationTransformer;
+ 
+ #[derive(Debug, Parser)]
+@@ -155,10 +161,20 @@ pub struct CheckCommand {
+     preview: bool,
+     #[clap(long, overrides_with("preview"), hide = true)]
+     no_preview: bool,
+-    /// Path to the `pyproject.toml` or `ruff.toml` file to use for
+-    /// configuration.
+-    #[arg(long, conflicts_with = "isolated")]
+-    pub config: Option<PathBuf>,
++    /// Either a path to a TOML configuration file (`pyproject.toml` or `ruff.toml`),
++    /// or a TOML `<KEY> = <VALUE>` pair
++    /// (such as you might find in a `ruff.toml` configuration file)
++    /// overriding a specific configuration option.
++    /// Overrides of individual settings using this option always take precedence
++    /// over all configuration files, including configuration files that were also
++    /// specified using `--config`.
++    #[arg(
++        long,
++        action = clap::ArgAction::Append,
++        value_name = "CONFIG_OPTION",
++        value_parser = ConfigArgumentParser,
++    )]
++    pub config: Vec<SingleConfigArgument>,
+     /// Comma-separated list of rule codes to enable (or ALL, to enable all rules).
+     #[arg(
+         long,
+@@ -291,7 +307,15 @@ pub struct CheckCommand {
+     #[arg(short, long, env = "RUFF_NO_CACHE", help_heading = "Miscellaneous")]
+     pub no_cache: bool,
+     /// Ignore all configuration files.
+-    #[arg(long, conflicts_with = "config", help_heading = "Miscellaneous")]
++    //
++    // Note: We can't mark this as conflicting with `--config` here
++    // as `--config` can be used for specifying configuration overrides
++    // as well as configuration files.
++    // Specifying a configuration file conflicts with `--isolated`;
++    // specifying a configuration override does not.
++    // If a user specifies `ruff check --isolated --config=ruff.toml`,
++    // we emit an error later on, after the initial parsing by clap.
++    #[arg(long, help_heading = "Miscellaneous")]
+     pub isolated: bool,
+     /// Path to the cache directory.
+     #[arg(long, env = "RUFF_CACHE_DIR", help_heading = "Miscellaneous")]
+@@ -384,9 +408,20 @@ pub struct FormatCommand {
+     /// difference between the current file and how the formatted file would look like.
+     #[arg(long)]
+     pub diff: bool,
+-    /// Path to the `pyproject.toml` or `ruff.toml` file to use for configuration.
+-    #[arg(long, conflicts_with = "isolated")]
+-    pub config: Option<PathBuf>,
++    /// Either a path to a TOML configuration file (`pyproject.toml` or `ruff.toml`),
++    /// or a TOML `<KEY> = <VALUE>` pair
++    /// (such as you might find in a `ruff.toml` configuration file)
++    /// overriding a specific configuration option.
++    /// Overrides of individual settings using this option always take precedence
++    /// over all configuration files, including configuration files that were also
++    /// specified using `--config`.
++    #[arg(
++        long,
++        action = clap::ArgAction::Append,
++        value_name = "CONFIG_OPTION",
++        value_parser = ConfigArgumentParser,
++    )]
++    pub config: Vec<SingleConfigArgument>,
+ 
+     /// Disable cache reads.
+     #[arg(short, long, env = "RUFF_NO_CACHE", help_heading = "Miscellaneous")]
+@@ -428,7 +463,15 @@ pub struct FormatCommand {
+     #[arg(long, help_heading = "Format configuration")]
+     pub line_length: Option<LineLength>,
+     /// Ignore all configuration files.
+-    #[arg(long, conflicts_with = "config", help_heading = "Miscellaneous")]
++    //
++    // Note: We can't mark this as conflicting with `--config` here
++    // as `--config` can be used for specifying configuration overrides
++    // as well as configuration files.
++    // Specifying a configuration file conflicts with `--isolated`;
++    // specifying a configuration override does not.
++    // If a user specifies `ruff check --isolated --config=ruff.toml`,
++    // we emit an error later on, after the initial parsing by clap.
++    #[arg(long, help_heading = "Miscellaneous")]
+     pub isolated: bool,
+     /// The name of the file when passing it through stdin.
+     #[arg(long, help_heading = "Miscellaneous")]
+@@ -515,101 +558,181 @@ impl From<&LogLevelArgs> for LogLevel {
+     }
+ }
+ 
++/// Configuration-related arguments passed via the CLI.
++#[derive(Default)]
++pub struct ConfigArguments {
++    /// Path to a pyproject.toml or ruff.toml configuration file (etc.).
++    /// Either 0 or 1 configuration file paths may be provided on the command line.
++    config_file: Option<PathBuf>,
++    /// Overrides provided via the `--config "KEY=VALUE"` option.
++    /// An arbitrary number of these overrides may be provided on the command line.
++    /// These overrides take precedence over all configuration files,
++    /// even configuration files that were also specified using `--config`.
++    overrides: Configuration,
++    /// Overrides provided via dedicated flags such as `--line-length` etc.
++    /// These overrides take precedence over all configuration files,
++    /// and also over all overrides specified using any `--config "KEY=VALUE"` flags.
++    per_flag_overrides: ExplicitConfigOverrides,
++}
++
++impl ConfigArguments {
++    pub fn config_file(&self) -> Option<&Path> {
++        self.config_file.as_deref()
++    }
++
++    fn from_cli_arguments(
++        config_options: Vec<SingleConfigArgument>,
++        per_flag_overrides: ExplicitConfigOverrides,
++        isolated: bool,
++    ) -> anyhow::Result<Self> {
++        let mut new = Self {
++            per_flag_overrides,
++            ..Self::default()
++        };
++
++        for option in config_options {
++            match option {
++                SingleConfigArgument::SettingsOverride(overridden_option) => {
++                    let overridden_option = Arc::try_unwrap(overridden_option)
++                        .unwrap_or_else(|option| option.deref().clone());
++                    new.overrides = new.overrides.combine(Configuration::from_options(
++                        overridden_option,
++                        None,
++                        &path_dedot::CWD,
++                    )?);
++                }
++                SingleConfigArgument::FilePath(path) => {
++                    if isolated {
++                        bail!(
++                            "\
++The argument `--config={}` cannot be used with `--isolated`
++
++  tip: You cannot specify a configuration file and also specify `--isolated`,
++       as `--isolated` causes ruff to ignore all configuration files.
++       For more information, try `--help`.
++",
++                            path.display()
++                        );
++                    }
++                    if let Some(ref config_file) = new.config_file {
++                        let (first, second) = (config_file.display(), path.display());
++                        bail!(
++                            "\
++You cannot specify more than one configuration file on the command line.
++
++  tip: remove either `--config={first}` or `--config={second}`.
++       For more information, try `--help`.
++"
++                        );
++                    }
++                    new.config_file = Some(path);
++                }
++            }
++        }
++        Ok(new)
++    }
++}
++
++impl ConfigurationTransformer for ConfigArguments {
++    fn transform(&self, config: Configuration) -> Configuration {
++        let with_config_overrides = self.overrides.clone().combine(config);
++        self.per_flag_overrides.transform(with_config_overrides)
++    }
++}
++
+ impl CheckCommand {
+     /// Partition the CLI into command-line arguments and configuration
+     /// overrides.
+-    pub fn partition(self) -> (CheckArguments, CliOverrides) {
+-        (
+-            CheckArguments {
+-                add_noqa: self.add_noqa,
+-                config: self.config,
+-                diff: self.diff,
+-                ecosystem_ci: self.ecosystem_ci,
+-                exit_non_zero_on_fix: self.exit_non_zero_on_fix,
+-                exit_zero: self.exit_zero,
+-                files: self.files,
+-                ignore_noqa: self.ignore_noqa,
+-                isolated: self.isolated,
+-                no_cache: self.no_cache,
+-                output_file: self.output_file,
+-                show_files: self.show_files,
+-                show_settings: self.show_settings,
+-                statistics: self.statistics,
+-                stdin_filename: self.stdin_filename,
+-                watch: self.watch,
+-            },
+-            CliOverrides {
+-                dummy_variable_rgx: self.dummy_variable_rgx,
+-                exclude: self.exclude,
+-                extend_exclude: self.extend_exclude,
+-                extend_fixable: self.extend_fixable,
+-                extend_ignore: self.extend_ignore,
+-                extend_per_file_ignores: self.extend_per_file_ignores,
+-                extend_select: self.extend_select,
+-                extend_unfixable: self.extend_unfixable,
+-                fixable: self.fixable,
+-                ignore: self.ignore,
+-                line_length: self.line_length,
+-                per_file_ignores: self.per_file_ignores,
+-                preview: resolve_bool_arg(self.preview, self.no_preview).map(PreviewMode::from),
+-                respect_gitignore: resolve_bool_arg(
+-                    self.respect_gitignore,
+-                    self.no_respect_gitignore,
+-                ),
+-                select: self.select,
+-                target_version: self.target_version,
+-                unfixable: self.unfixable,
+-                // TODO(charlie): Included in `pyproject.toml`, but not inherited.
+-                cache_dir: self.cache_dir,
+-                fix: resolve_bool_arg(self.fix, self.no_fix),
+-                fix_only: resolve_bool_arg(self.fix_only, self.no_fix_only),
+-                unsafe_fixes: resolve_bool_arg(self.unsafe_fixes, self.no_unsafe_fixes)
+-                    .map(UnsafeFixes::from),
+-                force_exclude: resolve_bool_arg(self.force_exclude, self.no_force_exclude),
+-                output_format: resolve_output_format(
+-                    self.output_format,
+-                    resolve_bool_arg(self.show_source, self.no_show_source),
+-                    resolve_bool_arg(self.preview, self.no_preview).unwrap_or_default(),
+-                ),
+-                show_fixes: resolve_bool_arg(self.show_fixes, self.no_show_fixes),
+-                extension: self.extension,
+-            },
+-        )
++    pub fn partition(self) -> anyhow::Result<(CheckArguments, ConfigArguments)> {
++        let check_arguments = CheckArguments {
++            add_noqa: self.add_noqa,
++            diff: self.diff,
++            ecosystem_ci: self.ecosystem_ci,
++            exit_non_zero_on_fix: self.exit_non_zero_on_fix,
++            exit_zero: self.exit_zero,
++            files: self.files,
++            ignore_noqa: self.ignore_noqa,
++            isolated: self.isolated,
++            no_cache: self.no_cache,
++            output_file: self.output_file,
++            show_files: self.show_files,
++            show_settings: self.show_settings,
++            statistics: self.statistics,
++            stdin_filename: self.stdin_filename,
++            watch: self.watch,
++        };
++
++        let cli_overrides = ExplicitConfigOverrides {
++            dummy_variable_rgx: self.dummy_variable_rgx,
++            exclude: self.exclude,
++            extend_exclude: self.extend_exclude,
++            extend_fixable: self.extend_fixable,
++            extend_ignore: self.extend_ignore,
++            extend_per_file_ignores: self.extend_per_file_ignores,
++            extend_select: self.extend_select,
++            extend_unfixable: self.extend_unfixable,
++            fixable: self.fixable,
++            ignore: self.ignore,
++            line_length: self.line_length,
++            per_file_ignores: self.per_file_ignores,
++            preview: resolve_bool_arg(self.preview, self.no_preview).map(PreviewMode::from),
++            respect_gitignore: resolve_bool_arg(self.respect_gitignore, self.no_respect_gitignore),
++            select: self.select,
++            target_version: self.target_version,
++            unfixable: self.unfixable,
++            // TODO(charlie): Included in `pyproject.toml`, but not inherited.
++            cache_dir: self.cache_dir,
++            fix: resolve_bool_arg(self.fix, self.no_fix),
++            fix_only: resolve_bool_arg(self.fix_only, self.no_fix_only),
++            unsafe_fixes: resolve_bool_arg(self.unsafe_fixes, self.no_unsafe_fixes)
++                .map(UnsafeFixes::from),
++            force_exclude: resolve_bool_arg(self.force_exclude, self.no_force_exclude),
++            output_format: resolve_output_format(
++                self.output_format,
++                resolve_bool_arg(self.show_source, self.no_show_source),
++                resolve_bool_arg(self.preview, self.no_preview).unwrap_or_default(),
++            ),
++            show_fixes: resolve_bool_arg(self.show_fixes, self.no_show_fixes),
++            extension: self.extension,
++        };
++
++        let config_args =
++            ConfigArguments::from_cli_arguments(self.config, cli_overrides, self.isolated)?;
++        Ok((check_arguments, config_args))
+     }
+ }
+ 
+ impl FormatCommand {
+     /// Partition the CLI into command-line arguments and configuration
+     /// overrides.
+-    pub fn partition(self) -> (FormatArguments, CliOverrides) {
+-        (
+-            FormatArguments {
+-                check: self.check,
+-                diff: self.diff,
+-                config: self.config,
+-                files: self.files,
+-                isolated: self.isolated,
+-                no_cache: self.no_cache,
+-                stdin_filename: self.stdin_filename,
+-                range: self.range,
+-            },
+-            CliOverrides {
+-                line_length: self.line_length,
+-                respect_gitignore: resolve_bool_arg(
+-                    self.respect_gitignore,
+-                    self.no_respect_gitignore,
+-                ),
+-                exclude: self.exclude,
+-                preview: resolve_bool_arg(self.preview, self.no_preview).map(PreviewMode::from),
+-                force_exclude: resolve_bool_arg(self.force_exclude, self.no_force_exclude),
+-                target_version: self.target_version,
+-                cache_dir: self.cache_dir,
+-                extension: self.extension,
+-
+-                // Unsupported on the formatter CLI, but required on `Overrides`.
+-                ..CliOverrides::default()
+-            },
+-        )
++    pub fn partition(self) -> anyhow::Result<(FormatArguments, ConfigArguments)> {
++        let format_arguments = FormatArguments {
++            check: self.check,
++            diff: self.diff,
++            files: self.files,
++            isolated: self.isolated,
++            no_cache: self.no_cache,
++            stdin_filename: self.stdin_filename,
++            range: self.range,
++        };
++
++        let cli_overrides = ExplicitConfigOverrides {
++            line_length: self.line_length,
++            respect_gitignore: resolve_bool_arg(self.respect_gitignore, self.no_respect_gitignore),
++            exclude: self.exclude,
++            preview: resolve_bool_arg(self.preview, self.no_preview).map(PreviewMode::from),
++            force_exclude: resolve_bool_arg(self.force_exclude, self.no_force_exclude),
++            target_version: self.target_version,
++            cache_dir: self.cache_dir,
++            extension: self.extension,
++
++            // Unsupported on the formatter CLI, but required on `Overrides`.
++            ..ExplicitConfigOverrides::default()
++        };
++
++        let config_args =
++            ConfigArguments::from_cli_arguments(self.config, cli_overrides, self.isolated)?;
++        Ok((format_arguments, config_args))
+     }
+ }
+ 
+@@ -622,6 +745,154 @@ fn resolve_bool_arg(yes: bool, no: bool) -> Option<bool> {
+     }
+ }
+ 
++#[derive(Debug)]
++enum TomlParseFailureKind {
++    SyntaxError,
++    UnknownOption,
++}
++
++impl std::fmt::Display for TomlParseFailureKind {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        let display = match self {
++            Self::SyntaxError => "The supplied argument is not valid TOML",
++            Self::UnknownOption => {
++                "Could not parse the supplied argument as a `ruff.toml` configuration option"
++            }
++        };
++        write!(f, "{display}")
++    }
++}
++
++#[derive(Debug)]
++struct TomlParseFailure {
++    kind: TomlParseFailureKind,
++    underlying_error: toml::de::Error,
++}
++
++impl std::fmt::Display for TomlParseFailure {
++    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
++        let TomlParseFailure {
++            kind,
++            underlying_error,
++        } = self;
++        let display = format!("{kind}:\n\n{underlying_error}");
++        write!(f, "{}", display.trim_end())
++    }
++}
++
++/// Enumeration to represent a single `--config` argument
++/// passed via the CLI.
++///
++/// Using the `--config` flag, users may pass 0 or 1 paths
++/// to configuration files and an arbitrary number of
++/// "inline TOML" overrides for specific settings.
++///
++/// For example:
++///
++/// ```sh
++/// ruff check --config "path/to/ruff.toml" --config "extend-select=['E501', 'F841']" --config "lint.per-file-ignores = {'some_file.py' = ['F841']}"
++/// ```
++#[derive(Clone, Debug)]
++pub enum SingleConfigArgument {
++    FilePath(PathBuf),
++    SettingsOverride(Arc<Options>),
++}
++
++#[derive(Clone)]
++pub struct ConfigArgumentParser;
++
++impl ValueParserFactory for SingleConfigArgument {
++    type Parser = ConfigArgumentParser;
++
++    fn value_parser() -> Self::Parser {
++        ConfigArgumentParser
++    }
++}
++
++impl TypedValueParser for ConfigArgumentParser {
++    type Value = SingleConfigArgument;
++
++    fn parse_ref(
++        &self,
++        cmd: &clap::Command,
++        arg: Option<&clap::Arg>,
++        value: &std::ffi::OsStr,
++    ) -> Result<Self::Value, clap::Error> {
++        let path_to_config_file = PathBuf::from(value);
++        if path_to_config_file.exists() {
++            return Ok(SingleConfigArgument::FilePath(path_to_config_file));
++        }
++
++        let value = value
++            .to_str()
++            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
++
++        let toml_parse_error = match toml::Table::from_str(value) {
++            Ok(table) => match table.try_into() {
++                Ok(option) => return Ok(SingleConfigArgument::SettingsOverride(Arc::new(option))),
++                Err(underlying_error) => TomlParseFailure {
++                    kind: TomlParseFailureKind::UnknownOption,
++                    underlying_error,
++                },
++            },
++            Err(underlying_error) => TomlParseFailure {
++                kind: TomlParseFailureKind::SyntaxError,
++                underlying_error,
++            },
++        };
++
++        let mut new_error = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
++        if let Some(arg) = arg {
++            new_error.insert(
++                clap::error::ContextKind::InvalidArg,
++                clap::error::ContextValue::String(arg.to_string()),
++            );
++        }
++        new_error.insert(
++            clap::error::ContextKind::InvalidValue,
++            clap::error::ContextValue::String(value.to_string()),
++        );
++
++        // small hack so that multiline tips
++        // have the same indent on the left-hand side:
++        let tip_indent = " ".repeat("  tip: ".len());
++
++        let mut tip = format!(
++            "\
++A `--config` flag must either be a path to a `.toml` configuration file
++{tip_indent}or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++{tip_indent}option"
++        );
++
++        // Here we do some heuristics to try to figure out whether
++        // the user was trying to pass in a path to a configuration file
++        // or some inline TOML.
++        // We want to display the most helpful error to the user as possible.
++        if std::path::Path::new(value)
++            .extension()
++            .map_or(false, |ext| ext.eq_ignore_ascii_case("toml"))
++        {
++            if !value.contains('=') {
++                tip.push_str(&format!(
++                    "
++
++It looks like you were trying to pass a path to a configuration file.
++The path `{value}` does not exist"
++                ));
++            }
++        } else if value.contains('=') {
++            tip.push_str(&format!("\n\n{toml_parse_error}"));
++        }
++
++        new_error.insert(
++            clap::error::ContextKind::Suggested,
++            clap::error::ContextValue::StyledStrs(vec![tip.into()]),
++        );
++
++        Err(new_error)
++    }
++}
++
+ fn resolve_output_format(
+     output_format: Option<SerializationFormat>,
+     show_sources: Option<bool>,
+@@ -664,7 +935,6 @@ fn resolve_output_format(
+ #[allow(clippy::struct_excessive_bools)]
+ pub struct CheckArguments {
+     pub add_noqa: bool,
+-    pub config: Option<PathBuf>,
+     pub diff: bool,
+     pub ecosystem_ci: bool,
+     pub exit_non_zero_on_fix: bool,
+@@ -688,7 +958,6 @@ pub struct FormatArguments {
+     pub check: bool,
+     pub no_cache: bool,
+     pub diff: bool,
+-    pub config: Option<PathBuf>,
+     pub files: Vec<PathBuf>,
+     pub isolated: bool,
+     pub stdin_filename: Option<PathBuf>,
+@@ -884,39 +1153,40 @@ impl LineColumnParseError {
+     }
+ }
+ 
+-/// CLI settings that function as configuration overrides.
++/// Configuration overrides provided via dedicated CLI flags:
++/// `--line-length`, `--respect-gitignore`, etc.
+ #[derive(Clone, Default)]
+ #[allow(clippy::struct_excessive_bools)]
+-pub struct CliOverrides {
+-    pub dummy_variable_rgx: Option<Regex>,
+-    pub exclude: Option<Vec<FilePattern>>,
+-    pub extend_exclude: Option<Vec<FilePattern>>,
+-    pub extend_fixable: Option<Vec<RuleSelector>>,
+-    pub extend_ignore: Option<Vec<RuleSelector>>,
+-    pub extend_select: Option<Vec<RuleSelector>>,
+-    pub extend_unfixable: Option<Vec<RuleSelector>>,
+-    pub fixable: Option<Vec<RuleSelector>>,
+-    pub ignore: Option<Vec<RuleSelector>>,
+-    pub line_length: Option<LineLength>,
+-    pub per_file_ignores: Option<Vec<PatternPrefixPair>>,
+-    pub extend_per_file_ignores: Option<Vec<PatternPrefixPair>>,
+-    pub preview: Option<PreviewMode>,
+-    pub respect_gitignore: Option<bool>,
+-    pub select: Option<Vec<RuleSelector>>,
+-    pub target_version: Option<PythonVersion>,
+-    pub unfixable: Option<Vec<RuleSelector>>,
++struct ExplicitConfigOverrides {
++    dummy_variable_rgx: Option<Regex>,
++    exclude: Option<Vec<FilePattern>>,
++    extend_exclude: Option<Vec<FilePattern>>,
++    extend_fixable: Option<Vec<RuleSelector>>,
++    extend_ignore: Option<Vec<RuleSelector>>,
++    extend_select: Option<Vec<RuleSelector>>,
++    extend_unfixable: Option<Vec<RuleSelector>>,
++    fixable: Option<Vec<RuleSelector>>,
++    ignore: Option<Vec<RuleSelector>>,
++    line_length: Option<LineLength>,
++    per_file_ignores: Option<Vec<PatternPrefixPair>>,
++    extend_per_file_ignores: Option<Vec<PatternPrefixPair>>,
++    preview: Option<PreviewMode>,
++    respect_gitignore: Option<bool>,
++    select: Option<Vec<RuleSelector>>,
++    target_version: Option<PythonVersion>,
++    unfixable: Option<Vec<RuleSelector>>,
+     // TODO(charlie): Captured in pyproject.toml as a default, but not part of `Settings`.
+-    pub cache_dir: Option<PathBuf>,
+-    pub fix: Option<bool>,
+-    pub fix_only: Option<bool>,
+-    pub unsafe_fixes: Option<UnsafeFixes>,
+-    pub force_exclude: Option<bool>,
+-    pub output_format: Option<SerializationFormat>,
+-    pub show_fixes: Option<bool>,
+-    pub extension: Option<Vec<ExtensionPair>>,
++    cache_dir: Option<PathBuf>,
++    fix: Option<bool>,
++    fix_only: Option<bool>,
++    unsafe_fixes: Option<UnsafeFixes>,
++    force_exclude: Option<bool>,
++    output_format: Option<SerializationFormat>,
++    show_fixes: Option<bool>,
++    extension: Option<Vec<ExtensionPair>>,
+ }
+ 
+-impl ConfigurationTransformer for CliOverrides {
++impl ConfigurationTransformer for ExplicitConfigOverrides {
+     fn transform(&self, mut config: Configuration) -> Configuration {
+         if let Some(cache_dir) = &self.cache_dir {
+             config.cache_dir = Some(cache_dir.clone());
+diff --git a/crates/ruff/src/commands/add_noqa.rs b/crates/ruff/src/commands/add_noqa.rs
+index 4767e8c490..48975f6b41 100644
+--- a/crates/ruff/src/commands/add_noqa.rs
++++ b/crates/ruff/src/commands/add_noqa.rs
+@@ -12,17 +12,17 @@ use ruff_linter::warn_user_once;
+ use ruff_python_ast::{PySourceType, SourceType};
+ use ruff_workspace::resolver::{python_files_in_path, PyprojectConfig, ResolvedFile};
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ 
+ /// Add `noqa` directives to a collection of files.
+ pub(crate) fn add_noqa(
+     files: &[PathBuf],
+     pyproject_config: &PyprojectConfig,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+ ) -> Result<usize> {
+     // Collect all the files to check.
+     let start = Instant::now();
+-    let (paths, resolver) = python_files_in_path(files, pyproject_config, overrides)?;
++    let (paths, resolver) = python_files_in_path(files, pyproject_config, config_arguments)?;
+     let duration = start.elapsed();
+     debug!("Identified files to lint in: {:?}", duration);
+ 
+diff --git a/crates/ruff/src/commands/check.rs b/crates/ruff/src/commands/check.rs
+index 71e38c5988..18101d7757 100644
+--- a/crates/ruff/src/commands/check.rs
++++ b/crates/ruff/src/commands/check.rs
+@@ -24,7 +24,7 @@ use ruff_workspace::resolver::{
+     match_exclusion, python_files_in_path, PyprojectConfig, ResolvedFile,
+ };
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ use crate::cache::{Cache, PackageCacheMap, PackageCaches};
+ use crate::diagnostics::Diagnostics;
+ use crate::panic::catch_unwind;
+@@ -34,7 +34,7 @@ use crate::panic::catch_unwind;
+ pub(crate) fn check(
+     files: &[PathBuf],
+     pyproject_config: &PyprojectConfig,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+     cache: flags::Cache,
+     noqa: flags::Noqa,
+     fix_mode: flags::FixMode,
+@@ -42,7 +42,7 @@ pub(crate) fn check(
+ ) -> Result<Diagnostics> {
+     // Collect all the Python files to check.
+     let start = Instant::now();
+-    let (paths, resolver) = python_files_in_path(files, pyproject_config, overrides)?;
++    let (paths, resolver) = python_files_in_path(files, pyproject_config, config_arguments)?;
+     debug!("Identified files to lint in: {:?}", start.elapsed());
+ 
+     if paths.is_empty() {
+@@ -233,7 +233,7 @@ mod test {
+     use ruff_workspace::resolver::{PyprojectConfig, PyprojectDiscoveryStrategy};
+     use ruff_workspace::Settings;
+ 
+-    use crate::args::CliOverrides;
++    use crate::args::ConfigArguments;
+ 
+     use super::check;
+ 
+@@ -272,7 +272,7 @@ mod test {
+             // Notebooks are not included by default
+             &[tempdir.path().to_path_buf(), notebook],
+             &pyproject_config,
+-            &CliOverrides::default(),
++            &ConfigArguments::default(),
+             flags::Cache::Disabled,
+             flags::Noqa::Disabled,
+             flags::FixMode::Generate,
+diff --git a/crates/ruff/src/commands/check_stdin.rs b/crates/ruff/src/commands/check_stdin.rs
+index 0471edd378..d300dd4c2a 100644
+--- a/crates/ruff/src/commands/check_stdin.rs
++++ b/crates/ruff/src/commands/check_stdin.rs
+@@ -6,7 +6,7 @@ use ruff_linter::packaging;
+ use ruff_linter::settings::flags;
+ use ruff_workspace::resolver::{match_exclusion, python_file_at_path, PyprojectConfig, Resolver};
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ use crate::diagnostics::{lint_stdin, Diagnostics};
+ use crate::stdin::{parrot_stdin, read_from_stdin};
+ 
+@@ -14,7 +14,7 @@ use crate::stdin::{parrot_stdin, read_from_stdin};
+ pub(crate) fn check_stdin(
+     filename: Option<&Path>,
+     pyproject_config: &PyprojectConfig,
+-    overrides: &CliOverrides,
++    overrides: &ConfigArguments,
+     noqa: flags::Noqa,
+     fix_mode: flags::FixMode,
+ ) -> Result<Diagnostics> {
+diff --git a/crates/ruff/src/commands/format.rs b/crates/ruff/src/commands/format.rs
+index 8f719ad07e..f760ec96a1 100644
+--- a/crates/ruff/src/commands/format.rs
++++ b/crates/ruff/src/commands/format.rs
+@@ -29,7 +29,7 @@ use ruff_text_size::{TextLen, TextRange, TextSize};
+ use ruff_workspace::resolver::{match_exclusion, python_files_in_path, ResolvedFile, Resolver};
+ use ruff_workspace::FormatterSettings;
+ 
+-use crate::args::{CliOverrides, FormatArguments, FormatRange};
++use crate::args::{ConfigArguments, FormatArguments, FormatRange};
+ use crate::cache::{Cache, FileCacheKey, PackageCacheMap, PackageCaches};
+ use crate::panic::{catch_unwind, PanicError};
+ use crate::resolve::resolve;
+@@ -60,18 +60,17 @@ impl FormatMode {
+ /// Format a set of files, and return the exit status.
+ pub(crate) fn format(
+     cli: FormatArguments,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+     log_level: LogLevel,
+ ) -> Result<ExitStatus> {
+     let pyproject_config = resolve(
+         cli.isolated,
+-        cli.config.as_deref(),
+-        overrides,
++        config_arguments,
+         cli.stdin_filename.as_deref(),
+     )?;
+     let mode = FormatMode::from_cli(&cli);
+     let files = resolve_default_files(cli.files, false);
+-    let (paths, resolver) = python_files_in_path(&files, &pyproject_config, overrides)?;
++    let (paths, resolver) = python_files_in_path(&files, &pyproject_config, config_arguments)?;
+ 
+     if paths.is_empty() {
+         warn_user_once!("No Python files found under the given path(s)");
+diff --git a/crates/ruff/src/commands/format_stdin.rs b/crates/ruff/src/commands/format_stdin.rs
+index 9f4a05313f..f23b459c3a 100644
+--- a/crates/ruff/src/commands/format_stdin.rs
++++ b/crates/ruff/src/commands/format_stdin.rs
+@@ -9,7 +9,7 @@ use ruff_python_ast::{PySourceType, SourceType};
+ use ruff_workspace::resolver::{match_exclusion, python_file_at_path, Resolver};
+ use ruff_workspace::FormatterSettings;
+ 
+-use crate::args::{CliOverrides, FormatArguments, FormatRange};
++use crate::args::{ConfigArguments, FormatArguments, FormatRange};
+ use crate::commands::format::{
+     format_source, warn_incompatible_formatter_settings, FormatCommandError, FormatMode,
+     FormatResult, FormattedSource,
+@@ -19,11 +19,13 @@ use crate::stdin::{parrot_stdin, read_from_stdin};
+ use crate::ExitStatus;
+ 
+ /// Run the formatter over a single file, read from `stdin`.
+-pub(crate) fn format_stdin(cli: &FormatArguments, overrides: &CliOverrides) -> Result<ExitStatus> {
++pub(crate) fn format_stdin(
++    cli: &FormatArguments,
++    config_arguments: &ConfigArguments,
++) -> Result<ExitStatus> {
+     let pyproject_config = resolve(
+         cli.isolated,
+-        cli.config.as_deref(),
+-        overrides,
++        config_arguments,
+         cli.stdin_filename.as_deref(),
+     )?;
+ 
+@@ -34,7 +36,7 @@ pub(crate) fn format_stdin(cli: &FormatArguments, overrides: &CliOverrides) -> R
+ 
+     if resolver.force_exclude() {
+         if let Some(filename) = cli.stdin_filename.as_deref() {
+-            if !python_file_at_path(filename, &mut resolver, overrides)? {
++            if !python_file_at_path(filename, &mut resolver, config_arguments)? {
+                 if mode.is_write() {
+                     parrot_stdin()?;
+                 }
+diff --git a/crates/ruff/src/commands/show_files.rs b/crates/ruff/src/commands/show_files.rs
+index 201c97f75d..f21a9aa943 100644
+--- a/crates/ruff/src/commands/show_files.rs
++++ b/crates/ruff/src/commands/show_files.rs
+@@ -7,17 +7,17 @@ use itertools::Itertools;
+ use ruff_linter::warn_user_once;
+ use ruff_workspace::resolver::{python_files_in_path, PyprojectConfig, ResolvedFile};
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ 
+ /// Show the list of files to be checked based on current settings.
+ pub(crate) fn show_files(
+     files: &[PathBuf],
+     pyproject_config: &PyprojectConfig,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+     writer: &mut impl Write,
+ ) -> Result<()> {
+     // Collect all files in the hierarchy.
+-    let (paths, _resolver) = python_files_in_path(files, pyproject_config, overrides)?;
++    let (paths, _resolver) = python_files_in_path(files, pyproject_config, config_arguments)?;
+ 
+     if paths.is_empty() {
+         warn_user_once!("No Python files found under the given path(s)");
+diff --git a/crates/ruff/src/commands/show_settings.rs b/crates/ruff/src/commands/show_settings.rs
+index 12d275eb65..679c2733df 100644
+--- a/crates/ruff/src/commands/show_settings.rs
++++ b/crates/ruff/src/commands/show_settings.rs
+@@ -6,17 +6,17 @@ use itertools::Itertools;
+ 
+ use ruff_workspace::resolver::{python_files_in_path, PyprojectConfig, ResolvedFile};
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ 
+ /// Print the user-facing configuration settings.
+ pub(crate) fn show_settings(
+     files: &[PathBuf],
+     pyproject_config: &PyprojectConfig,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+     writer: &mut impl Write,
+ ) -> Result<()> {
+     // Collect all files in the hierarchy.
+-    let (paths, resolver) = python_files_in_path(files, pyproject_config, overrides)?;
++    let (paths, resolver) = python_files_in_path(files, pyproject_config, config_arguments)?;
+ 
+     // Print the list of files.
+     let Some(path) = paths
+diff --git a/crates/ruff/src/lib.rs b/crates/ruff/src/lib.rs
+index 303703ad6b..f2414af7b9 100644
+--- a/crates/ruff/src/lib.rs
++++ b/crates/ruff/src/lib.rs
+@@ -204,24 +204,23 @@ pub fn run(
+ }
+ 
+ fn format(args: FormatCommand, log_level: LogLevel) -> Result<ExitStatus> {
+-    let (cli, overrides) = args.partition();
++    let (cli, config_arguments) = args.partition()?;
+ 
+     if is_stdin(&cli.files, cli.stdin_filename.as_deref()) {
+-        commands::format_stdin::format_stdin(&cli, &overrides)
++        commands::format_stdin::format_stdin(&cli, &config_arguments)
+     } else {
+-        commands::format::format(cli, &overrides, log_level)
++        commands::format::format(cli, &config_arguments, log_level)
+     }
+ }
+ 
+ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+-    let (cli, overrides) = args.partition();
++    let (cli, config_arguments) = args.partition()?;
+ 
+     // Construct the "default" settings. These are used when no `pyproject.toml`
+     // files are present, or files are injected from outside of the hierarchy.
+     let pyproject_config = resolve::resolve(
+         cli.isolated,
+-        cli.config.as_deref(),
+-        &overrides,
++        &config_arguments,
+         cli.stdin_filename.as_deref(),
+     )?;
+ 
+@@ -239,11 +238,21 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+     let files = resolve_default_files(cli.files, is_stdin);
+ 
+     if cli.show_settings {
+-        commands::show_settings::show_settings(&files, &pyproject_config, &overrides, &mut writer)?;
++        commands::show_settings::show_settings(
++            &files,
++            &pyproject_config,
++            &config_arguments,
++            &mut writer,
++        )?;
+         return Ok(ExitStatus::Success);
+     }
+     if cli.show_files {
+-        commands::show_files::show_files(&files, &pyproject_config, &overrides, &mut writer)?;
++        commands::show_files::show_files(
++            &files,
++            &pyproject_config,
++            &config_arguments,
++            &mut writer,
++        )?;
+         return Ok(ExitStatus::Success);
+     }
+ 
+@@ -302,7 +311,8 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+         if !fix_mode.is_generate() {
+             warn_user!("--fix is incompatible with --add-noqa.");
+         }
+-        let modifications = commands::add_noqa::add_noqa(&files, &pyproject_config, &overrides)?;
++        let modifications =
++            commands::add_noqa::add_noqa(&files, &pyproject_config, &config_arguments)?;
+         if modifications > 0 && log_level >= LogLevel::Default {
+             let s = if modifications == 1 { "" } else { "s" };
+             #[allow(clippy::print_stderr)]
+@@ -352,7 +362,7 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+         let messages = commands::check::check(
+             &files,
+             &pyproject_config,
+-            &overrides,
++            &config_arguments,
+             cache.into(),
+             noqa.into(),
+             fix_mode,
+@@ -374,8 +384,7 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+                     if matches!(change_kind, ChangeKind::Configuration) {
+                         pyproject_config = resolve::resolve(
+                             cli.isolated,
+-                            cli.config.as_deref(),
+-                            &overrides,
++                            &config_arguments,
+                             cli.stdin_filename.as_deref(),
+                         )?;
+                     }
+@@ -385,7 +394,7 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+                     let messages = commands::check::check(
+                         &files,
+                         &pyproject_config,
+-                        &overrides,
++                        &config_arguments,
+                         cache.into(),
+                         noqa.into(),
+                         fix_mode,
+@@ -402,7 +411,7 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+             commands::check_stdin::check_stdin(
+                 cli.stdin_filename.map(fs::normalize_path).as_deref(),
+                 &pyproject_config,
+-                &overrides,
++                &config_arguments,
+                 noqa.into(),
+                 fix_mode,
+             )?
+@@ -410,7 +419,7 @@ pub fn check(args: CheckCommand, log_level: LogLevel) -> Result<ExitStatus> {
+             commands::check::check(
+                 &files,
+                 &pyproject_config,
+-                &overrides,
++                &config_arguments,
+                 cache.into(),
+                 noqa.into(),
+                 fix_mode,
+diff --git a/crates/ruff/src/resolve.rs b/crates/ruff/src/resolve.rs
+index 9c8f159c31..a645583d08 100644
+--- a/crates/ruff/src/resolve.rs
++++ b/crates/ruff/src/resolve.rs
+@@ -11,19 +11,18 @@ use ruff_workspace::resolver::{
+     Relativity,
+ };
+ 
+-use crate::args::CliOverrides;
++use crate::args::ConfigArguments;
+ 
+ /// Resolve the relevant settings strategy and defaults for the current
+ /// invocation.
+ pub fn resolve(
+     isolated: bool,
+-    config: Option<&Path>,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+     stdin_filename: Option<&Path>,
+ ) -> Result<PyprojectConfig> {
+     // First priority: if we're running in isolated mode, use the default settings.
+     if isolated {
+-        let config = overrides.transform(Configuration::default());
++        let config = config_arguments.transform(Configuration::default());
+         let settings = config.into_settings(&path_dedot::CWD)?;
+         debug!("Isolated mode, not reading any pyproject.toml");
+         return Ok(PyprojectConfig::new(
+@@ -36,12 +35,13 @@ pub fn resolve(
+     // Second priority: the user specified a `pyproject.toml` file. Use that
+     // `pyproject.toml` for _all_ configuration, and resolve paths relative to the
+     // current working directory. (This matches ESLint's behavior.)
+-    if let Some(pyproject) = config
++    if let Some(pyproject) = config_arguments
++        .config_file()
+         .map(|config| config.display().to_string())
+         .map(|config| shellexpand::full(&config).map(|config| PathBuf::from(config.as_ref())))
+         .transpose()?
+     {
+-        let settings = resolve_root_settings(&pyproject, Relativity::Cwd, overrides)?;
++        let settings = resolve_root_settings(&pyproject, Relativity::Cwd, config_arguments)?;
+         debug!(
+             "Using user-specified configuration file at: {}",
+             pyproject.display()
+@@ -67,7 +67,7 @@ pub fn resolve(
+             "Using configuration file (via parent) at: {}",
+             pyproject.display()
+         );
+-        let settings = resolve_root_settings(&pyproject, Relativity::Parent, overrides)?;
++        let settings = resolve_root_settings(&pyproject, Relativity::Parent, config_arguments)?;
+         return Ok(PyprojectConfig::new(
+             PyprojectDiscoveryStrategy::Hierarchical,
+             settings,
+@@ -84,7 +84,7 @@ pub fn resolve(
+             "Using configuration file (via cwd) at: {}",
+             pyproject.display()
+         );
+-        let settings = resolve_root_settings(&pyproject, Relativity::Cwd, overrides)?;
++        let settings = resolve_root_settings(&pyproject, Relativity::Cwd, config_arguments)?;
+         return Ok(PyprojectConfig::new(
+             PyprojectDiscoveryStrategy::Hierarchical,
+             settings,
+@@ -97,7 +97,7 @@ pub fn resolve(
+     // "closest" `pyproject.toml` file for every Python file later on, so these act
+     // as the "default" settings.)
+     debug!("Using Ruff default settings");
+-    let config = overrides.transform(Configuration::default());
++    let config = config_arguments.transform(Configuration::default());
+     let settings = config.into_settings(&path_dedot::CWD)?;
+     Ok(PyprojectConfig::new(
+         PyprojectDiscoveryStrategy::Hierarchical,
+diff --git a/crates/ruff/tests/format.rs b/crates/ruff/tests/format.rs
+index 59c2149fc9..c04eb21db4 100644
+--- a/crates/ruff/tests/format.rs
++++ b/crates/ruff/tests/format.rs
+@@ -90,6 +90,179 @@ fn format_warn_stdin_filename_with_files() {
+     "###);
+ }
+ 
++#[test]
++fn nonexistent_config_file() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(["format", "--config", "foo.toml", "."]), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'foo.toml' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    It looks like you were trying to pass a path to a configuration file.
++    The path `foo.toml` does not exist
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn config_override_rejected_if_invalid_toml() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(["format", "--config", "foo = bar", "."]), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'foo = bar' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    The supplied argument is not valid TOML:
++
++    TOML parse error at line 1, column 7
++      |
++    1 | foo = bar
++      |       ^
++    invalid string
++    expected `"`, `'`
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn too_many_config_files() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_dot_toml = tempdir.path().join("ruff.toml");
++    let ruff2_dot_toml = tempdir.path().join("ruff2.toml");
++    fs::File::create(&ruff_dot_toml)?;
++    fs::File::create(&ruff2_dot_toml)?;
++    let expected_stderr = format!(
++        "\
++ruff failed
++  Cause: You cannot specify more than one configuration file on the command line.
++
++  tip: remove either `--config={}` or `--config={}`.
++       For more information, try `--help`.
++
++",
++        ruff_dot_toml.display(),
++        ruff2_dot_toml.display(),
++    );
++    let cmd = Command::new(get_cargo_bin(BIN_NAME))
++        .arg("format")
++        .arg("--config")
++        .arg(&ruff_dot_toml)
++        .arg("--config")
++        .arg(&ruff2_dot_toml)
++        .arg(".")
++        .output()?;
++    let stderr = std::str::from_utf8(&cmd.stderr)?;
++    assert_eq!(stderr, expected_stderr);
++    Ok(())
++}
++
++#[test]
++fn config_file_and_isolated() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_dot_toml = tempdir.path().join("ruff.toml");
++    fs::File::create(&ruff_dot_toml)?;
++    let expected_stderr = format!(
++        "\
++ruff failed
++  Cause: The argument `--config={}` cannot be used with `--isolated`
++
++  tip: You cannot specify a configuration file and also specify `--isolated`,
++       as `--isolated` causes ruff to ignore all configuration files.
++       For more information, try `--help`.
++
++",
++        ruff_dot_toml.display(),
++    );
++    let cmd = Command::new(get_cargo_bin(BIN_NAME))
++        .arg("format")
++        .arg("--config")
++        .arg(&ruff_dot_toml)
++        .arg("--isolated")
++        .arg(".")
++        .output()?;
++    let stderr = std::str::from_utf8(&cmd.stderr)?;
++    assert_eq!(stderr, expected_stderr);
++    Ok(())
++}
++
++#[test]
++fn config_override_via_cli() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_toml = tempdir.path().join("ruff.toml");
++    fs::write(&ruff_toml, "line-length = 100")?;
++    let fixture = r#"
++def foo():
++    print("looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong string")
++
++    "#;
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .arg("format")
++        .arg("--config")
++        .arg(&ruff_toml)
++        // This overrides the long line length set in the config file
++        .args(["--config", "line-length=80"])
++        .arg("-")
++        .pass_stdin(fixture), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    def foo():
++        print(
++            "looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong string"
++        )
++
++    ----- stderr -----
++    "###);
++    Ok(())
++}
++
++#[test]
++fn config_doubly_overridden_via_cli() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_toml = tempdir.path().join("ruff.toml");
++    fs::write(&ruff_toml, "line-length = 70")?;
++    let fixture = r#"
++def foo():
++    print("looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong string")
++
++    "#;
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .arg("format")
++        .arg("--config")
++        .arg(&ruff_toml)
++        // This overrides the long line length set in the config file...
++        .args(["--config", "line-length=80"])
++        // ...but this overrides them both:
++        .args(["--line-length", "100"])
++        .arg("-")
++        .pass_stdin(fixture), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++    def foo():
++        print("looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong string")
++
++    ----- stderr -----
++    "###);
++    Ok(())
++}
++
+ #[test]
+ fn format_options() -> Result<()> {
+     let tempdir = TempDir::new()?;
+diff --git a/crates/ruff/tests/lint.rs b/crates/ruff/tests/lint.rs
+index 7bafd0b129..badfb07cb1 100644
+--- a/crates/ruff/tests/lint.rs
++++ b/crates/ruff/tests/lint.rs
+@@ -510,6 +510,341 @@ ignore = ["D203", "D212"]
+     Ok(())
+ }
+ 
++#[test]
++fn nonexistent_config_file() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .args(["--config", "foo.toml", "."]), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'foo.toml' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    It looks like you were trying to pass a path to a configuration file.
++    The path `foo.toml` does not exist
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn config_override_rejected_if_invalid_toml() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .args(["--config", "foo = bar", "."]), @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'foo = bar' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    The supplied argument is not valid TOML:
++
++    TOML parse error at line 1, column 7
++      |
++    1 | foo = bar
++      |       ^
++    invalid string
++    expected `"`, `'`
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn too_many_config_files() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_dot_toml = tempdir.path().join("ruff.toml");
++    let ruff2_dot_toml = tempdir.path().join("ruff2.toml");
++    fs::File::create(&ruff_dot_toml)?;
++    fs::File::create(&ruff2_dot_toml)?;
++    insta::with_settings!({
++        filters => vec![(tempdir_filter(&tempdir).as_str(), "[TMP]/")]
++    }, {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .arg("--config")
++        .arg(&ruff_dot_toml)
++        .arg("--config")
++        .arg(&ruff2_dot_toml)
++        .arg("."), @r###"
++        success: false
++        exit_code: 2
++        ----- stdout -----
++
++        ----- stderr -----
++        ruff failed
++          Cause: You cannot specify more than one configuration file on the command line.
++
++          tip: remove either `--config=[TMP]/ruff.toml` or `--config=[TMP]/ruff2.toml`.
++               For more information, try `--help`.
++
++        "###);
++    });
++    Ok(())
++}
++
++#[test]
++fn config_file_and_isolated() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_dot_toml = tempdir.path().join("ruff.toml");
++    fs::File::create(&ruff_dot_toml)?;
++    insta::with_settings!({
++        filters => vec![(tempdir_filter(&tempdir).as_str(), "[TMP]/")]
++    }, {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .arg("--config")
++        .arg(&ruff_dot_toml)
++        .arg("--isolated")
++        .arg("."), @r###"
++        success: false
++        exit_code: 2
++        ----- stdout -----
++
++        ----- stderr -----
++        ruff failed
++          Cause: The argument `--config=[TMP]/ruff.toml` cannot be used with `--isolated`
++
++          tip: You cannot specify a configuration file and also specify `--isolated`,
++               as `--isolated` causes ruff to ignore all configuration files.
++               For more information, try `--help`.
++
++        "###);
++    });
++    Ok(())
++}
++
++#[test]
++fn config_override_via_cli() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_toml = tempdir.path().join("ruff.toml");
++    fs::write(
++        &ruff_toml,
++        r#"
++line-length = 100
++
++[lint]
++select = ["I"]
++
++[lint.isort]
++combine-as-imports = true
++        "#,
++    )?;
++    let fixture = r#"
++from foo import (
++    aaaaaaaaaaaaaaaaaaa,
++    bbbbbbbbbbb as bbbbbbbbbbbbbbbb,
++    cccccccccccccccc,
++    ddddddddddd as ddddddddddddd,
++    eeeeeeeeeeeeeee,
++    ffffffffffff as ffffffffffffff,
++    ggggggggggggg,
++    hhhhhhh as hhhhhhhhhhh,
++    iiiiiiiiiiiiii,
++    jjjjjjjjjjjjj as jjjjjj,
++)
++
++x = "longer_than_90_charactersssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
++"#;
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .arg("--config")
++        .arg(&ruff_toml)
++        .args(["--config", "line-length=90"])
++        .args(["--config", "lint.extend-select=['E501', 'F841']"])
++        .args(["--config", "lint.isort.combine-as-imports = false"])
++        .arg("-")
++        .pass_stdin(fixture), @r###"
++    success: false
++    exit_code: 1
++    ----- stdout -----
++    -:2:1: I001 [*] Import block is un-sorted or un-formatted
++    -:15:91: E501 Line too long (97 > 90)
++    Found 2 errors.
++    [*] 1 fixable with the `--fix` option.
++
++    ----- stderr -----
++    "###);
++    Ok(())
++}
++
++#[test]
++fn valid_toml_but_nonexistent_option_provided_via_config_argument() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .args([".", "--config", "extend-select=['F481']"]),  // No such code as F481!
++        @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'extend-select=['F481']' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    Could not parse the supplied argument as a `ruff.toml` configuration option:
++
++    Unknown rule selector: `F481`
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn each_toml_option_requires_a_new_flag_1() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        // commas can't be used to delimit different config overrides;
++        // you need a new --config flag for each override
++        .args([".", "--config", "extend-select=['F841'], line-length=90"]),
++        @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'extend-select=['F841'], line-length=90' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    The supplied argument is not valid TOML:
++
++    TOML parse error at line 1, column 23
++      |
++    1 | extend-select=['F841'], line-length=90
++      |                       ^
++    expected newline, `#`
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn each_toml_option_requires_a_new_flag_2() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        // spaces *also* can't be used to delimit different config overrides;
++        // you need a new --config flag for each override
++        .args([".", "--config", "extend-select=['F841'] line-length=90"]),
++        @r###"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    error: invalid value 'extend-select=['F841'] line-length=90' for '--config <CONFIG_OPTION>'
++
++      tip: A `--config` flag must either be a path to a `.toml` configuration file
++           or a TOML `<KEY> = <VALUE>` pair overriding a specific configuration
++           option
++
++    The supplied argument is not valid TOML:
++
++    TOML parse error at line 1, column 24
++      |
++    1 | extend-select=['F841'] line-length=90
++      |                        ^
++    expected newline, `#`
++
++    For more information, try '--help'.
++    "###);
++}
++
++#[test]
++fn config_doubly_overridden_via_cli() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_toml = tempdir.path().join("ruff.toml");
++    fs::write(
++        &ruff_toml,
++        r#"
++line-length = 100
++
++[lint]
++select=["E501"]
++"#,
++    )?;
++    let fixture = "x = 'longer_than_90_charactersssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss'";
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        // The --line-length flag takes priority over both the config file
++        // and the `--config="line-length=110"` flag,
++        // despite them both being specified after this flag on the command line:
++        .args(["--line-length", "90"])
++        .arg("--config")
++        .arg(&ruff_toml)
++        .args(["--config", "line-length=110"])
++        .arg("-")
++        .pass_stdin(fixture), @r###"
++    success: false
++    exit_code: 1
++    ----- stdout -----
++    -:1:91: E501 Line too long (97 > 90)
++    Found 1 error.
++
++    ----- stderr -----
++    "###);
++    Ok(())
++}
++
++#[test]
++fn complex_config_setting_overridden_via_cli() -> Result<()> {
++    let tempdir = TempDir::new()?;
++    let ruff_toml = tempdir.path().join("ruff.toml");
++    fs::write(&ruff_toml, "lint.select = ['N801']")?;
++    let fixture = "class violates_n801: pass";
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .arg("--config")
++        .arg(&ruff_toml)
++        .args(["--config", "lint.per-file-ignores = {'generated.py' = ['N801']}"])
++        .args(["--stdin-filename", "generated.py"])
++        .arg("-")
++        .pass_stdin(fixture), @r###"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    "###);
++    Ok(())
++}
++
++#[test]
++fn deprecated_config_option_overridden_via_cli() {
++    assert_cmd_snapshot!(Command::new(get_cargo_bin(BIN_NAME))
++        .args(STDIN_BASE_OPTIONS)
++        .args(["--config", "select=['N801']", "-"])
++        .pass_stdin("class lowercase: ..."),
++        @r###"
++    success: false
++    exit_code: 1
++    ----- stdout -----
++    -:1:7: N801 Class name `lowercase` should use CapWords convention 
++    Found 1 error.
++
++    ----- stderr -----
++    warning: The top-level linter settings are deprecated in favour of their counterparts in the `lint` section. Please update the following options in your `--config` CLI arguments:
++      - 'select' -> 'lint.select'
++    "###);
++}
++
+ #[test]
+ fn extension() -> Result<()> {
+     let tempdir = TempDir::new()?;
+diff --git a/crates/ruff_dev/src/format_dev.rs b/crates/ruff_dev/src/format_dev.rs
+index e692d0ecee..b09f679bcf 100644
+--- a/crates/ruff_dev/src/format_dev.rs
++++ b/crates/ruff_dev/src/format_dev.rs
+@@ -27,7 +27,7 @@ use tracing_subscriber::layer::SubscriberExt;
+ use tracing_subscriber::util::SubscriberInitExt;
+ use tracing_subscriber::EnvFilter;
+ 
+-use ruff::args::{CliOverrides, FormatArguments, FormatCommand, LogLevelArgs};
++use ruff::args::{ConfigArguments, FormatArguments, FormatCommand, LogLevelArgs};
+ use ruff::resolve::resolve;
+ use ruff_formatter::{FormatError, LineWidth, PrintError};
+ use ruff_linter::logging::LogLevel;
+@@ -38,24 +38,23 @@ use ruff_python_formatter::{
+ use ruff_python_parser::ParseError;
+ use ruff_workspace::resolver::{python_files_in_path, PyprojectConfig, ResolvedFile, Resolver};
+ 
+-fn parse_cli(dirs: &[PathBuf]) -> anyhow::Result<(FormatArguments, CliOverrides)> {
++fn parse_cli(dirs: &[PathBuf]) -> anyhow::Result<(FormatArguments, ConfigArguments)> {
+     let args_matches = FormatCommand::command()
+         .no_binary_name(true)
+         .get_matches_from(dirs);
+     let arguments: FormatCommand = FormatCommand::from_arg_matches(&args_matches)?;
+-    let (cli, overrides) = arguments.partition();
+-    Ok((cli, overrides))
++    let (cli, config_arguments) = arguments.partition()?;
++    Ok((cli, config_arguments))
+ }
+ 
+ /// Find the [`PyprojectConfig`] to use for formatting.
+ fn find_pyproject_config(
+     cli: &FormatArguments,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+ ) -> anyhow::Result<PyprojectConfig> {
+     let mut pyproject_config = resolve(
+         cli.isolated,
+-        cli.config.as_deref(),
+-        overrides,
++        config_arguments,
+         cli.stdin_filename.as_deref(),
+     )?;
+     // We don't want to format pyproject.toml
+@@ -72,9 +71,9 @@ fn find_pyproject_config(
+ fn ruff_check_paths<'a>(
+     pyproject_config: &'a PyprojectConfig,
+     cli: &FormatArguments,
+-    overrides: &CliOverrides,
++    config_arguments: &ConfigArguments,
+ ) -> anyhow::Result<(Vec<Result<ResolvedFile, ignore::Error>>, Resolver<'a>)> {
+-    let (paths, resolver) = python_files_in_path(&cli.files, pyproject_config, overrides)?;
++    let (paths, resolver) = python_files_in_path(&cli.files, pyproject_config, config_arguments)?;
+     Ok((paths, resolver))
+ }
+ 
+diff --git a/crates/ruff_linter/src/settings/types.rs b/crates/ruff_linter/src/settings/types.rs
+index d2106e351e..f527a00c8d 100644
+--- a/crates/ruff_linter/src/settings/types.rs
++++ b/crates/ruff_linter/src/settings/types.rs
+@@ -534,7 +534,7 @@ impl SerializationFormat {
+     }
+ }
+ 
+-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+ #[serde(try_from = "String")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+ pub struct Version(String);
+diff --git a/crates/ruff_wasm/src/lib.rs b/crates/ruff_wasm/src/lib.rs
+index cb18b337b3..c7a0d269db 100644
+--- a/crates/ruff_wasm/src/lib.rs
++++ b/crates/ruff_wasm/src/lib.rs
+@@ -108,8 +108,9 @@ impl Workspace {
+     #[wasm_bindgen(constructor)]
+     pub fn new(options: JsValue) -> Result<Workspace, Error> {
+         let options: Options = serde_wasm_bindgen::from_value(options).map_err(into_error)?;
+-        let configuration = Configuration::from_options(options, Path::new("."), Path::new("."))
+-            .map_err(into_error)?;
++        let configuration =
++            Configuration::from_options(options, Some(Path::new(".")), Path::new("."))
++                .map_err(into_error)?;
+         let settings = configuration
+             .into_settings(Path::new("."))
+             .map_err(into_error)?;
+diff --git a/crates/ruff_workspace/src/configuration.rs b/crates/ruff_workspace/src/configuration.rs
+index c41006b09e..dac4e14387 100644
+--- a/crates/ruff_workspace/src/configuration.rs
++++ b/crates/ruff_workspace/src/configuration.rs
+@@ -51,7 +51,7 @@ use crate::settings::{
+     FileResolverSettings, FormatterSettings, LineEnding, Settings, EXCLUDE, INCLUDE,
+ };
+ 
+-#[derive(Debug, Default)]
++#[derive(Clone, Debug, Default)]
+ pub struct RuleSelection {
+     pub select: Option<Vec<RuleSelector>>,
+     pub ignore: Vec<RuleSelector>,
+@@ -106,7 +106,7 @@ impl RuleSelection {
+     }
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Debug, Default, Clone)]
+ pub struct Configuration {
+     // Global options
+     pub cache_dir: Option<PathBuf>,
+@@ -397,7 +397,13 @@ impl Configuration {
+     }
+ 
+     /// Convert the [`Options`] read from the given [`Path`] into a [`Configuration`].
+-    pub fn from_options(options: Options, path: &Path, project_root: &Path) -> Result<Self> {
++    /// If `None` is supplied for `path`, it indicates that the `Options` instance
++    /// was created via "inline TOML" from the `--config` flag
++    pub fn from_options(
++        options: Options,
++        path: Option<&Path>,
++        project_root: &Path,
++    ) -> Result<Self> {
+         warn_about_deprecated_top_level_lint_options(&options.lint_top_level.0, path);
+ 
+         let lint = if let Some(mut lint) = options.lint {
+@@ -578,7 +584,7 @@ impl Configuration {
+     }
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Clone, Debug, Default)]
+ pub struct LintConfiguration {
+     pub exclude: Option<Vec<FilePattern>>,
+     pub preview: Option<PreviewMode>,
+@@ -1155,7 +1161,7 @@ impl LintConfiguration {
+     }
+ }
+ 
+-#[derive(Debug, Default)]
++#[derive(Clone, Debug, Default)]
+ pub struct FormatConfiguration {
+     pub exclude: Option<Vec<FilePattern>>,
+     pub preview: Option<PreviewMode>,
+@@ -1263,7 +1269,7 @@ pub fn resolve_src(src: &[String], project_root: &Path) -> Result<Vec<PathBuf>>
+ 
+ fn warn_about_deprecated_top_level_lint_options(
+     top_level_options: &LintCommonOptions,
+-    path: &Path,
++    path: Option<&Path>,
+ ) {
+     let mut used_options = Vec::new();
+ 
+@@ -1454,9 +1460,14 @@ fn warn_about_deprecated_top_level_lint_options(
+         .map(|option| format!("- '{option}' -> 'lint.{option}'"))
+         .join("\n  ");
+ 
++    let thing_to_update = path.map_or_else(
++        || String::from("your `--config` CLI arguments"),
++        |path| format!("`{}`", fs::relativize_path(path)),
++    );
++
+     warn_user_once_by_message!(
+-        "The top-level linter settings are deprecated in favour of their counterparts in the `lint` section. Please update the following options in `{}`:\n  {options_mapping}",
+-        fs::relativize_path(path),
++        "The top-level linter settings are deprecated in favour of their counterparts in the `lint` section. \
++        Please update the following options in {thing_to_update}:\n  {options_mapping}",
+     );
+ }
+ 
+diff --git a/crates/ruff_workspace/src/options.rs b/crates/ruff_workspace/src/options.rs
+index 0a0ed48f47..46c081778d 100644
+--- a/crates/ruff_workspace/src/options.rs
++++ b/crates/ruff_workspace/src/options.rs
+@@ -33,7 +33,7 @@ use ruff_python_formatter::{DocstringCodeLineWidth, QuoteStyle};
+ 
+ use crate::settings::LineEnding;
+ 
+-#[derive(Debug, PartialEq, Eq, Default, OptionsMetadata, Serialize, Deserialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Default, OptionsMetadata, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+ pub struct Options {
+@@ -441,7 +441,7 @@ pub struct Options {
+ ///
+ /// Options specified in the `lint` section take precedence over the deprecated top-level settings.
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+-#[derive(Debug, PartialEq, Eq, Default, OptionsMetadata, Serialize, Deserialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Default, OptionsMetadata, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ pub struct LintOptions {
+     #[serde(flatten)]
+@@ -483,7 +483,7 @@ pub struct LintOptions {
+ }
+ 
+ /// Newtype wrapper for [`LintCommonOptions`] that allows customizing the JSON schema and omitting the fields from the [`OptionsMetadata`].
+-#[derive(Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+ #[serde(transparent)]
+ pub struct DeprecatedTopLevelLintOptions(pub LintCommonOptions);
+ 
+@@ -538,7 +538,7 @@ impl schemars::JsonSchema for DeprecatedTopLevelLintOptions {
+ // global settings.
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+ #[derive(
+-    Debug, PartialEq, Eq, Default, OptionsMetadata, CombineOptions, Serialize, Deserialize,
++    Clone, Debug, PartialEq, Eq, Default, OptionsMetadata, CombineOptions, Serialize, Deserialize,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ pub struct LintCommonOptions {
+@@ -922,7 +922,7 @@ pub struct LintCommonOptions {
+ 
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+ #[derive(
+-    Debug, PartialEq, Eq, Default, OptionsMetadata, CombineOptions, Serialize, Deserialize,
++    Clone, Debug, PartialEq, Eq, Default, OptionsMetadata, CombineOptions, Serialize, Deserialize,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ pub struct Flake8AnnotationsOptions {
+@@ -990,7 +990,7 @@ impl Flake8AnnotationsOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1038,7 +1038,7 @@ impl Flake8BanditOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1068,7 +1068,7 @@ impl Flake8BugbearOptions {
+     }
+ }
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1090,7 +1090,7 @@ impl Flake8BuiltinsOptions {
+     }
+ }
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1115,7 +1115,7 @@ impl Flake8ComprehensionsOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1169,7 +1169,7 @@ impl Flake8CopyrightOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1188,7 +1188,7 @@ impl Flake8ErrMsgOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1225,7 +1225,7 @@ impl Flake8GetTextOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1258,7 +1258,7 @@ impl Flake8ImplicitStrConcatOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1340,7 +1340,7 @@ impl Flake8ImportConventionsOptions {
+     }
+ }
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1476,7 +1476,7 @@ impl Flake8PytestStyleOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1548,7 +1548,7 @@ impl Flake8QuotesOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1588,7 +1588,7 @@ impl Flake8SelfOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1645,7 +1645,7 @@ impl Flake8TidyImportsOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1774,7 +1774,7 @@ impl Flake8TypeCheckingOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -1797,7 +1797,7 @@ impl Flake8UnusedArgumentsOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2400,7 +2400,7 @@ impl IsortOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2428,7 +2428,7 @@ impl McCabeOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2520,7 +2520,7 @@ impl Pep8NamingOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2592,7 +2592,7 @@ impl PycodestyleOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2682,7 +2682,7 @@ impl PydocstyleOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2710,7 +2710,7 @@ impl PyflakesOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2818,7 +2818,7 @@ impl PylintOptions {
+ }
+ 
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+@@ -2874,7 +2874,7 @@ impl PyUpgradeOptions {
+ 
+ /// Configures the way ruff formats your code.
+ #[derive(
+-    Debug, PartialEq, Eq, Default, Deserialize, Serialize, OptionsMetadata, CombineOptions,
++    Clone, Debug, PartialEq, Eq, Default, Deserialize, Serialize, OptionsMetadata, CombineOptions,
+ )]
+ #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+ #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+diff --git a/crates/ruff_workspace/src/resolver.rs b/crates/ruff_workspace/src/resolver.rs
+index b1623461c9..446e08b6bf 100644
+--- a/crates/ruff_workspace/src/resolver.rs
++++ b/crates/ruff_workspace/src/resolver.rs
+@@ -264,7 +264,7 @@ fn resolve_configuration(
+         let options = pyproject::load_options(&path)?;
+ 
+         let project_root = relativity.resolve(&path);
+-        let configuration = Configuration::from_options(options, &path, &project_root)?;
++        let configuration = Configuration::from_options(options, Some(&path), &project_root)?;
+ 
+         // If extending, continue to collect.
+         next = configuration.extend.as_ref().map(|extend| {
+diff --git a/docs/configuration.md b/docs/configuration.md
+index acac5fc29d..769b0ecd80 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -449,14 +449,69 @@ Alternatively, pass the notebook file(s) to `ruff` on the command-line directly.
+ 
+ ## Command-line interface
+ 
+-Some configuration options can be provided via the command-line, such as those related to rule
+-enablement and disablement, file discovery, logging level, and more:
++Some configuration options can be provided or overridden via dedicated flags on the command line.
++This includes those related to rule enablement and disablement,
++file discovery, logging level, and more:
+ 
+ ```shell
+ ruff check path/to/code/ --select F401 --select F403 --quiet
+ ```
+ 
+-See `ruff help` for more on Ruff's top-level commands:
++All other configuration options can be set via the command line
++using the `--config` flag, detailed below.
++
++### The `--config` CLI flag
++
++The `--config` flag has two uses. It is most often used to point to the
++configuration file that you would like Ruff to use, for example:
++
++```shell
++ruff check path/to/directory --config path/to/ruff.toml
++```
++
++However, the `--config` flag can also be used to provide arbitrary
++overrides of configuration settings using TOML `<KEY> = <VALUE>` pairs.
++This is mostly useful in situations where you wish to override a configuration setting
++that does not have a dedicated command-line flag.
++
++In the below example, the `--config` flag is the only way of overriding the
++`dummy-variable-rgx` configuration setting from the command line,
++since this setting has no dedicated CLI flag. The `per-file-ignores` setting
++could also have been overridden via the `--per-file-ignores` dedicated flag,
++but using `--config` to override the setting is also fine:
++
++```shell
++ruff check path/to/file --config path/to/ruff.toml --config "lint.dummy-variable-rgx = '__.*'" --config "lint.per-file-ignores = {'some_file.py' = ['F841']}"
++```
++
++Configuration options passed to `--config` are parsed in the same way
++as configuration options in a `ruff.toml` file.
++As such, options specific to the Ruff linter need to be prefixed with `lint.`
++(`--config "lint.dummy-variable-rgx = '__.*'"` rather than simply
++`--config "dummy-variable-rgx = '__.*'"`), and options specific to the Ruff formatter
++need to be prefixed with `format.`.
++
++If a specific configuration option is simultaneously overridden by
++a dedicated flag and by the `--config` flag, the dedicated flag
++takes priority. In this example, the maximum permitted line length
++will be set to 90, not 100:
++
++```shell
++ruff format path/to/file --line-length=90 --config "line-length=100"
++```
++
++Specifying `--config "line-length=90"` will override the `line-length`
++setting from *all* configuration files detected by Ruff,
++including configuration files discovered in subdirectories.
++In this respect, specifying `--config "line-length=90"` has
++the same effect as specifying `--line-length=90`,
++which will similarly override the `line-length` setting from
++all configuration files detected by Ruff, regardless of where
++a specific configuration file is located.
++
++### Full command-line interface
++
++See `ruff help` for the full list of Ruff's top-level commands:
+ 
+ <!-- Begin auto-generated command help. -->
+ 
+@@ -541,9 +596,13 @@ Options:
+       --preview
+           Enable preview mode; checks will include unstable rules and fixes.
+           Use `--no-preview` to disable
+-      --config <CONFIG>
+-          Path to the `pyproject.toml` or `ruff.toml` file to use for
+-          configuration
++      --config <CONFIG_OPTION>
++          Either a path to a TOML configuration file (`pyproject.toml` or
++          `ruff.toml`), or a TOML `<KEY> = <VALUE>` pair (such as you might
++          find in a `ruff.toml` configuration file) overriding a specific
++          configuration option. Overrides of individual settings using this
++          option always take precedence over all configuration files, including
++          configuration files that were also specified using `--config`
+       --extension <EXTENSION>
+           List of mappings from file extension to language (one of ["python",
+           "ipynb", "pyi"]). For example, to treat `.ipy` files as IPython
+@@ -640,9 +699,13 @@ Options:
+           Avoid writing any formatted files back; instead, exit with a non-zero
+           status code and the difference between the current file and how the
+           formatted file would look like
+-      --config <CONFIG>
+-          Path to the `pyproject.toml` or `ruff.toml` file to use for
+-          configuration
++      --config <CONFIG_OPTION>
++          Either a path to a TOML configuration file (`pyproject.toml` or
++          `ruff.toml`), or a TOML `<KEY> = <VALUE>` pair (such as you might
++          find in a `ruff.toml` configuration file) overriding a specific
++          configuration option. Overrides of individual settings using this
++          option always take precedence over all configuration files, including
++          configuration files that were also specified using `--config`
+       --extension <EXTENSION>
+           List of mappings from file extension to language (one of ["python",
+           "ipynb", "pyi"]). For example, to treat `.ipy` files as IPython

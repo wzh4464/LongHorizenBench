@@ -1,0 +1,142 @@
+{
+  "id": "ai-research-position-paper",
+  "name": "AI Research - Position Paper",
+  "description": "For argument-driven papers: framing, taxonomy, agenda, and critical synthesis",
+  "domain": "ai-research",
+  "category": "ai-research",
+  "format": "research-brief-json",
+  "fileName": "research_brief.json",
+  "metaFields": [
+    { "key": "title", "label": "Paper Title", "path": "meta.title", "placeholder": "Optional project title" },
+    { "key": "lead_author", "label": "Lead Author", "path": "meta.lead_author", "placeholder": "Optional lead author" },
+    { "key": "target_venue", "label": "Target Venue", "path": "meta.target_venue", "placeholder": "Optional venue" }
+  ],
+  "sectionFields": {
+    "ideation": [
+      { "key": "research_goal", "label": "Core Thesis", "path": "sections.ideation.research_goal", "placeholder": "State your central claim" },
+      { "key": "problem_framing", "label": "Problem Framing", "path": "sections.ideation.problem_framing", "placeholder": "Why now and for whom" },
+      { "key": "evidence_plan", "label": "Evidence Plan", "path": "sections.ideation.evidence_plan", "placeholder": "Canonical + contradictory evidence" },
+      { "key": "success_criteria", "label": "Success Criteria", "path": "sections.ideation.success_criteria", "type": "array", "placeholder": "One criterion per line" }
+    ],
+    "experiment": [
+      { "key": "hypothesis_or_validation_goal", "label": "Validation Goal", "path": "sections.experiment.hypothesis_or_validation_goal", "placeholder": "What should empirical support validate?" },
+      { "key": "dataset_or_data_source", "label": "Data/Case Source", "path": "sections.experiment.dataset_or_data_source", "placeholder": "Case studies or datasets if needed" },
+      { "key": "method_or_protocol", "label": "Validation Protocol", "path": "sections.experiment.method_or_protocol", "placeholder": "Audit/survey/small-scale protocol" },
+      { "key": "evaluation_plan", "label": "Evaluation Plan", "path": "sections.experiment.evaluation_plan", "placeholder": "Internal/external validity checks" }
+    ],
+    "publication": [
+      { "key": "paper_outline", "label": "Paper Outline", "path": "sections.publication.paper_outline", "placeholder": "Argument structure and sections" },
+      { "key": "figures_tables_plan", "label": "Figures/Tables Plan", "path": "sections.publication.figures_tables_plan", "placeholder": "Taxonomy/checklist/evidence tables" },
+      { "key": "artifact_plan", "label": "Artifact Plan", "path": "sections.publication.artifact_plan", "placeholder": "Appendix and reproducibility artifacts" },
+      { "key": "submission_checklist", "label": "Submission Checklist", "path": "sections.publication.submission_checklist", "type": "array", "placeholder": "One item per line" }
+    ]
+  },
+  "pipeline": {
+    "version": "1.1",
+    "mode": "idea",
+    "stages": {
+      "ideation": {
+        "required_elements": [
+          "sections.ideation.research_goal",
+          "sections.ideation.problem_framing"
+        ],
+        "optional_elements": [
+          "sections.ideation.evidence_plan",
+          "sections.ideation.success_criteria"
+        ],
+        "quality_gate": [
+          "Core thesis and scope boundaries are testable and explicit",
+          "Counterarguments and alternative framings are acknowledged"
+        ],
+        "task_blueprints": [
+          {
+            "id": "position_thesis_and_scope_definition",
+            "title": "Formulate central thesis and argument scope",
+            "description": "Define the core position, audience, and limits of the argument.",
+            "taskType": "analysis",
+            "recommended_skills": ["inno-research-orchestrator"]
+          },
+          {
+            "id": "position_evidence_map_and_counterpoints",
+            "title": "Build evidence map with supporting and opposing views",
+            "description": "Collect canonical support and strongest counter-evidence for balance.",
+            "taskType": "exploration",
+            "recommended_skills": ["inno-idea-generation", "inno-research-orchestrator"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-idea-generation",
+          "inno-research-orchestrator"
+        ]
+      },
+      "experiment": {
+        "required_elements": [
+          "sections.experiment.hypothesis_or_validation_goal",
+          "sections.experiment.method_or_protocol",
+          "sections.experiment.evaluation_plan"
+        ],
+        "optional_elements": [
+          "sections.experiment.dataset_or_data_source"
+        ],
+        "quality_gate": [
+          "Validation protocol is appropriate for argument claims",
+          "Evidence synthesis addresses internal and external validity"
+        ],
+        "task_blueprints": [
+          {
+            "id": "position_validation_protocol_design",
+            "title": "Design argument-validation protocol",
+            "description": "Specify survey/audit/case-study protocol to stress-test key claims.",
+            "taskType": "implementation",
+            "recommended_skills": ["inno-experiment-dev"]
+          },
+          {
+            "id": "position_synthesis_and_conflict_resolution",
+            "title": "Synthesize evidence and resolve claim conflicts",
+            "description": "Aggregate findings, reconcile contradictions, and refine claim strength.",
+            "taskType": "analysis",
+            "recommended_skills": ["inno-experiment-analysis"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-experiment-dev",
+          "inno-experiment-analysis"
+        ]
+      },
+      "publication": {
+        "required_elements": [
+          "sections.publication.paper_outline",
+          "sections.publication.submission_checklist"
+        ],
+        "optional_elements": [
+          "sections.publication.figures_tables_plan",
+          "sections.publication.artifact_plan"
+        ],
+        "quality_gate": [
+          "Argument flow is coherent end-to-end",
+          "Taxonomy/checklists and evidence tables are publication-ready"
+        ],
+        "task_blueprints": [
+          {
+            "id": "position_taxonomy_and_argument_structure",
+            "title": "Draft taxonomy and argument structure",
+            "description": "Translate thesis into sectioned narrative with clear argumentative progression.",
+            "taskType": "writing",
+            "recommended_skills": ["inno-paper-writing", "inno-reference-audit"]
+          },
+          {
+            "id": "position_manuscript_finalization",
+            "title": "Finalize position manuscript and submission package",
+            "description": "Complete final revisions, checklist, and supplementary rationale artifacts.",
+            "taskType": "writing",
+            "recommended_skills": ["inno-paper-writing"]
+          }
+        ],
+        "recommended_skills": [
+          "inno-paper-writing",
+          "inno-reference-audit"
+        ]
+      }
+    }
+  }
+}

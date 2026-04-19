@@ -1,0 +1,3543 @@
+diff --git a/src/math/reduce_sum_v2/CMakeLists.txt b/src/math/reduce_sum_v2/CMakeLists.txt
+new file mode 100644
+index 00000000..3223c604
+--- /dev/null
++++ b/src/math/reduce_sum_v2/CMakeLists.txt
+@@ -0,0 +1,107 @@
++add_ops_compile_options(
++        OP_NAME ReduceSumV2
++        OPTIONS --cce-auto-sync=on
++                -Wno-deprecated-declarations
++                -Werror
++)
++
++
++#手动实现的aclnn
++target_sources(op_host_aclnnInner PRIVATE
++        op_host/reduce_sum_v2_def.cpp
++)
++
++target_sources(opapi PRIVATE
++        ${CMAKE_SOURCE_DIR}/src/math/reduce_sum_v2/op_host/reduce_sum_v2.cpp
++        ${CMAKE_SOURCE_DIR}/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.cpp
++)
++
++
++# optiling
++target_sources(optiling PRIVATE
++        op_host/reduce_sum_v2_tiling.cpp
++)
++
++
++target_sources(opsproto PRIVATE
++        op_host/reduce_sum_v2_proto.cpp
++)
++
++file(GLOB KERNEL_FILES
++        op_kernel/*.cpp
++        op_kernel/*.h
++)
++
++install(FILES ${KERNEL_FILES}
++        DESTINATION ${ASCEND_IMPL_OUT_DIR}/dynamic
++)
++
++target_include_directories(optiling PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
++        ${CMAKE_SOURCE_DIR}/src/common/inc
++        ${ASCEND_CANN_PACKAGE_PATH}/include
++        ${ASCEND_CANN_PACKAGE_PATH}/include/external
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
++        ${ASCEND_CANN_PACKAGE_PATH}/include/exe_graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn/opdev
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/slog/toolchain
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/mmpa
++)
++
++
++target_include_directories(opapi PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
++        ${CMAKE_SOURCE_DIR}/src/common/inc
++        ${ASCEND_CANN_PACKAGE_PATH}/include
++        ${ASCEND_CANN_PACKAGE_PATH}/include/exe_graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn/opdev
++        ${ASCEND_CANN_PACKAGE_PATH}/include/graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/external
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++)
++
++target_include_directories(op_host_aclnnInner PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
++        ${CMAKE_SOURCE_DIR}/src/common/inc
++        ${ASCEND_CANN_PACKAGE_PATH}/include
++        ${ASCEND_CANN_PACKAGE_PATH}/include/exe_graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn/opdev
++        ${ASCEND_CANN_PACKAGE_PATH}/include/graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/external
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++)
++
++
++target_include_directories(opsproto PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
++        ${CMAKE_SOURCE_DIR}/src/common/inc
++        ${ASCEND_CANN_PACKAGE_PATH}/include
++        ${ASCEND_CANN_PACKAGE_PATH}/include/exe_graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/graph
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn
++        ${ASCEND_CANN_PACKAGE_PATH}/include/aclnn/opdev
++        ${ASCEND_CANN_PACKAGE_PATH}/include/external
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/platform
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/metadef
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/runtime
++        ${ASCEND_CANN_PACKAGE_PATH}/include/experiment/msprof
++)
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/README.md b/src/math/reduce_sum_v2/README.md
+new file mode 100644
+index 00000000..81c61434
+--- /dev/null
++++ b/src/math/reduce_sum_v2/README.md
+@@ -0,0 +1,59 @@
++## ReduceSum自定义算子样例说明 
++本样例通过`Ascend C`编程语言实现了`ReduceSum`算子。
++
++### 算子描述
++`ReduceSum`算子将数据进行开方并取倒数运算。
++
++
++
++### 支持的产品型号
++本样例支持如下产品型号：
++- Atlas A2 训练系列产品
++- Atlas A3 训练系列产品
++
++### 目录结构介绍
++```
++├── docs                        // 算子文档目录
++├── example                     // 调用示例目录
++├── framework                   // 第三方框架适配目录
++├── op_host                     // host目录
++├── op_kernel                   // kernel目录
++├── opp_kernel_aicpu            // aicpu目录
++└── tests                       // 测试用例目录
++```
++
++### 环境要求
++编译运行此样例前，请参考[《CANN软件安装指南》](https://hiascend.com/document/redirect/CannCommunityInstSoftware)完成开发运行环境的部署。
++
++### 算子包编译部署
++  - 进入到仓库目录
++
++    ```bash
++    cd ${git_clone_path}/cann-ops
++    ```
++
++  - 执行编译
++
++    ```bash
++    bash build.sh
++    ```
++
++  - 部署算子包
++
++    ```bash
++    bash build_out/CANN-custom_ops-<cann_version>-linux.<arch>.run
++    ```
++
++### 算子调用
++<table>
++    <th>目录</th><th>描述</th>
++    <tr>
++        <td><a href="./examples/AclNNInvocationNaive"> AclNNInvocationNaive</td><td>通过aclnn调用的方式调用Reciprocal算子。</td>
++    </tr>
++</table>
++
++
++## 更新说明
++| 时间 | 更新事项 |
++|----|------|
++| 2025/09/19 | 新增本readme |
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/CMakeLists.txt b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/CMakeLists.txt
+new file mode 100644
+index 00000000..a2f75470
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/CMakeLists.txt
+@@ -0,0 +1,61 @@
++# CMake lowest version requirement
++cmake_minimum_required(VERSION 3.5.1)
++
++# project information
++project(acl_execute_reduec_sum_v2)
++
++# Compile options
++add_compile_options(-std=c++11)
++
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "./")
++
++set(INC_PATH $ENV{DDK_PATH})
++
++if (NOT DEFINED ENV{DDK_PATH})
++    set(INC_PATH "/usr/local/Ascend/ascend-toolkit/latest")
++    message(STATUS "set default INC_PATH: ${INC_PATH}")
++else ()
++    message(STATUS "env INC_PATH: ${INC_PATH}")
++endif()
++
++set(CUST_PKG_PATH "${INC_PATH}/opp/vendors/customize/op_api")
++
++set(LIB_PATH $ENV{NPU_HOST_LIB})
++
++# Dynamic libraries in the stub directory can only be used for compilation
++if (NOT DEFINED ENV{NPU_HOST_LIB})
++    set(LIB_PATH "/usr/local/Ascend/ascend-toolkit/latest/acllib/lib64/stub/")
++    set(LIB_PATH1 "/usr/local/Ascend/ascend-toolkit/latest/atc/lib64/stub/")
++    message(STATUS "set default LIB_PATH: ${LIB_PATH}")
++else ()
++    message(STATUS "env LIB_PATH: ${LIB_PATH}")
++endif()
++
++# Header path
++include_directories(
++    ${INC_PATH}/runtime/include
++    ${INC_PATH}/atc/include
++    ${CUST_PKG_PATH}/include
++)
++
++# add host lib path
++link_directories(
++    ${LIB_PATH}
++    ${LIB_PATH1}
++    ${CUST_PKG_PATH}/lib
++)
++
++add_executable(execute_reduce_sum_v2_op
++    main.cpp
++)
++
++target_link_libraries(execute_reduce_sum_v2_op
++    ascendcl
++    cust_opapi
++    acl_op_compiler
++    nnopbase
++    stdc++
++)
++
++install(TARGETS execute_reduce_sum_v2_op DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
++
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/README.md b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/README.md
+new file mode 100644
+index 00000000..713cdb6a
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/README.md
+@@ -0,0 +1,71 @@
++## 概述
++
++通过aclnn调用的方式调用ReduceSumV2算子。
++
++## 目录结构介绍
++
++```
++├── AclNNInvocationNaive
++│   ├── CMakeLists.txt      // 编译规则文件
++│   ├── gen_data.py         // 算子期望数据生成脚本
++│   ├── main.cpp            // 单算子调用应用的入口
++│   ├── run.sh              // 编译运行算子的脚本
++│   └── verify_result.py    // 计算结果精度比对脚本
++```
++
++## 代码实现介绍
++
++完成自定义算子的开发部署后，可以通过单算子调用的方式来验证单算子的功能。main.cpp代码为单算子API执行方式。单算子API执行是基于C语言的API执行算子，无需提供单算子描述文件进行离线模型的转换，直接调用单算子API接口。
++
++自定义算子编译部署后，会自动生成单算子API，可以直接在应用程序中调用。算子API的形式一般定义为“两段式接口”，形如：
++
++```cpp
++// 获取算子使用的workspace空间大小
++aclnnStatus aclnnReduceSumGetWorkspaceSize(const aclTensor *self, const aclIntArray *dims, bool keepDims, aclDataType dtype, aclTensor *out, uint64_t *workspaceSize, aclOpExecutor **executor);
++// 执行算子
++aclnnStatus aclnnReduceSum(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
++```
++
++其中aclnnReduceSumV2GetWorkspaceSize为第一段接口，主要用于计算本次API调用计算过程中需要多少的workspace内存。获取到本次API计算需要的workspace大小之后，按照workspaceSize大小申请Device侧内存，然后调用第二段接口aclnnReduceSumV2执行计算。具体参考[AscendCL单算子调用](https://hiascend.com/document/redirect/CannCommunityAscendCInVorkSingleOp)>单算子API执行 章节。
++
++## 运行样例算子
++  **请确保已根据算子包编译部署步骤完成本算子的编译部署动作。**
++  
++  - 进入样例代码所在路径
++  
++  ```bash
++  cd ${git_clone_path}/cann-ops/src/math/reduce_sum_v2/examples/AclNNInvocationNaive
++  ```
++  
++  - 环境变量配置
++    
++    需要设置环境变量，以arm为例
++    
++    ```bash
++    export DDK_PATH=/usr/local/Ascend/ascend-toolkit/latest
++    export NPU_HOST_LIB=/usr/local/Ascend/ascend-toolkit/latest/lib64
++    ```
++  - 样例执行
++    
++    样例执行过程中会自动生成测试数据，然后编译与运行aclnn样例，最后打印运行结果。
++    
++    ```bash
++    mkdir -p build
++    cd build
++    cmake .. && make
++    ./execute_reduce_sum_v2_op
++    cd ..
++    python3 verify_result.py output/output_y.bin output/output.bin
++    ```
++    
++    用户亦可参考run.sh脚本进行编译与运行。
++    
++    ```bash
++    bash run.sh
++    ```
++
++## 更新说明
++
++| 时间       | 更新事项     |
++| ---------- | ------------ |
++| 2025/03/26 | 新增本readme |
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/gen_data.py b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/gen_data.py
+new file mode 100644
+index 00000000..08be33ab
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/gen_data.py
+@@ -0,0 +1,26 @@
++import os
++import torch
++import torch.nn.functional as F
++import tensorflow as tf
++import numpy as np
++
++def gen_golden_data_simple():
++    input_shape = [2, 3, 4]
++
++    input = torch.ones(input_shape, dtype=torch.float32)
++
++    golden = torch.sum(input, dim=1)
++
++    os.system("mkdir -p input")
++    os.system("mkdir -p output")
++    
++    input_f32 = input.to(torch.float32)
++    output_f32 = golden.to(torch.float32)
++
++    input_f32.detach().numpy().tofile("./input/input.bin")
++    output_f32.detach().numpy().tofile("./output/output.bin")
++    print(output_f32)
++
++
++if __name__ == "__main__":
++    gen_golden_data_simple()
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/main.cpp b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/main.cpp
+new file mode 100644
+index 00000000..7ef7c0d0
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/main.cpp
+@@ -0,0 +1,241 @@
++#include <algorithm>
++#include <cstdint>
++#include <iostream>
++#include <vector>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fstream>
++#include <fcntl.h>
++#include <memory>
++
++#include "acl/acl.h"
++#include "../../op_host/aclnn_reduce_sum_v2.h"
++
++#define CHECK_RET(cond, return_expr) \
++    do {                             \
++        if (!(cond)) {               \
++            return_expr;             \
++        }                            \
++    } while (0)
++
++#define CHECK_FREE_RET(cond, return_expr)        \
++    do {                                         \
++        if (!(cond)) {                           \
++            Finalize(deviceId, stream); \
++            return_expr;                         \
++        }                                        \
++    } while (0)
++
++#define LOG_PRINT(message, ...)         \
++    do {                                \
++        printf(message, ##__VA_ARGS__); \
++    } while (0)
++
++#define SUCCESS 0
++#define FAILED 1
++
++#define INFO_LOG(fmt, args...) fprintf(stdout, "[INFO]  " fmt "\n", ##args)
++#define WARN_LOG(fmt, args...) fprintf(stdout, "[WARN]  " fmt "\n", ##args)
++#define ERROR_LOG(fmt, args...) fprintf(stderr, "[ERROR]  " fmt "\n", ##args)
++
++
++bool ReadFile(const std::string &filePath, size_t fileSize, void *buffer, size_t bufferSize)
++{
++    struct stat sBuf;
++    int fileStatus = stat(filePath.data(), &sBuf);
++    if (fileStatus == -1) {
++        ERROR_LOG("failed to get file %s", filePath.c_str());
++        return false;
++    }
++    if (S_ISREG(sBuf.st_mode) == 0) {
++        ERROR_LOG("%s is not a file, please enter a file", filePath.c_str());
++        return false;
++    }
++
++    std::ifstream file;
++    file.open(filePath, std::ios::binary);
++    if (!file.is_open()) {
++        ERROR_LOG("Open file failed. path = %s", filePath.c_str());
++        return false;
++    }
++
++    std::filebuf *buf = file.rdbuf();
++    size_t size = buf->pubseekoff(0, std::ios::end, std::ios::in);
++    if (size == 0) {
++        ERROR_LOG("file size is 0");
++        file.close();
++        return false;
++    }
++    if (size > bufferSize) {
++        ERROR_LOG("file size is larger than buffer size");
++        file.close();
++        return false;
++    }
++    buf->pubseekpos(0, std::ios::in);
++    buf->sgetn(static_cast<char *>(buffer), size);
++    fileSize = size;
++    file.close();
++    return true;
++}
++
++bool WriteFile(const std::string &filePath, const void *buffer, size_t size)
++{
++    if (buffer == nullptr) {
++        ERROR_LOG("Write file failed. buffer is nullptr");
++        return false;
++    }
++
++    int fd = open(filePath.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWRITE);
++    if (fd < 0) {
++        ERROR_LOG("Open file failed. path = %s", filePath.c_str());
++        return false;
++    }
++
++    auto writeSize = write(fd, buffer, size);
++    (void) close(fd);
++    if (writeSize != size) {
++        ERROR_LOG("Write file Failed.");
++        return false;
++    }
++
++    return true;
++}
++
++int64_t GetShapeSize(const std::vector<int64_t> &shape)
++{
++    int64_t shapeSize = 1;
++    for (auto i : shape) {
++        shapeSize *= i;
++    }
++    return shapeSize;
++}
++
++int Init(int32_t deviceId, aclrtStream *stream)
++{
++    // 固定写法，AscendCL初始化
++    auto ret = aclInit(nullptr);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclInit failed. ERROR: %d\n", ret); return ret);
++    ret = aclrtSetDevice(deviceId);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return ret);
++    ret = aclrtCreateStream(stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret); return ret);
++    return 0;
++}
++
++template <typename T>
++int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &shape, void **DeviceAddr,
++                    aclDataType dataType, aclTensor **tensor)
++{
++    auto size = GetShapeSize(shape) * sizeof(T);
++    // 调用aclrtMalloc申请device侧内存
++    auto ret = aclrtMalloc(DeviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return ret);
++    // 调用aclrtMemcpy将host侧数据拷贝到device侧内存上
++    ret = aclrtMemcpy(*DeviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret); return ret);
++
++    // 计算连续tensor的strides
++    std::vector<int64_t> strides(shape.size(), 1);
++    for (int64_t i = shape.size() - 2; i >= 0; i--) {
++        strides[i] = shape[i + 1] * strides[i + 1];
++    }
++
++    // 调用aclCreateTensor接口创建aclTensor
++    if (shape.size() == 5) {
++        *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_NCDHW,
++                                  shape.data(), shape.size(), *DeviceAddr);
++    } else {
++        *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, strides.data(), 0, aclFormat::ACL_FORMAT_ND,
++                                  shape.data(), shape.size(), *DeviceAddr);
++    }
++
++    return 0;
++}
++
++void Finalize(int32_t deviceId, aclrtStream stream)
++{
++    aclrtDestroyStream(stream);
++    aclrtResetDevice(deviceId);
++    aclFinalize();
++}
++
++int aclnnReduceSumV2Test(int32_t deviceId, aclrtStream &stream)
++{
++    // 1. 初始化
++    auto ret = Init(deviceId, &stream);
++    CHECK_FREE_RET(ret == ACL_SUCCESS, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return ret);
++    // 2. 构造输入与输出，需要根据API的接口自定义构造
++    std::vector<int64_t> selfShape = {2, 3, 4};
++    std::vector<int64_t> outShape = {2, 4};
++    void* selfDeviceAddr = nullptr;
++    void* outDeviceAddr = nullptr;
++    aclTensor* self = nullptr;
++    aclIntArray* dims = nullptr;
++    aclTensor* out = nullptr;
++    std::vector<int64_t> dimsData = {1};
++    bool keepDims = false;
++    auto dtype = aclDataType::ACL_FLOAT;
++    size_t dtypeSize = sizeof(float);
++    size_t fileSize;
++    
++    // 创建self aclTensor
++    std::vector<float> selfHostData(GetShapeSize(selfShape), 1);
++    ReadFile("../input/input.bin", fileSize, selfHostData.data(), GetShapeSize(selfShape) * dtypeSize);
++    ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
++    CHECK_FREE_RET(ret == ACL_SUCCESS, return ret);
++    // 创建out aclTensor
++    std::vector<float> outHostData(GetShapeSize(outShape), 1);
++    ReadFile("../output/output.bin", fileSize, outHostData.data(), GetShapeSize(outShape) * dtypeSize);
++    ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
++    CHECK_FREE_RET(ret == ACL_SUCCESS, return ret);
++    // 创建dims aclIntArray
++    dims = aclCreateIntArray(dimsData.data(), dimsData.size());
++    CHECK_FREE_RET(dims != nullptr, return ret);
++
++    // 3. 调用CANN算子库API，需要修改为具体的API名称
++    uint64_t workspaceSize = 0;
++    aclOpExecutor* executor;
++    // 调用aclnnReduceSum第一段接口
++    ret = aclnnReduceSumV2GetWorkspaceSize(self, dims, keepDims, dtype, out, &workspaceSize, &executor);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnReduceSumV2GetWorkspaceSize failed. ERROR: %d\n", ret); return ret);
++    // 根据第一段接口计算出的workspaceSize申请device内存
++    void* workspaceAddr = nullptr;
++    if (workspaceSize > 0) {
++        ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
++        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return ret);
++    }
++    // 调用aclnnReduceSum第二段接口
++    ret = aclnnReduceSumV2(workspaceAddr, workspaceSize, executor, stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnReduceSumV2 failed. ERROR: %d\n", ret); return ret);
++
++    // 4. （固定写法）同步等待任务执行结束
++    ret = aclrtSynchronizeStream(stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
++
++    // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
++    auto size = GetShapeSize(outShape);
++    std::vector<float> resultData(size, 0);
++    ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outDeviceAddr,
++                        size * sizeof(resultData[0]), ACL_MEMCPY_DEVICE_TO_HOST);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return ret);
++    for (int64_t i = 0; i < size; i++) {
++        LOG_PRINT("result[%ld] is: %f\n", i, resultData[i]);
++    }
++
++    WriteFile("../output/output_y.bin", resultData.data(), size * dtypeSize);
++    return ACL_SUCCESS;
++}
++
++int main()
++{
++    // 1. （固定写法）device/stream初始化
++    // 根据自己的实际device填写deviceId
++    int32_t deviceId = 0;
++    aclrtStream stream;
++    auto ret = aclnnReduceSumV2Test(deviceId, stream);
++    CHECK_FREE_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnReduceSumV2Test failed. ERROR: %d\n", ret); return ret);
++
++    Finalize(deviceId, stream);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/run.sh b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/run.sh
+new file mode 100644
+index 00000000..4829086c
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/run.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ======================================================================================================================
++
++if [ -n "$ASCEND_INSTALL_PATH" ]; then
++    _ASCEND_INSTALL_PATH=$ASCEND_INSTALL_PATH
++elif [ -n "$ASCEND_HOME_PATH" ]; then
++    _ASCEND_INSTALL_PATH=$ASCEND_HOME_PATH
++else
++    if [ -d "$HOME/Ascend/ascend-toolkit/latest" ]; then
++        _ASCEND_INSTALL_PATH=$HOME/Ascend/ascend-toolkit/latest
++    else
++        _ASCEND_INSTALL_PATH=/usr/local/Ascend/ascend-toolkit/latest
++    fi
++fi
++source $_ASCEND_INSTALL_PATH/bin/setenv.bash
++export DDK_PATH=$_ASCEND_INSTALL_PATH
++export NPU_HOST_LIB=$_ASCEND_INSTALL_PATH/lib64
++
++echo ""
++echo "#####################################"
++echo "INFO: you have passed the Precision!"
++echo "#####################################"
++echo ""
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/verify_result.py b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/verify_result.py
+new file mode 100644
+index 00000000..d0f570cd
+--- /dev/null
++++ b/src/math/reduce_sum_v2/examples/AclNNInvocationNaive/verify_result.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/python3
++# -*- coding:utf-8 -*-
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ======================================================================================================================
++import os
++import sys
++import numpy as np
++
++LOSS = 1e-3 # 容忍偏差，一般fp16要求绝对误差和相对误差均不超过千分之一
++MINIMUM = 10e-10
++
++
++def verify_result(real_result, golden):
++    dtype = np.float32
++    real_result = np.fromfile(real_result, dtype=dtype) # 从bin文件读取实际运算结果
++    golden = np.fromfile(golden, dtype=dtype) # 从bin文件读取预期运算结果
++    result = np.abs(real_result - golden) # 计算运算结果和预期结果偏差
++    deno = np.maximum(np.abs(real_result), np.abs(golden))  # 获取最大值并组成新数组
++    result_atol = np.less_equal(result, LOSS) # 计算绝对误差
++    result_rtol = np.less_equal(result / np.add(deno, MINIMUM), LOSS) # 计算相对误差
++    if not result_rtol.all() and not result_atol.all():
++        if np.sum(result_rtol == False) > real_result.size * LOSS and \
++           np.sum(result_atol == False) > real_result.size * LOSS: # 误差超出预期时返回打印错误，返回对比失败
++            print("[ERROR] result error")
++            return False
++    print("test pass")
++    return True
++
++if __name__ == '__main__':
++    verify_result(sys.argv[1], sys.argv[2])
+diff --git a/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.cpp b/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.cpp
+new file mode 100644
+index 00000000..bcb7c362
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.cpp
+@@ -0,0 +1,228 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++#include <bitset>
++#include "aclnn_kernels/cast.h"
++#include "reduce_sum_v2.h"
++#include "aclnn_kernels/contiguous.h"
++#include "fill.h"
++#include "aclnn_kernels/common/op_error_check.h"
++#include "op_api_def.h"
++#include "aclnn/aclnn_base.h"
++#include "opdev/common_types.h"
++#include "opdev/shape_utils.h"
++#include "opdev/data_type_utils.h"
++#include "opdev/format_utils.h"
++#include "opdev/op_dfx.h"
++#include "opdev/op_executor.h"
++#include "opdev/op_log.h"
++#include "opdev/tensor_view_utils.h"
++#include "opdev/platform.h"
++#include "aclnn_reduce_sum_v2.h"
++
++using namespace op;
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++constexpr size_t MAX_MASK_LEN = 64;
++
++// 根据API定义，需要列出所能支持的所有dtype
++static const std::initializer_list<op::DataType> ASCEND910B_DTYPE_SUPPORT_LIST = {
++    op::DataType::DT_FLOAT16, op::DataType::DT_FLOAT, op::DataType::DT_BF16};
++
++static const std::initializer_list<op::DataType> EMPTY_INPUT_DTYPE_SUPPORT_LIST = {
++    op::DataType::DT_FLOAT16, op::DataType::DT_FLOAT, op::DataType::DT_BF16};
++
++static bool CheckNotNull(const aclTensor *self, const aclIntArray *dims, const aclTensor *out) {
++  OP_CHECK_NULL(self, return false);
++  OP_CHECK_NULL(dims, return false);
++  OP_CHECK_NULL(out, return false);
++  return true;
++}
++
++static bool CheckDtypeValid(const aclTensor *self, const aclDataType dtype, const aclTensor *out) {
++  // 检查self和out的数据类型是否在支持列表内
++  bool isAscend910BSocVersion = (GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910B ||
++                                 GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910_93);
++
++  OP_CHECK_DTYPE_NOT_SUPPORT(self, ASCEND910B_DTYPE_SUPPORT_LIST, return false);
++  OP_CHECK_DTYPE_NOT_SUPPORT(out, ASCEND910B_DTYPE_SUPPORT_LIST, return false);
++  // 检查dtype指定的数据类型是否支持
++  if (!CheckType(op::ToOpDataType(dtype), ASCEND910B_DTYPE_SUPPORT_LIST)) {
++    OP_LOGE(ACLNN_ERR_PARAM_INVALID, "type %s should be in dtype support list [%s].",
++            op::ToString(op::ToOpDataType(dtype)).GetString(), op::ToString(ASCEND910B_DTYPE_SUPPORT_LIST).GetString());
++    return false;
++  }
++  // 检查dtype数据类型与out是否一致
++  OP_CHECK_DTYPE_NOT_MATCH(out, op::ToOpDataType(dtype), return false);
++  return true;
++}
++
++static bool CheckMaxDimension(const aclTensor *self) {
++  OP_CHECK_MAX_DIM(self, MAX_SUPPORT_DIMS_NUMS, return false);
++  return true;
++}
++
++static inline uint64_t GetPosDim(int64_t dim, int64_t dimNum) {
++  if (dimNum <= 0) {
++    dimNum = 1;
++  }
++  return dim >= 0 ? dim : dim + dimNum;
++}
++
++static bool CheckDimValid(const aclTensor* self, const aclIntArray* dims) {
++  auto selfViewShape = self->GetViewShape();
++  auto selfDimNum = static_cast<int64_t>(selfViewShape.GetDimNum());
++  // self为标量时，dim range [-1, 0]
++  if (selfDimNum <= 0) {
++    selfDimNum = 1;
++  }
++  // dim为负时需要转正校验
++  std::bitset<MAX_MASK_LEN> dimMask = std::bitset<MAX_MASK_LEN>();
++
++  for (size_t i = 0; i < dims->Size(); i++) {
++    int64_t curDim = (*dims)[i];
++    if (curDim >= selfDimNum || curDim < (-selfDimNum)) {
++      OP_LOGE(ACLNN_ERR_PARAM_INVALID, "Provided dim %ld must be in the range of [%ld, %ld].",
++              curDim, -selfDimNum, selfDimNum - 1);
++      return false;
++    }
++    uint64_t index = GetPosDim(curDim, selfDimNum);
++    // dim重复
++    if (dimMask[index]) {
++      OP_LOGE(ACLNN_ERR_PARAM_INVALID, "Dim %lu appears multiple times in the list of dims.", index);
++      return false;
++    }
++
++    dimMask.set(index);
++  }
++
++  return true;
++}
++
++static aclnnStatus CheckParams(const aclTensor *self, const aclIntArray *dims, const aclDataType dtype, const aclTensor *out) {
++  // 1. 检查参数是否为空指针
++  CHECK_RET(CheckNotNull(self, dims, out), ACLNN_ERR_PARAM_NULLPTR);
++
++  // 2. 检查self、out的数据类型是否合法
++  CHECK_RET(CheckDtypeValid(self, dtype, out), ACLNN_ERR_PARAM_INVALID);
++
++  // 3. 检查最大维度是否超过8
++  CHECK_RET(CheckMaxDimension(self), ACLNN_ERR_PARAM_INVALID);
++
++  // 4. 检查reduce的轴是否超出self维度范围
++  CHECK_RET(CheckDimValid(self, dims), ACLNN_ERR_PARAM_INVALID);
++
++  return ACLNN_SUCCESS;
++}
++
++static aclnnStatus FillScalar(aclTensor *out, float val, aclOpExecutor *executor)
++{
++  OP_CHECK_DTYPE_NOT_SUPPORT(out, EMPTY_INPUT_DTYPE_SUPPORT_LIST, return ACLNN_ERR_PARAM_INVALID);
++  FVector<int64_t> shape;
++  size_t dimNum = out->GetViewShape().GetDimNum();
++
++  if (out->IsEmpty()) {
++    return ACLNN_SUCCESS;
++  }
++
++  for (size_t idx = 0; idx < dimNum; idx++) {
++    int64_t tmpVal = out->GetViewShape().GetDim(idx);
++    shape.push_back(tmpVal);
++  }
++
++  auto dims = executor->ConvertToTensor(shape.data(), shape.size(), DataType::DT_INT64);
++  auto shapeArray = executor->AllocIntArray(shape.data(), shape.size());
++
++  FVector<float> valVector = {val};
++  auto valTensor = executor->ConvertToTensor(valVector.data(), valVector.size(), out->GetDataType());
++  auto fillOut = l0op::Fill(dims, valTensor, shapeArray, executor);
++  CHECK_RET(fillOut != nullptr, ACLNN_ERR_INNER_NULLPTR);
++  auto viewCopyResult = l0op::ViewCopy(fillOut, out, executor);
++  CHECK_RET(viewCopyResult != nullptr, ACLNN_ERR_INNER_NULLPTR);
++  return ACLNN_SUCCESS;
++}
++
++aclnnStatus aclnnReduceSumV2GetWorkspaceSize(const aclTensor *self, const aclIntArray *dims, bool keepDims,
++                                           aclDataType dtype, aclTensor *out, uint64_t *workspaceSize,
++                                           aclOpExecutor **executor) {
++  L2_DFX_PHASE_1(aclnnReduceSumV2, DFX_IN(self, dims, keepDims, dtype), DFX_OUT(out));
++
++  // 固定写法，创建OpExecutor
++  auto uniqueExecutor = CREATE_EXECUTOR();
++  CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
++
++  // 固定写法，参数检查
++  auto ret = CheckParams(self, dims, dtype, out);
++  CHECK_RET(ret == ACLNN_SUCCESS, ret);
++
++  // 输入self为空tensor时，直接返回dtype类型的空tensor
++  if (self->IsEmpty()) {
++    ret = FillScalar(out, 0.0f, uniqueExecutor.get());
++    if (ret == ACLNN_SUCCESS) {
++      *workspaceSize = uniqueExecutor->GetWorkspaceSize();
++      uniqueExecutor.ReleaseTo(executor);
++    }
++    return ret;
++  }
++
++  // 数据类型转换处理
++  op::DataType selfType = self->GetDataType();
++  op::DataType dataType = op::ToOpDataType(dtype);
++  op::DataType promoteType = dataType;
++  promoteType = (selfType == promoteType) ? selfType : promoteType;
++  
++  // 空dims处理
++  op::Shape shape = self->GetViewShape();
++  if (dims->Size() == 0) {
++    size_t dimDum = shape.GetDimNum();
++    int64_t appendDim[dimDum];
++    for (uint64_t i = 0; i < dimDum; i++) {
++      appendDim[i] = i;
++    }
++    dims = uniqueExecutor.get()->AllocIntArray(appendDim, dimDum);
++  }
++ 
++  // 固定写法，将输入self转换成连续的tensor
++  auto selfContiguous = l0op::Contiguous(self, uniqueExecutor.get());
++  CHECK_RET(selfContiguous != nullptr, ACLNN_ERR_INNER_NULLPTR);
++
++  // 将输入self的数据类型进行转换
++  auto selfContiguousCasted = l0op::Cast(selfContiguous, promoteType, uniqueExecutor.get());
++  CHECK_RET(selfContiguousCasted != nullptr, ACLNN_ERR_INNER_NULLPTR);
++
++  // 调用ReduceSum算子kernel,将输入self的数据类型转换成指定的数据类型
++  const aclTensor *reduceSumOut = l0op::ReduceSumV2(selfContiguousCasted, dims, keepDims, uniqueExecutor.get());
++  CHECK_RET(reduceSumOut != nullptr, ACLNN_ERR_INNER_NULLPTR);
++  CHECK_RET(CheckReduceOutShape(reduceSumOut, out), ACLNN_ERR_PARAM_INVALID);
++
++  // 将计算结果转换成输出out的数据类型
++  reduceSumOut = l0op::Cast(reduceSumOut, out->GetDataType(), uniqueExecutor.get());
++
++  // 固定写法，将计算结果拷贝到输出out上，out可能是非连续的tensor
++  auto viewCopyResult = l0op::ViewCopy(reduceSumOut, out, uniqueExecutor.get());
++  CHECK_RET(viewCopyResult != nullptr, ACLNN_ERR_INNER_NULLPTR);
++
++  // 固定写法，获取计算过程中需要使用的workspace大小
++  *workspaceSize = uniqueExecutor->GetWorkspaceSize();
++  uniqueExecutor.ReleaseTo(executor);
++  return ACLNN_SUCCESS;
++}
++
++aclnnStatus aclnnReduceSumV2(void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream) {
++  L2_DFX_PHASE_2(aclnnReduceSumV2);
++  // 固定写法，调用框架能力，完成计算
++  return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.h b/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.h
+new file mode 100644
+index 00000000..b3e3a29a
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/aclnn_reduce_sum_v2.h
+@@ -0,0 +1,36 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#ifndef OP_API_INC_REDUCE_SUM_V2_H_
++#define OP_API_INC_REDUCE_SUM_V2_H_
++
++#include "aclnn/aclnn_base.h"
++#include "aclnnop/aclnn_util.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++/**
++ * @brief aclnnReduceSum的第一段接口，根据具体的计算流程，计算workspace大小。
++ * @domain aclnn_math
++ */
++ACLNN_API aclnnStatus aclnnReduceSumV2GetWorkspaceSize(const aclTensor* self, const aclIntArray* dims, bool keepDims,
++                                                     aclDataType dtype, aclTensor* out, uint64_t* workspaceSize,
++                                                     aclOpExecutor** executor);
++
++/**
++ * @brief aclnnReduceSum的第二段接口，用于执行计算。
++ */
++ACLNN_API aclnnStatus aclnnReduceSumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
++                                     aclrtStream stream);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // OP_API_INC_REDUCE_SUM_H_
+diff --git a/src/math/reduce_sum_v2/op_host/fill.h b/src/math/reduce_sum_v2/op_host/fill.h
+new file mode 100644
+index 00000000..f97f8dec
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/fill.h
+@@ -0,0 +1,20 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#ifndef OP_API_INC_LEVEL0_OP_FILL_OP_H_
++#define OP_API_INC_LEVEL0_OP_FILL_OP_H_
++
++#include "opdev/op_executor.h"
++
++namespace l0op {
++const aclTensor *Fill(const aclTensor *dims, const aclTensor *value, const aclIntArray *outShape,
++    aclOpExecutor *executor);
++}
++
++#endif
+diff --git a/src/math/reduce_sum_v2/op_host/op_api_def.h b/src/math/reduce_sum_v2/op_host/op_api_def.h
+new file mode 100644
+index 00000000..92ea976d
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/op_api_def.h
+@@ -0,0 +1,28 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++ /*!
++ * \file op_api_def.h
++ * \brief
++ */
++
++#ifndef OP_API_DEF_H_
++#define OP_API_DEF_H_
++
++namespace op {
++    const size_t BN_MIN_SUPPORT_DIMS_NUMS = 2;
++    const size_t MAX_SUPPORT_DIMS_NUMS = 8;
++    const int8_t FP16FP32_KEEP_DTYPE = -1;
++    const int8_t KEEP_DTYPE = 0;
++    const int8_t ALLOW_FP32_DOWN_PRECISION = 1;
++    const int8_t USE_FP16 = 2;
++    const int8_t USE_HF32 = 3;
++}  // namespace op
++#endif  // OP_API_DEF_H_
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2.cpp b/src/math/reduce_sum_v2/op_host/reduce_sum_v2.cpp
+new file mode 100644
+index 00000000..a03174ca
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2.cpp
+@@ -0,0 +1,72 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#include "reduce_sum_v2.h"
++#include "opdev/data_type_utils.h"
++#include "opdev/format_utils.h"
++#include "opdev/make_op_executor.h"
++#include "opdev/op_def.h"
++#include "opdev/op_dfx.h"
++#include "opdev/op_executor.h"
++#include "opdev/op_log.h"
++#include "opdev/shape_utils.h"
++#include "opdev/platform.h"
++#include "aclnn_kernels/common/op_error_check.h"
++
++using namespace op;
++
++namespace l0op {
++OP_TYPE_REGISTER(ReduceSumV2);
++
++static const std::initializer_list<op::DataType> AICORE910B_DTYPE_SUPPORT_LIST = {
++    op::DataType::DT_FLOAT, op::DataType::DT_FLOAT16, op::DataType::DT_BF16};
++
++// 根据芯片类型、dtype判断算子是否支持走aicore
++static bool IsAiCoreSupport(const aclTensor *self) {
++  bool isSocSupport = (GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910B ||
++                       GetCurrentPlatformInfo().GetSocVersion() == SocVersion::ASCEND910_93);
++  return isSocSupport && CheckType(self->GetDataType(), AICORE910B_DTYPE_SUPPORT_LIST);
++}
++
++// AICORE算子kernel
++static const aclTensor *ReduceSumV2AiCore(const aclTensor *x, const aclTensor *axes, bool keepDim,
++                                          bool noopWithEmptyAxes, const aclTensor *out, aclOpExecutor *executor) {
++  L0_DFX(ReduceSumV2AiCore, x, axes, keepDim, noopWithEmptyAxes, out);
++  auto retAicore = ADD_TO_LAUNCHER_LIST_AICORE(ReduceSumV2, OP_INPUT(x, axes), OP_OUTPUT(out), OP_ATTR(keepDim, noopWithEmptyAxes));
++  OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(retAicore != ACLNN_SUCCESS, return nullptr,
++                                       "ReduceSumOp ADD_TO_LAUNCHER_LIST_AICORE failed.");
++  return out;
++}
++
++const aclTensor *ReduceSumV2(const aclTensor *x, const aclIntArray *axes, bool keepDim, aclOpExecutor *executor) {
++  auto axesTensor = executor->ConvertToTensor(axes, op::ToOpDataType(ACL_INT64));
++  auto out = executor->AllocTensor(x->GetDataType(), op::Format::FORMAT_ND, op::Format::FORMAT_ND);
++
++  // dim为空时，默认保留所有轴
++  bool noopWithEmptyAxes = true;
++  INFER_SHAPE(ReduceSumV2, OP_INPUT(x, axesTensor), OP_OUTPUT(out), OP_ATTR(keepDim, noopWithEmptyAxes));
++  op::Shape outShape = x->GetViewShape();
++  auto count = axes->Size();
++  size_t dimNum = outShape.GetDimNum();
++  if (keepDim) {
++    for (uint64_t i = 0; i < count; i++) {
++      int64_t dimIndex = static_cast<int64_t>((*axes)[i]);
++      int64_t dimNew = dimIndex >= 0 ? dimIndex : dimIndex + dimNum;
++      outShape.SetDim(dimNew, 1);
++    }
++    out->SetViewShape(outShape);
++  }
++
++  if (IsAiCoreSupport(x)) {
++    return ReduceSumV2AiCore(x, axesTensor, keepDim, noopWithEmptyAxes, out, executor);
++  } else {
++    return nullptr;
++  }
++}
++} // namespace l0op
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2.h b/src/math/reduce_sum_v2/op_host/reduce_sum_v2.h
+new file mode 100644
+index 00000000..a0b65707
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2.h
+@@ -0,0 +1,21 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#ifndef OP_API_OP_API_COMMON_INC_LEVEL0_OP_REDUCE_SUM_V2_H_
++#define OP_API_OP_API_COMMON_INC_LEVEL0_OP_REDUCE_SUM_V2_H_
++
++#include "opdev/op_executor.h"
++#include "opdev/make_op_executor.h"
++
++namespace l0op {
++const aclTensor *ReduceSumV2(const aclTensor *x, const aclIntArray *axes,
++                             bool keep_dims, aclOpExecutor *executor);
++}
++
++#endif // OP_API_OP_API_COMMON_INC_LEVEL0_OP_REDUCE_SUM_V2_H_
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_common.h b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_common.h
+new file mode 100644
+index 00000000..ac7cf6a9
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_common.h
+@@ -0,0 +1,129 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_common.h
++ * \brief tiling for reduce sum
++ */
++#ifndef REDUCE_SUM_V2_COMMON_H
++#define REDUCE_SUM_V2_COMMON_H
++
++#include <numeric>
++#include <algorithm>
++
++constexpr int64_t MAX_DIM = 8;
++constexpr int64_t NUM_TWO = 2;
++
++#define OP_LOGE(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++#define OP_LOGD(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++#define OP_LOGI(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++
++namespace optiling {
++#define VECTOR_INNER_ERR_REPORT_TILIING(op_name, err_msg, ...) std::printf(err_msg, ##__VA_ARGS__)
++#define OP_TILING_CHECK(cond, log_func, expr) \
++    do {                                      \
++        if (cond) {                           \
++            log_func;                         \
++            expr;                             \
++        }                                     \
++    } while (0)
++#define OPS_CHECK_NULL_WITH_CONTEXT_RET(context, ptr, ret)                                        \
++  if ((ptr) == nullptr) {                                                                         \
++    const char* name = ((context)->GetNodeName() == nullptr) ? "nil" : (context)->GetNodeName();  \
++    std::printf(name, "is nullptr!");                                                             \
++    REPORT_INNER_ERR_MSG("EZ9999", "op[%s], %s is nullptr!", name, #ptr);                            \
++    return ret;                                                                                   \
++  }
++#define OPS_CHECK_NULL_WITH_CONTEXT(context, ptr)                                                  \
++  if ((ptr) == nullptr) {                                                                          \
++    const char* name = ((context)->GetNodeName() == nullptr) ? "nil" : (context)->GetNodeName();   \
++    std::printf(name, "is nullptr!");                                                              \
++    REPORT_INNER_ERR_MSG("EZ9999", "op[%s], %s is nullptr!", name, #ptr);                             \
++    return ge::GRAPH_FAILED;                                                                       \
++  }
++
++template <typename T>
++inline T* GetCompileInfoPtr(gert::TilingParseContext* context) {
++  return context->GetCompiledInfo<T>();
++}
++}
++
++namespace optiling {
++namespace ReduceCommon {
++template <typename T>
++ge::graphStatus GetAxesData(gert::TilingContext* context, int32_t idx, std::vector<uint64_t>& axes)
++{
++    auto axesInput = context->GetInputTensor(idx);
++    OPS_CHECK_NULL_WITH_CONTEXT(context, axesInput);
++    auto size = axesInput->GetShapeSize();
++    OP_TILING_CHECK(
++        (size > static_cast<int64_t>(MAX_DIM)),
++        VECTOR_INNER_ERR_REPORT_TILIING(context->GetNodeName(), "dim size:%ld is over max dim, cannot support.", size),
++        return ge::GRAPH_FAILED);
++
++    if (size == 0) {
++        return ge::GRAPH_SUCCESS;
++    }
++    axes.resize(size);
++    auto axesData = axesInput->GetData<T>();
++    OP_TILING_CHECK((axesData == nullptr), VECTOR_INNER_ERR_REPORT_TILIING(context->GetNodeName(), "GetData failed"),
++                    return ge::GRAPH_FAILED;);
++    for (size_t i = 0; i < size; i++) {
++        axes[i] = static_cast<uint64_t>(axesData[i]);
++    }
++    return ge::GRAPH_SUCCESS;
++}
++
++ge::graphStatus GetInputDtype(gert::TilingContext* context, int32_t idx, ge::DataType& dtype)
++{
++    auto inputDesc = context->GetInputDesc(idx);
++    OPS_CHECK_NULL_WITH_CONTEXT(context, inputDesc);
++    dtype = inputDesc->GetDataType();
++    return ge::GRAPH_SUCCESS;
++}
++
++inline void DoFuseAxes(const std::vector<uint64_t> &xShape, std::vector<uint64_t> &axes, std::vector<uint64_t> &xFusedShape, uint64_t &reduceCnt)
++{
++    std::sort(axes.begin(), axes.end());
++    size_t j = 0;
++    bool isLastR = true;
++    if (!axes[0]) {
++        xFusedShape.emplace_back(1);
++        isLastR = false;
++    }
++    
++    for (size_t i = 0; i < xShape.size(); i++) {
++        uint64_t dim = xShape[i];
++        if (j < axes.size() && i == axes[j]) {
++            if (isLastR) {
++                xFusedShape[xFusedShape.size() - 1] *= dim;
++            } else {
++                reduceCnt++;
++                xFusedShape.emplace_back(dim);
++                isLastR = true;
++            }
++            j++;
++        } else {
++            if (isLastR) {
++                xFusedShape.emplace_back(dim);
++                isLastR = false;
++            } else {
++                xFusedShape[xFusedShape.size() - 1] *= dim;
++            }
++        }
++    }
++    if ((xFusedShape.size() % NUM_TWO) && (xFusedShape.back() == 1)) {
++        xFusedShape.pop_back();
++    }
++}
++
++}  // namespace ReduceCommon
++}  // namespace optiling
++#endif
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_def.cpp b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_def.cpp
+new file mode 100644
+index 00000000..2f143b32
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_def.cpp
+@@ -0,0 +1,57 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_v2_def.cpp
++ * \brief ReduceSumV2 ascendc impl
++ */
++
++#include "register/op_def_registry.h"
++#include "graph/utils/type_utils.h"
++#include "exe_graph/runtime/infer_shape_context.h"
++#include "register/op_impl_registry.h"
++
++namespace ops {
++class ReduceSumV2 : public OpDef {
++public:
++    explicit ReduceSumV2(const char *name) : OpDef(name)
++    {
++        this->Input("x")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Input("axes")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_INT32, ge::DT_INT32, ge::DT_INT32, ge::DT_INT64, ge::DT_INT64, ge::DT_INT64})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++        this->Output("y")
++            .ParamType(REQUIRED)
++            .DataType({ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16, ge::DT_BF16, ge::DT_FLOAT, ge::DT_FLOAT16})
++            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++
++        this->Attr("keep_dims").AttrType(OPTIONAL).Bool(false);
++        this->Attr("noop_with_empty_axes").AttrType(OPTIONAL).Bool(true);
++
++        OpAICoreConfig aicore_config;
++        aicore_config.DynamicCompileStaticFlag(true)
++            .DynamicRankSupportFlag(true)
++            .DynamicShapeSupportFlag(true)
++            .ExtendCfgInfo("opFile.value", "reduce_sum_v2");
++
++        this->AICore().AddConfig("ascend910b", aicore_config);
++        this->AICore().AddConfig("ascend910_93", aicore_config);
++    }
++};
++
++OP_ADD(ReduceSumV2);
++}  // namespace ops
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.cpp b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.cpp
+new file mode 100644
+index 00000000..8993270c
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.cpp
+@@ -0,0 +1,56 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_proto.cpp
++ * \brief
++ */
++#include "reduce_sum_v2_proto.h"
++
++using namespace ge;
++namespace ops {
++static ge::graphStatus InferShape4ReduceCommon(gert::InferShapeContext* context) {
++  auto in_shape = context->GetInputShape(0);
++  OPS_CHECK_NULL_WITH_CONTEXT(context, in_shape);
++  auto axes_tensor = context->GetInputTensor(1);
++  OPS_CHECK_NULL_WITH_CONTEXT(context, axes_tensor);
++  auto out_shape = context->GetOutputShape(0);
++  OPS_CHECK_NULL_WITH_CONTEXT(context, out_shape);
++  auto attrs = context->GetAttrs();
++  OPS_CHECK_NULL_WITH_CONTEXT(context, attrs);
++
++  const bool* keep_dims = attrs->GetAttrPointer<bool>(0);
++  OPS_CHECK_NULL_WITH_CONTEXT(context, keep_dims);
++
++  auto axes_size = static_cast<int32_t>(axes_tensor->GetShapeSize());
++
++  OP_CHECK(axes_size < 0,
++           VECTOR_INFER_SHAPE_INNER_ERR_REPORT(context->GetNodeName(), "axes num cannot be less than 0!"),
++           return ge::GRAPH_FAILED);
++
++  if (axes_size == 0) {
++    *out_shape = *in_shape;
++    OP_LOGD(context->GetNodeName(), "axes is empty tensor, will ignore infer, set output shape = input shape");
++    return ge::GRAPH_SUCCESS;
++  }
++
++  auto dtype = axes_tensor->GetDataType();
++  OP_CHECK(dtype != ge::DT_INT32 && dtype != ge::DT_INT64,
++           VECTOR_INFER_SHAPE_INNER_ERR_REPORT(
++               context->GetNodeName(), "axes datatype must in (int32, int64)"),
++           return ge::GRAPH_FAILED);
++  if (dtype == ge::DT_INT32) {
++    return ReduceDims<int32_t>(in_shape, axes_tensor, axes_size, *keep_dims, out_shape);
++  }
++  return ReduceDims<int64_t>(in_shape, axes_tensor, axes_size, *keep_dims, out_shape);
++}
++
++IMPL_OP_INFERSHAPE(ReduceSumV2).InferShape(InferShape4ReduceCommon).InputsDataDependency({1});
++}  // namespace ops
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.h b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.h
+new file mode 100644
+index 00000000..b2549525
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_proto.h
+@@ -0,0 +1,119 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_proto.h
++ * \brief
++ */
++#ifndef REDUCE_SUM_V2_PROTO_H
++#define REDUCE_SUM_V2_PROTO_H
++#include "register/op_def_registry.h"
++#include "error_util.h"
++
++#define OP_LOGE(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++#define OP_LOGD(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++#define OP_LOGI(nodeName, fmt, ...) std::printf(fmt, ##__VA_ARGS__); std::printf("\n")
++
++#define VECTOR_INFER_SHAPE_INNER_ERR_REPORT(op_name, err_msg) \
++    do {                                                      \
++        std::printf("op[%s], %s", op_name, err_msg);          \
++    } while (0)   
++
++#define OP_CHECK(cond, log_func, return_expr) \
++    if (cond) {                               \
++        log_func;                             \
++        return_expr;                          \
++    }                                     
++
++// tools api
++#define OPS_CHECK_NULL_WITH_CONTEXT(context, ptr)                                                \
++  if ((ptr) == nullptr) {                                                                        \
++    std::printf("nullptr error!");                                                               \
++    return ge::GRAPH_FAILED;                                                                     \
++  }
++
++template <typename T1, typename T2>
++bool IsDimValid(const T1 shape_size, const T2 dim_value) {
++  int64_t minimum_num = static_cast<int64_t>(shape_size) * (-1);
++  int64_t maximum_num = static_cast<int64_t>(shape_size) - 1;
++
++  return static_cast<int64_t>(dim_value) >= minimum_num && static_cast<int64_t>(dim_value) <= maximum_num;
++}
++
++std::vector<int64_t> ToVector(const gert::Shape& shape) {
++  size_t shape_size = shape.GetDimNum();
++  std::vector<int64_t> shape_vec(shape_size, 0);
++
++  for (size_t i = 0; i < shape_size; i++) {
++    shape_vec[i] = shape.GetDim(i);
++  }
++  return shape_vec;
++}
++
++std::string ToString(const gert::Shape& shape) {
++  return ge::DebugString(ToVector(shape));
++}
++
++namespace ops {
++template <typename T>
++ge::graphStatus ReduceDimsWithKeepDims(const gert::Shape* x_shape, const T* axes_dims, int32_t axes_size,
++                                       gert::Shape* output_shape) {
++  T dim_num = x_shape->GetDimNum();
++  const bool is_scalar = x_shape->GetDimNum() == 0;
++  dim_num = is_scalar ? 1 : dim_num;
++  *output_shape = *x_shape;
++  for (int32_t i = 0; i < axes_size; i++) {
++    OP_CHECK(!IsDimValid(dim_num, axes_dims[i]), OP_LOGE("reduce", "axes_dims is invalid"), return ge::GRAPH_FAILED);
++    if (is_scalar) {
++      // no need to update output shape, when input is scalar
++      continue;
++    }
++    T dim = axes_dims[i] < 0 ? axes_dims[i] + dim_num : axes_dims[i];
++    output_shape->SetDim(dim, 1);
++  }
++  OP_LOGD("ReduceDimsWithKeepDims", "after reduce output shape is %s.", ToString(*output_shape).c_str());
++  return ge::GRAPH_SUCCESS;
++}
++
++template <typename T>
++ge::graphStatus ReduceDimsWithoutKeepDims(const gert::Shape* x_shape, const T* axes_dims, int32_t axes_size,
++                                          gert::Shape* output_shape) {
++  T dim_num = x_shape->GetDimNum();
++  output_shape->SetDimNum(0);
++  for (T j = 0; j < dim_num; j++) {
++    bool reduce_flag = false;
++    for (int32_t i = 0; i < axes_size; i++) {
++      OP_CHECK(!IsDimValid(dim_num, axes_dims[i]), OP_LOGE("reduce", "axes_dims is invalid"), return ge::GRAPH_FAILED);
++      T dim = axes_dims[i] < 0 ? axes_dims[i] + dim_num : axes_dims[i];
++      if (dim == j) {
++        reduce_flag = true;
++        break;
++      }
++    }
++    if (!reduce_flag) {
++      output_shape->AppendDim(x_shape->GetDim(j));
++    }
++  }
++
++  OP_LOGD("ReduceDimsWithoutKeepDims", "after reduce output shape is %s.", ToString(*output_shape).c_str());
++  return ge::GRAPH_SUCCESS;
++}
++
++template <typename T>
++ge::graphStatus ReduceDims(const gert::Shape* x_shape, const gert::Tensor* axes_tensor, int32_t axes_size,
++                           const bool keep_dims, gert::Shape* output_shape) {
++  const T* axes_dims = axes_tensor->GetData<T>();
++  if (keep_dims) {
++    return ReduceDimsWithKeepDims<T>(x_shape, axes_dims, axes_size, output_shape);
++  }
++  return ReduceDimsWithoutKeepDims<T>(x_shape, axes_dims, axes_size, output_shape);
++}
++}  // namespace ops
++#endif
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.cpp b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.cpp
+new file mode 100644
+index 00000000..0544afcd
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.cpp
+@@ -0,0 +1,657 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_tiling.cc
++ * \brief
++ */
++
++#include "reduce_sum_v2_tiling.h"
++#include "reduce_sum_v2_common.h"
++#include "register/op_def_registry.h"
++#include "platform/platform_info.h"
++#include "tiling/platform/platform_ascendc.h"
++#include "tiling/tiling_api.h"
++#include "tiling/tiling_base.h"
++#include "tiling/tiling_type.h"
++
++namespace {
++namespace vectorutil {
++int64_t CeilDiv(const int64_t dividend, const int64_t divisor) {
++  if (divisor == 0) {
++    return 0;
++  }
++  return (dividend + divisor - 1) / divisor;
++}
++
++int64_t FloorAlign(const int64_t dividend, const int64_t divisor) {
++  if (divisor == 0) {
++    return 0;
++  }
++  return dividend / divisor * divisor;
++}
++int64_t CeilAlign(const int64_t dividend, const int64_t divisor) {
++  return CeilDiv(dividend, divisor) * divisor;
++}
++} // namespace vectorutil
++}
++
++namespace optiling {
++    // Common
++    constexpr uint64_t RESERVED_UB_SIZE = 10 * 2048;
++    constexpr uint64_t CACHELINE = 512;
++    constexpr uint64_t BLOCK_SIZE = 32;
++    constexpr uint64_t BUFFER_NUM = 2;  // 开启DoubleBuffer
++    constexpr uint64_t ROWS_IN_UB = 128;
++    constexpr uint64_t UB_PROCESS_SIZE = 64 * 1024;
++    constexpr uint64_t UB_CACHE_PROCESS_SIZE = 64 * 1024;
++    constexpr uint64_t NUM_2 = 2;
++    constexpr uint64_t NUM_3 = 3;
++
++    // Tensor IDX
++    constexpr uint64_t X_IDX = 0;
++    constexpr uint64_t AXES_IDX = 1;
++    // Pattern
++    constexpr uint64_t PATTERN_AR = 0;
++    constexpr uint64_t PATTERN_ARA = 1;
++
++    struct CoreAndDataInfos {
++        uint64_t formerCoreNum = 0;
++        uint64_t tailCoreNum = 0;
++        uint64_t formerUnitDataLen = 0;
++        uint64_t tailUnitDataLen = 0;
++        uint64_t tailRealDataLen = 0;
++        uint64_t usedCoreNum = 1;
++    };
++
++    struct UbTilingInfos {
++        uint64_t formerATimes = 0;
++        uint64_t formerA = 0;
++        uint64_t tailA = 0;
++        uint64_t formerRTimes = 0;
++        uint64_t formerR = 0;
++        uint64_t tailR = 0;
++        uint64_t formerA1Times = 0;
++        uint64_t formerA1 = 0;
++        uint64_t tailA1 = 0;
++        uint64_t formerRealTimes = 0;
++        uint64_t tailRealData = 0;
++    };
++
++    struct BlockTilingInfos {
++        CoreAndDataInfos infosA;
++        CoreAndDataInfos infosR;
++        CoreAndDataInfos infosA1;
++    };
++
++    struct TilingInfos {
++        uint64_t A = 1;
++        uint64_t R = 1;
++        uint64_t A1 = 1;
++        uint64_t pattern = PATTERN_AR;
++        uint64_t usedCoreNum = 1;
++        uint64_t inBufferSize = 0;
++        uint64_t cacheBufferSize = 0;
++        uint64_t workspaceSize = 0;
++        UbTilingInfos ubInfos[NUM_2];
++        BlockTilingInfos blockInfos;
++    };
++
++    class ReduceSumV2Tiling {
++    public:
++        explicit ReduceSumV2Tiling(gert::TilingContext* context) : tilingContext_(context) {}
++        ge::graphStatus Init();
++        ge::graphStatus SetKernelTiling();
++        void TilingDataPrint() const;
++    private:
++        inline void SetProcessTiling(ReduceSumV2Process &tiling, const uint64_t &processId);
++        inline void SetTilingKeyMode();
++        inline void PrintBlockInfos(const BlockTilingInfos &blockInfos) const;
++        inline void PrintUbInfos(const UbTilingInfos &ubInfos) const;
++        inline uint64_t CalcDataSize(const uint64_t &A, const uint64_t &R);
++        inline void Tiling4Base();
++        inline void UbTiling(BlockTilingInfos &blockInfos, const uint64_t &pattern, UbTilingInfos (&ubInfos)[NUM_2]);
++        inline void UbTilingAR(const uint64_t &cutA, const uint64_t &cutR, const uint64_t &tailRealData, UbTilingInfos &ubInfos);
++        inline void UbTilingARA(const uint64_t &cutA, const uint64_t &cutR, const uint64_t &cutA1, const uint64_t &tailRealData, UbTilingInfos &ubInfos);
++        inline void BlockTiling(TilingInfos &tilingInfos);
++        inline void BlockTilingAR(TilingInfos &tilingInfos);
++        inline void BlockTilingARA(TilingInfos &tilingInfos);
++        inline void CalcCoreAndDataLen(uint64_t coreNum, const uint64_t &dataLen, const uint64_t &unitDataLen, CoreAndDataInfos &coreDataInfos);
++        inline uint64_t CalcTilingKey();
++        inline void CalcUbAndWsSize(TilingInfos &tilingInfos, const uint64_t &preocessId);
++
++        ReduceSumV2TilingData tilingData_;
++        gert::TilingContext* tilingContext_ = nullptr;
++    private:
++        uint64_t tilingKey_ = 0;
++        uint64_t coreNum_ = 0;
++        uint64_t usedCoreNum_ = 0;
++        uint64_t ubSize_ = 0;
++        uint64_t availableUb_ = 0;
++        std::vector<uint64_t> xShape_;
++        std::vector<uint64_t> axes_;
++        ge::DataType xDtype_;
++        uint64_t xDtypeSize_ = 4;
++        bool keepDims_ = false;
++        uint64_t processNum_ = 0;       // process次数，范围[1, 4]
++        uint64_t usedWorkspaceSize_ = 0;
++
++        TilingInfos tilingInfosList[4];
++    };
++
++    inline void ReduceSumV2Tiling::SetTilingKeyMode()
++    {
++        tilingKey_ = CalcTilingKey();
++        tilingContext_->SetTilingKey(tilingKey_);
++    }
++
++    ge::graphStatus ReduceSumV2Tiling::Init()
++    {
++        OP_LOGD(tilingContext_->GetNodeName(), "ReduceSumV2Tiling initing");
++        auto compileInfo = reinterpret_cast<const ReduceSumV2CompileInfo*>(tilingContext_->GetCompileInfo());
++        auto attrs = tilingContext_->GetAttrs();
++        keepDims_ = *(attrs->GetAttrPointer<uint64_t>)(0);
++        std::cout << "keepDims_: " << keepDims_ << std::endl;
++        auto xShape = tilingContext_->GetInputShape(X_IDX)->GetStorageShape();
++        for (size_t i = 0; i < xShape.GetDimNum(); i++) {
++            xShape_.emplace_back(xShape.GetDim(i));
++        }
++
++        ge::DataType axesDtype;
++        ge::graphStatus status = ReduceCommon::GetInputDtype(tilingContext_, X_IDX, xDtype_);
++        OP_TILING_CHECK((status == ge::GRAPH_FAILED),
++                        VECTOR_INNER_ERR_REPORT_TILIING(tilingContext_->GetNodeName(), "ReduceSum get axes dtype failed"),
++                        return ge::GRAPH_FAILED);
++        status = ReduceCommon::GetInputDtype(tilingContext_, AXES_IDX, axesDtype);
++        OP_TILING_CHECK((status == ge::GRAPH_FAILED),
++                        VECTOR_INNER_ERR_REPORT_TILIING(tilingContext_->GetNodeName(), "ReduceSum get axes dtype failed"),
++                        return ge::GRAPH_FAILED);
++        if (axesDtype == ge::DT_INT32) {
++            status = ReduceCommon::GetAxesData<int32_t>(tilingContext_, AXES_IDX, axes_);
++        } else if (axesDtype == ge::DT_INT64) {
++            status = ReduceCommon::GetAxesData<int64_t>(tilingContext_, AXES_IDX, axes_);
++        }
++        OP_TILING_CHECK((status == ge::GRAPH_FAILED),
++                        VECTOR_INNER_ERR_REPORT_TILIING(tilingContext_->GetNodeName(), "ReduceSum get axes const input failed"),
++                        return ge::GRAPH_FAILED);
++        
++        xDtypeSize_ = sizeof(float);
++        
++        coreNum_ = compileInfo->totalCoreNum;      
++        ubSize_ = compileInfo->ubSizePlatForm;
++        availableUb_ = std::min(ubSize_ - RESERVED_UB_SIZE, UB_PROCESS_SIZE);
++
++        Tiling4Base();
++        
++        size_t sysWorkspaceSize = compileInfo->sysWorkspaceSize;
++        sysWorkspaceSize = sysWorkspaceSize + usedWorkspaceSize_;
++        size_t *currentWorkSpace = tilingContext_->GetWorkspaceSizes(1);
++        currentWorkSpace[0] = sysWorkspaceSize;
++        SetTilingKeyMode();
++        
++        OP_LOGD(tilingContext_->GetNodeName(), "ReduceSumV2Tiling inited");
++        return ge::GRAPH_SUCCESS;
++    }
++
++    ge::graphStatus ReduceSumV2Tiling::SetKernelTiling()
++    {
++        for (auto tilingInfos : tilingInfosList) {
++            usedCoreNum_ = usedCoreNum_ < tilingInfos.usedCoreNum ? tilingInfos.usedCoreNum : usedCoreNum_;
++        }
++        tilingContext_->SetBlockDim(usedCoreNum_);
++        tilingData_.set_processNum(processNum_);
++        SetProcessTiling(tilingData_.process0, 0);
++        SetProcessTiling(tilingData_.process1, 1);
++        SetProcessTiling(tilingData_.process2, NUM_2);
++        SetProcessTiling(tilingData_.process3, NUM_3);
++
++        tilingData_.SaveToBuffer(tilingContext_->GetRawTilingData()->GetData(),
++                                tilingContext_->GetRawTilingData()->GetCapacity());
++        tilingContext_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
++        TilingDataPrint();
++        return ge::GRAPH_SUCCESS;
++    }
++
++    inline void ReduceSumV2Tiling::SetProcessTiling(ReduceSumV2Process &tiling, const uint64_t &processId)
++    {
++        tiling.set_A(tilingInfosList[processId].A);
++        tiling.set_R(tilingInfosList[processId].R);
++        tiling.set_A1(tilingInfosList[processId].A1);
++        tiling.set_pattern(tilingInfosList[processId].pattern);
++        tiling.set_usedCoreNum(tilingInfosList[processId].usedCoreNum);
++        tiling.set_inBufferSize(UB_PROCESS_SIZE / BUFFER_NUM);
++        tiling.set_cacheBufferSize(UB_CACHE_PROCESS_SIZE);
++
++        size_t ubInfosNum = NUM_2;
++        
++        const UbTilingInfos *ubInfos = tilingInfosList[processId].ubInfos;
++        uint64_t formerATimes[ubInfosNum];
++        uint64_t formerA[ubInfosNum];
++        uint64_t tailA[ubInfosNum];
++        uint64_t formerRTimes[ubInfosNum];
++        uint64_t formerR[ubInfosNum];
++        uint64_t tailR[ubInfosNum];
++        uint64_t formerA1Times[ubInfosNum];
++        uint64_t formerA1[ubInfosNum];
++        uint64_t tailA1[ubInfosNum];
++        uint64_t formerRealTimes[ubInfosNum];
++        uint64_t tailRealData[ubInfosNum];
++
++        for (size_t j = 0; j < ubInfosNum; j++) {
++            formerATimes[j] = ubInfos[j].formerATimes;
++            formerA[j] = ubInfos[j].formerA;
++            tailA[j] = ubInfos[j].tailA;
++            formerRTimes[j] = ubInfos[j].formerRTimes;
++            formerR[j] = ubInfos[j].formerR;
++            tailR[j] = ubInfos[j].tailR;
++            formerA1Times[j] = ubInfos[j].formerA1Times;
++            formerA1[j] = ubInfos[j].formerA1;
++            tailA1[j] = ubInfos[j].tailA1;
++            formerRealTimes[j] = ubInfos[j].formerRealTimes; 
++            tailRealData[j] = ubInfos[j].tailRealData; 
++        }
++        tiling.ubInfos.set_formerATimes(formerATimes);
++        tiling.ubInfos.set_formerA(formerA);
++        tiling.ubInfos.set_tailA(tailA);
++        tiling.ubInfos.set_formerRTimes(formerRTimes);
++        tiling.ubInfos.set_formerR(formerR);
++        tiling.ubInfos.set_tailR(tailR);
++        tiling.ubInfos.set_formerA1Times(formerA1Times);
++        tiling.ubInfos.set_formerA1(formerA1);
++        tiling.ubInfos.set_tailA1(tailA1);
++        tiling.ubInfos.set_formerRealTimes(formerRealTimes);
++        tiling.ubInfos.set_tailRealData(tailRealData);
++
++        CoreAndDataInfos &blockInfosA = tilingInfosList[processId].blockInfos.infosA;
++        tiling.blockA.set_usedCoreNum(blockInfosA.usedCoreNum);
++        tiling.blockA.set_formerCoreNum(blockInfosA.formerCoreNum);
++        tiling.blockA.set_formerUnitDataLen(blockInfosA.formerUnitDataLen);
++        tiling.blockA.set_tailUnitDataLen(blockInfosA.tailUnitDataLen);
++        tiling.blockA.set_tailRealDataLen(blockInfosA.tailRealDataLen);
++
++        CoreAndDataInfos &blockInfosR = tilingInfosList[processId].blockInfos.infosR;
++        tiling.blockR.set_usedCoreNum(blockInfosR.usedCoreNum);
++        tiling.blockR.set_formerCoreNum(blockInfosR.formerCoreNum);
++        tiling.blockR.set_formerUnitDataLen(blockInfosR.formerUnitDataLen);
++        tiling.blockR.set_tailUnitDataLen(blockInfosR.tailUnitDataLen);
++        tiling.blockR.set_tailRealDataLen(blockInfosR.tailRealDataLen);
++
++        CoreAndDataInfos &blockInfosA1 = tilingInfosList[processId].blockInfos.infosA1;
++        tiling.blockA1.set_usedCoreNum(blockInfosA1.usedCoreNum);
++        tiling.blockA1.set_formerCoreNum(blockInfosA1.formerCoreNum);
++        tiling.blockA1.set_formerUnitDataLen(blockInfosA1.formerUnitDataLen);
++        tiling.blockA1.set_tailUnitDataLen(blockInfosA1.tailUnitDataLen);
++        tiling.blockA1.set_tailRealDataLen(blockInfosA1.tailRealDataLen);
++    }
++
++    void ReduceSumV2Tiling::TilingDataPrint() const
++    {
++        OP_LOGD(tilingContext_->GetNodeName(), "tilingKey:                  %lu", tilingKey_);
++        OP_LOGD(tilingContext_->GetNodeName(), "coreNum:                    %lu", coreNum_);
++        OP_LOGD(tilingContext_->GetNodeName(), "ubSize:                     %lu", ubSize_);
++        OP_LOGD(tilingContext_->GetNodeName(), "usedCoreNum:                %lu", usedCoreNum_);
++        OP_LOGD(tilingContext_->GetNodeName(), "processNum:                 %lu", processNum_);
++        for (size_t i = 0; i < processNum_; i++) {
++            OP_LOGD(tilingContext_->GetNodeName(), "--- process %lu tiling data ---", i);
++            OP_LOGD(tilingContext_->GetNodeName(), "A:                          %lu", tilingInfosList[i].A);
++            OP_LOGD(tilingContext_->GetNodeName(), "R:                          %lu", tilingInfosList[i].R);
++            OP_LOGD(tilingContext_->GetNodeName(), "A1:                         %lu", tilingInfosList[i].A1);
++            OP_LOGD(tilingContext_->GetNodeName(), "pattern:                    %lu", tilingInfosList[i].pattern);
++            OP_LOGD(tilingContext_->GetNodeName(), "usedCoreNum:                %lu", tilingInfosList[i].usedCoreNum);
++            OP_LOGD(tilingContext_->GetNodeName(), "inBufferSize:               %lu", tilingInfosList[i].inBufferSize);
++            OP_LOGD(tilingContext_->GetNodeName(), "cacheBufferSize:            %lu", tilingInfosList[i].cacheBufferSize);
++            OP_LOGD(tilingContext_->GetNodeName(), "workspaceSize:              %lu", tilingInfosList[i].workspaceSize);
++            PrintBlockInfos(tilingInfosList[i].blockInfos);
++            for (size_t j = 0; j < NUM_2; j++) {
++                OP_LOGD(tilingContext_->GetNodeName(), "--- ubInfos %lu tiling data ---", i);
++                PrintUbInfos(tilingInfosList[i].ubInfos[j]);
++            }
++        }  
++    }
++
++    inline void ReduceSumV2Tiling::PrintBlockInfos(const BlockTilingInfos &blockInfos) const
++    {
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:usedCoreNum:            %lu", blockInfos.infosA.usedCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:formerCoreNum:          %lu", blockInfos.infosA.formerCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:tailCoreNum:            %lu", blockInfos.infosA.tailCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:formerUnitDataLen:      %lu", blockInfos.infosA.formerUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:tailUnitDataLen:        %lu", blockInfos.infosA.tailUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A]:tailRealDataLen:        %lu", blockInfos.infosA.tailRealDataLen);
++        
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:usedCoreNum:            %lu", blockInfos.infosR.usedCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:formerCoreNum:          %lu", blockInfos.infosR.formerCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:tailCoreNum:            %lu", blockInfos.infosR.tailCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:formerUnitDataLen:      %lu", blockInfos.infosR.formerUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:tailUnitDataLen:        %lu", blockInfos.infosR.tailUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[R]:tailRealDataLen:        %lu", blockInfos.infosR.tailRealDataLen);
++
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:usedCoreNum:           %lu", blockInfos.infosA1.usedCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:formerCoreNum:         %lu", blockInfos.infosA1.formerCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:tailCoreNum:           %lu", blockInfos.infosA1.tailCoreNum);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:formerUnitDataLen:     %lu", blockInfos.infosA1.formerUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:tailUnitDataLen:       %lu", blockInfos.infosA1.tailUnitDataLen);
++        OP_LOGD(tilingContext_->GetNodeName(), "[A1]:tailRealDataLen:       %lu", blockInfos.infosA1.tailRealDataLen);
++    }
++
++    inline void ReduceSumV2Tiling::PrintUbInfos(const UbTilingInfos &ubInfos) const
++    {
++        OP_LOGD(tilingContext_->GetNodeName(), "formerATimes                %lu", ubInfos.formerATimes);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerA:                    %lu", ubInfos.formerA);
++        OP_LOGD(tilingContext_->GetNodeName(), "tailA:                      %lu", ubInfos.tailA);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerRTimes                %lu", ubInfos.formerRTimes);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerR:                    %lu", ubInfos.formerR);
++        OP_LOGD(tilingContext_->GetNodeName(), "tailR:                      %lu", ubInfos.tailR);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerA1Times               %lu", ubInfos.formerA1Times);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerA1:                   %lu", ubInfos.formerA1);
++        OP_LOGD(tilingContext_->GetNodeName(), "tailA1:                     %lu", ubInfos.tailA1);
++        OP_LOGD(tilingContext_->GetNodeName(), "formerRealTimes:            %lu", ubInfos.formerRealTimes);
++        OP_LOGD(tilingContext_->GetNodeName(), "tailRealData:               %lu", ubInfos.tailRealData);
++    }
++
++    ge::graphStatus Tiling4ReduceSumV2(gert::TilingContext* context)
++    {
++        OP_LOGD(context->GetNodeName(), "TilingReduceSumV2 enter.");
++        if (context == nullptr) {
++            OP_LOGE(context->GetNodeName(), "The context is nullptr.");
++            return ge::GRAPH_FAILED;
++        }
++
++        ReduceSumV2Tiling tilingObject(context);
++        if (tilingObject.Init() != ge::GRAPH_SUCCESS) {
++            OP_LOGE(context->GetNodeName(), "tiling init fail");
++            return ge::GRAPH_FAILED;
++        }
++        return tilingObject.SetKernelTiling();
++    }
++
++    ge::graphStatus TilingPrepare4ReduceSumV2(gert::TilingParseContext* context)
++    {
++        OP_LOGD(context->GetNodeName(), "Tiling Prepare For ReduceSumV2 start");
++        auto compileInfo = GetCompileInfoPtr<ReduceSumV2CompileInfo>(context);
++        OPS_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
++        auto platformInfo = context->GetPlatformInfo();
++        OPS_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
++        auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
++        compileInfo->totalCoreNum = ascendcPlatform.GetCoreNumAiv();
++        uint64_t ubSizePlatForm;
++        ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSizePlatForm);
++        compileInfo->ubSizePlatForm = static_cast<int64_t>(ubSizePlatForm);
++        OP_TILING_CHECK((compileInfo->ubSizePlatForm <= 0),
++                        VECTOR_INNER_ERR_REPORT_TILIING(context->GetNodeName(), "Failed to get ub size"),
++                        return ge::GRAPH_FAILED);
++        OP_LOGD(context->GetNodeName(), "ub_size_platform is %lu", compileInfo->ubSizePlatForm);
++        uint64_t totalUbSize = 0;
++        platformInfo->GetLocalMemSize(fe::LocalMemType::UB, totalUbSize);
++        OP_LOGD(context->GetNodeName(), "total ub size is %lu", totalUbSize);
++        compileInfo->sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
++        OP_TILING_CHECK((compileInfo->sysWorkspaceSize < 0),
++                        VECTOR_INNER_ERR_REPORT_TILIING(context->GetNodeName(),
++                                                        "sysWorkspaceSize should be greater than or equal to zero"),
++                        return ge::GRAPH_FAILED);
++        OP_LOGD(context->GetNodeName(), "Tiling prepare for ReduceSumV2 end");
++        return ge::GRAPH_SUCCESS;
++    }
++    
++    inline uint64_t ReduceSumV2Tiling::CalcDataSize(const uint64_t &A, const uint64_t &R)
++    {
++        return A * vectorutil::CeilAlign(R * xDtypeSize_, BLOCK_SIZE);
++    }
++
++    inline void ReduceSumV2Tiling::Tiling4Base()
++    {
++        OP_LOGD(tilingContext_->GetNodeName(), "Tiling4Base start");
++        std::vector<uint64_t> xFusedShape;
++        ReduceCommon::DoFuseAxes(xShape_, axes_, xFusedShape, processNum_);
++        for (size_t processId = 0; processId < processNum_; processId++) {
++            // shape推导
++            tilingInfosList[processId].pattern = processId == processNum_ - 1 ? xFusedShape.size() % 2 : PATTERN_ARA;
++            uint64_t lastA = processId ? tilingInfosList[processId - 1].A : 1;
++            tilingInfosList[processId].A = lastA * xFusedShape[processId * 2];
++            tilingInfosList[processId].R = xFusedShape[processId * 2 + 1];
++            tilingInfosList[processId].A1 = tilingInfosList[processId].pattern == PATTERN_AR ? 1 :
++                                            std::accumulate(xFusedShape.begin() + (processId + 1) * 2, xFusedShape.end(), 1LL, std::multiplies<uint64_t>());
++            BlockTiling(tilingInfosList[processId]);
++            UbTiling(tilingInfosList[processId].blockInfos, tilingInfosList[processId].pattern, tilingInfosList[processId].ubInfos);
++            CalcUbAndWsSize(tilingInfosList[processId], processId);
++        }
++
++        OP_LOGD(tilingContext_->GetNodeName(), "Tiling4Base finished");
++    }
++
++    // UBTiling
++    inline void ReduceSumV2Tiling::UbTiling(BlockTilingInfos &blockInfos, const uint64_t &pattern, UbTilingInfos (&ubInfos)[NUM_2])
++    {
++        if (pattern == PATTERN_AR) {
++            if (blockInfos.infosR.usedCoreNum != 1) {
++                UbTilingAR(blockInfos.infosA.tailUnitDataLen, blockInfos.infosR.formerUnitDataLen, blockInfos.infosR.formerUnitDataLen, ubInfos[0]);
++            } else {
++                UbTilingAR(blockInfos.infosA.formerUnitDataLen, blockInfos.infosR.tailUnitDataLen, blockInfos.infosR.tailRealDataLen, ubInfos[0]);
++            }
++            UbTilingAR(blockInfos.infosA.tailUnitDataLen, blockInfos.infosR.tailUnitDataLen, blockInfos.infosR.tailRealDataLen, ubInfos[1]);
++        } else if (pattern == PATTERN_ARA) {
++            if (blockInfos.infosR.usedCoreNum != 1) {
++                UbTilingARA(blockInfos.infosA.tailUnitDataLen, blockInfos.infosR.formerUnitDataLen, blockInfos.infosA1.tailUnitDataLen, blockInfos.infosA1.tailRealDataLen, ubInfos[0]);
++            } else if (blockInfos.infosA1.usedCoreNum != 1) {
++                UbTilingARA(blockInfos.infosA.tailUnitDataLen, blockInfos.infosR.tailUnitDataLen, blockInfos.infosA1.formerUnitDataLen, blockInfos.infosA1.formerUnitDataLen, ubInfos[0]);
++            } else {
++                UbTilingARA(blockInfos.infosA.formerUnitDataLen, blockInfos.infosR.tailUnitDataLen, blockInfos.infosA1.tailUnitDataLen, blockInfos.infosA1.tailRealDataLen, ubInfos[0]);
++            }
++            UbTilingARA(blockInfos.infosA.tailUnitDataLen, blockInfos.infosR.tailUnitDataLen, blockInfos.infosA1.tailUnitDataLen, blockInfos.infosA1.tailRealDataLen, ubInfos[1]);
++        } else {
++            std::cout << "pattern do not support yet" << std::endl;
++        }
++    }
++
++    inline void ReduceSumV2Tiling::UbTilingAR(const uint64_t &cutA, const uint64_t &cutR, const uint64_t &tailRealData, UbTilingInfos &ubInfos)
++    {
++        // 当前切块是否能全载
++        uint64_t dataAlignSize = CalcDataSize(cutA, cutR);
++        uint64_t eachBufferSize = availableUb_ / BUFFER_NUM;
++        // UB不切分
++        ubInfos.formerATimes = 0;
++        ubInfos.formerA = 0;
++        ubInfos.tailA = cutA;
++        ubInfos.formerRTimes = 0;
++        ubInfos.formerR = 0;
++        ubInfos.tailR = cutR;
++        ubInfos.formerRealTimes = 0;
++        ubInfos.tailRealData = tailRealData;
++        if (dataAlignSize <= eachBufferSize) {
++            return;
++        }
++        // UB切A
++        dataAlignSize = CalcDataSize(1, cutR);
++        if (dataAlignSize <= eachBufferSize) {
++            ubInfos.formerA = eachBufferSize / vectorutil::CeilAlign(cutR * xDtypeSize_, BLOCK_SIZE);
++            ubInfos.formerATimes = cutA / ubInfos.formerA;
++            ubInfos.tailA = cutA % ubInfos.formerA;
++            return;
++        }
++        // UB切AR
++        ubInfos.formerA = 1;
++        ubInfos.formerATimes = cutA / ubInfos.formerA;
++        ubInfos.tailA = cutA % ubInfos.formerA;
++        if (cutA == 1) {
++            ubInfos.formerA = 0;
++            ubInfos.formerATimes = 0;
++            ubInfos.tailA = 1;
++        }
++        ubInfos.formerR = vectorutil::FloorAlign(eachBufferSize, CACHELINE) / xDtypeSize_; // 每行多少个CACHELINE
++        ubInfos.formerRTimes = cutR / ubInfos.formerR;
++        ubInfos.tailR = cutR % ubInfos.formerR;
++
++        ubInfos.formerRealTimes = tailRealData / ubInfos.formerR;
++        ubInfos.tailRealData = tailRealData % ubInfos.formerR;
++    }
++
++    inline void ReduceSumV2Tiling::UbTilingARA(const uint64_t &cutA, const uint64_t &cutR, const uint64_t &cutA1, const uint64_t &tailRealData, UbTilingInfos &ubInfos)
++    {
++        // 当前切块是否能全载
++        uint64_t dataAlignSize = CalcDataSize(cutA * cutR, cutA1);
++        uint64_t eachBufferSize = availableUb_ / BUFFER_NUM;
++        // UB不切分
++        ubInfos.formerATimes = 0;
++        ubInfos.formerA = 0;
++        ubInfos.tailA = cutA;
++        ubInfos.formerRTimes = 0;
++        ubInfos.formerR = 0;
++        ubInfos.tailR = cutR;
++        ubInfos.formerA1Times = 0;
++        ubInfos.formerA1 = 0;
++        ubInfos.tailA1 = cutA1;
++        ubInfos.formerRealTimes = 0;
++        ubInfos.tailRealData = tailRealData;
++        if (dataAlignSize <= eachBufferSize) {
++            return;
++        }
++
++        // UB切A，A最小单位为1
++        dataAlignSize = CalcDataSize(1 * cutR, cutA1);
++        if (dataAlignSize <= eachBufferSize) {
++            ubInfos.formerA = eachBufferSize / vectorutil::CeilAlign(cutR * cutA1 * xDtypeSize_, BLOCK_SIZE);
++            ubInfos.formerA = eachBufferSize / (cutR * cutA1);
++            ubInfos.formerATimes = cutA / ubInfos.formerA;
++            ubInfos.tailA = cutA % ubInfos.formerA;
++            return;
++        }
++        // UB切A1，A1最小单位为CACHELINE
++        ubInfos.formerA = 1;
++        ubInfos.formerATimes = cutA / ubInfos.formerA;
++        ubInfos.tailA = cutA % ubInfos.formerA;
++        if (ubInfos.formerATimes == 1) {
++            ubInfos.formerA = 0;
++            ubInfos.formerATimes = 0;
++            ubInfos.tailA = 1;
++        }
++        dataAlignSize = CalcDataSize(1 * cutR, CACHELINE / xDtypeSize_);
++        if (dataAlignSize <= eachBufferSize) {
++            ubInfos.formerA1 = eachBufferSize / (cutR * CACHELINE) * (CACHELINE / xDtypeSize_); // 每行多少个CACHELINE
++            ubInfos.formerA1Times = cutA1 / ubInfos.formerA1;
++            ubInfos.tailA1 = cutA1 % ubInfos.formerA1;
++            // 最后一个尾块
++            ubInfos.formerRealTimes = tailRealData / ubInfos.formerA1;
++            ubInfos.tailRealData = tailRealData % ubInfos.formerA1;
++            return;
++        }
++        // UB切R，R最小单位为2
++        ubInfos.formerA1 = CACHELINE / xDtypeSize_;
++        ubInfos.formerA1Times = cutA1 / ubInfos.formerA1;
++        ubInfos.tailA1 = cutA1 % ubInfos.formerA1;
++
++        ubInfos.formerRealTimes = tailRealData / ubInfos.formerA1;
++        ubInfos.tailRealData = tailRealData % ubInfos.formerA1;
++        if (ubInfos.formerA1Times == 1) {
++            ubInfos.tailA1 = ubInfos.formerA1;
++            ubInfos.tailRealData = tailRealData;
++            ubInfos.formerA1 = 0;
++            ubInfos.formerA1Times = 0;
++            ubInfos.formerRealTimes = 0;
++        }
++        ubInfos.formerR = eachBufferSize / CACHELINE;
++        ubInfos.formerRTimes = cutR / ubInfos.formerR;
++        ubInfos.tailR = cutR % ubInfos.formerR;
++        return;
++    }
++
++    // BlockTiling
++    inline void ReduceSumV2Tiling::BlockTiling(TilingInfos &tilingInfos)
++    {
++        if (tilingInfos.pattern == PATTERN_AR) {
++            BlockTilingAR(tilingInfos);
++        } else if (tilingInfos.pattern == PATTERN_ARA) {
++            BlockTilingARA(tilingInfos);
++        } else {
++            std::cout << "pattern do not support yet" << std::endl;
++        }
++    }
++
++    inline void ReduceSumV2Tiling::BlockTilingAR(TilingInfos &tilingInfos)
++    {
++        // A开核
++        CalcCoreAndDataLen(coreNum_, tilingInfos.A, 1, tilingInfos.blockInfos.infosA);
++        uint64_t remainCore4R = coreNum_ / tilingInfos.blockInfos.infosA.usedCoreNum;
++        // AR一起开核
++        CalcCoreAndDataLen(remainCore4R, tilingInfos.R, CACHELINE / xDtypeSize_, tilingInfos.blockInfos.infosR);        
++        tilingInfos.usedCoreNum = tilingInfos.blockInfos.infosA.usedCoreNum * tilingInfos.blockInfos.infosR.usedCoreNum;
++    }
++
++    inline void ReduceSumV2Tiling::BlockTilingARA(TilingInfos &tilingInfos)
++    {
++        // A先开多核
++        CalcCoreAndDataLen(coreNum_, tilingInfos.A, 1, tilingInfos.blockInfos.infosA);
++        uint64_t remainCore4A1 = coreNum_ / tilingInfos.blockInfos.infosA.usedCoreNum;
++        CalcCoreAndDataLen(remainCore4A1, tilingInfos.A1, CACHELINE / xDtypeSize_, tilingInfos.blockInfos.infosA1);
++        uint64_t remainCore4R = remainCore4A1 / tilingInfos.blockInfos.infosA1.usedCoreNum;
++        // 最少每个核处理两个R
++        remainCore4R = std::min(std::max(tilingInfos.R / 2, static_cast<uint64_t>(1)), remainCore4R);
++        CalcCoreAndDataLen(remainCore4R, tilingInfos.R, 1, tilingInfos.blockInfos.infosR);
++        tilingInfos.usedCoreNum = tilingInfos.blockInfos.infosA.usedCoreNum * tilingInfos.blockInfos.infosR.usedCoreNum * tilingInfos.blockInfos.infosA1.usedCoreNum;
++    }
++
++    inline void ReduceSumV2Tiling::CalcCoreAndDataLen(uint64_t coreNum, const uint64_t &dataLen, const uint64_t &unitDataLen, CoreAndDataInfos &coreDataInfos)
++    {
++        uint64_t unitDataNum = vectorutil::CeilDiv(dataLen, unitDataLen);
++        coreNum = std::min(unitDataNum, coreNum); // 数据量少于核数的情况
++        coreDataInfos.formerCoreNum = unitDataNum % std::max(static_cast<uint64_t>(1), coreNum);
++        coreDataInfos.tailCoreNum = coreNum - coreDataInfos.formerCoreNum;
++        coreDataInfos.formerUnitDataLen = vectorutil::CeilDiv(unitDataNum, coreNum) * unitDataLen;
++        coreDataInfos.tailUnitDataLen = unitDataNum / std::max(static_cast<uint64_t>(1), coreNum) * unitDataLen;
++        // 最后一个核实际处理数据
++        coreDataInfos.tailRealDataLen = dataLen - (coreDataInfos.formerCoreNum * coreDataInfos.formerUnitDataLen + (coreDataInfos.tailCoreNum - 1) * coreDataInfos.tailUnitDataLen);
++        coreDataInfos.usedCoreNum = coreDataInfos.formerCoreNum + coreDataInfos.tailCoreNum;
++    }
++
++    inline void ReduceSumV2Tiling::CalcUbAndWsSize(TilingInfos &tilingInfos, const uint64_t &preocessId)
++    {
++        uint64_t syncWorkspace = 0;
++        uint64_t tempWorkspace = 0;
++        if (tilingInfos.blockInfos.infosR.usedCoreNum != 1) {
++            tempWorkspace = tilingInfos.usedCoreNum * CACHELINE;
++            syncWorkspace = tilingInfos.blockInfos.infosA.usedCoreNum *
++                            tilingInfos.blockInfos.infosR.usedCoreNum *
++                            tilingInfos.blockInfos.infosA1.usedCoreNum * BLOCK_SIZE;
++        }
++        uint64_t outWorkspace = 0;
++        if (preocessId < processNum_ - 1) {
++            outWorkspace = tilingInfos.A * tilingInfos.A1 * xDtypeSize_;
++        }
++        tilingInfos.workspaceSize = syncWorkspace + tempWorkspace + outWorkspace;
++        usedWorkspaceSize_ = std::max(usedWorkspaceSize_, tilingInfos.workspaceSize);
++    }
++
++    inline uint64_t ReduceSumV2Tiling::CalcTilingKey()
++    {
++        uint64_t tilingkey;
++        switch (processNum_) {
++            case 1:
++                tilingkey = tilingInfosList[0].pattern;
++                break;
++            case 2:
++                tilingkey = RecursiveSum(tilingInfosList[1].pattern, tilingInfosList[0].pattern);
++                break;
++            case 3:
++                tilingkey = RecursiveSum(tilingInfosList[2].pattern, tilingInfosList[1].pattern,
++                                         tilingInfosList[0].pattern);
++                break;
++            case 4:
++                tilingkey = RecursiveSum(tilingInfosList[3].pattern, tilingInfosList[2].pattern,
++                                         tilingInfosList[1].pattern, tilingInfosList[0].pattern);
++                break;
++            default:
++                tilingkey = 0;
++        }
++        return tilingkey;
++    }
++
++    IMPL_OP_OPTILING(ReduceSumV2)
++        .Tiling(Tiling4ReduceSumV2)
++        .TilingParse<ReduceSumV2CompileInfo>(TilingPrepare4ReduceSumV2);
++
++} // namespace optiling
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.h b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.h
+new file mode 100644
+index 00000000..8b2c2c42
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_host/reduce_sum_v2_tiling.h
+@@ -0,0 +1,86 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_tiling.h
++ * \brief
++ */
++
++#ifndef REDUCE_SUM_V2_TILING_H
++#define REDUCE_SUM_V2_TILING_H
++
++#include "register/tilingdata_base.h"
++#include "tiling/tiling_api.h"
++#include "tiling/tiling_base.h"
++#include "tiling/tiling_type.h"
++
++namespace optiling {
++// ub
++BEGIN_TILING_DATA_DEF(ReduceSumV2UbInfos)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerATimes)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerA)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, tailA)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerRTimes)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerR)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, tailR)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerA1Times)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerA1)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, tailA1)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, formerRealTimes)
++    TILING_DATA_FIELD_DEF_ARR(uint64_t, 2, tailRealData)
++END_TILING_DATA_DEF
++REGISTER_TILING_DATA_CLASS(ReduceSumV2UbInfosOp, ReduceSumV2UbInfos)
++
++// block
++BEGIN_TILING_DATA_DEF(ReduceSumV2BlockInfos)
++    TILING_DATA_FIELD_DEF(uint64_t, usedCoreNum)
++    TILING_DATA_FIELD_DEF(uint64_t, formerCoreNum)
++    TILING_DATA_FIELD_DEF(uint64_t, tailCoreNum)
++    TILING_DATA_FIELD_DEF(uint64_t, formerUnitDataLen)
++    TILING_DATA_FIELD_DEF(uint64_t, tailUnitDataLen)
++    TILING_DATA_FIELD_DEF(uint64_t, tailRealDataLen)
++END_TILING_DATA_DEF
++REGISTER_TILING_DATA_CLASS(ReduceSumV2BlockInfosOp, ReduceSumV2BlockInfos)
++
++// process
++BEGIN_TILING_DATA_DEF(ReduceSumV2Process)
++    TILING_DATA_FIELD_DEF(uint64_t, A)
++    TILING_DATA_FIELD_DEF(uint64_t, R)
++    TILING_DATA_FIELD_DEF(uint64_t, A1)
++    TILING_DATA_FIELD_DEF(uint64_t, pattern)
++    TILING_DATA_FIELD_DEF(uint64_t, usedCoreNum)
++    TILING_DATA_FIELD_DEF(uint64_t, inBufferSize)
++    TILING_DATA_FIELD_DEF(uint64_t, cacheBufferSize)
++    TILING_DATA_FIELD_DEF(uint64_t, workspaceSize)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2UbInfos, ubInfos)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2BlockInfos, blockA)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2BlockInfos, blockR)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2BlockInfos, blockA1)
++END_TILING_DATA_DEF
++REGISTER_TILING_DATA_CLASS(ReduceSumV2ProcessOp, ReduceSumV2Process)
++
++// base
++BEGIN_TILING_DATA_DEF(ReduceSumV2TilingData)
++    TILING_DATA_FIELD_DEF(uint64_t, processNum)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2Process, process0)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2Process, process1)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2Process, process2)
++    TILING_DATA_FIELD_DEF_STRUCT(ReduceSumV2Process, process3)
++END_TILING_DATA_DEF
++
++REGISTER_TILING_DATA_CLASS(ReduceSumV2, ReduceSumV2TilingData)
++
++struct ReduceSumV2CompileInfo {
++    uint64_t totalCoreNum = 0;
++    uint64_t ubSizePlatForm = 0;
++    uint64_t sysWorkspaceSize = 0;
++};
++}
++#endif // REDUCE_SUM_V2_TILING_H
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_kernel/kernel_utils.h b/src/math/reduce_sum_v2/op_kernel/kernel_utils.h
+new file mode 100644
+index 00000000..9e36056f
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_kernel/kernel_utils.h
+@@ -0,0 +1,75 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file kernel_utils.h
++ * \brief
++ */
++#ifndef OPS_BUILT_IN_OP_ASCENDC_KERNEL_UTILS_H_
++#define OPS_BUILT_IN_OP_ASCENDC_KERNEL_UTILS_H_
++
++namespace ops {
++
++template<typename Tp, Tp v>
++struct IntegralConstant {
++    static constexpr Tp value = v;
++};
++using trueType = IntegralConstant<bool, true>;
++using falseType = IntegralConstant<bool, false>;
++template<typename, typename>
++struct IsSame
++    : public falseType {
++};
++template<typename Tp>
++struct IsSame<Tp, Tp>
++    : public trueType {
++};
++
++template <typename T>
++__aicore__ inline T Ceil(T a, T b)
++{
++    return (a + b - 1) / b;
++}
++
++template <typename T>
++__aicore__ inline T CeilAlign(T a, T b)
++{
++    return (a + b - 1) / b * b;
++}
++
++template <typename T>
++__aicore__ inline T CeilDiv(T a, T b)
++{
++    if (b == 0) {
++        return a;
++    }
++    return (a + b - 1) / b;
++}
++
++template <typename T>
++__aicore__ inline T FloorDiv(T a, T b)
++{
++    if (b == 0) {
++        return a;
++    }
++    return a / b;
++}
++
++template <typename T>
++__aicore__ inline T Aligned(T value, T alignment)
++{
++    if (alignment == 0) {
++        return value;
++    }
++    return (value + alignment - 1) / alignment * alignment;
++}
++
++}
++#endif  // OPS_BUILT_IN_OP_ASCENDC_KERNEL_UTILS_H_
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2.cpp b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2.cpp
+new file mode 100644
+index 00000000..779f8d33
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2.cpp
+@@ -0,0 +1,139 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2.cpp
++ * \brief
++ */
++
++#include "reduce_sum_v2_ar.h"
++#include "reduce_sum_v2_ara.h"
++using namespace AscendC;
++
++template<uint8_t processId>
++__aicore__ inline void GetProcessTilingData(const ReduceSumV2TilingData &tilingData, ReduceSumV2Process &processTiling)
++{
++    if constexpr (processId == 0) {
++        processTiling = tilingData.process0;
++    } else if constexpr (processId == 1) {
++        processTiling = tilingData.process1;
++    } else if constexpr (processId == 2) {
++        processTiling = tilingData.process2;
++    } else {
++        processTiling = tilingData.process3;
++    }
++}
++
++template<uint8_t processId, uint8_t processNum>
++__aicore__ inline void DoReduceSumAR(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, const ReduceSumV2TilingData &tilingData, TPipe *tpipe)
++{
++    ReduceSumV2Process processTiling;
++    GetProcessTilingData<processId>(tilingData, processTiling);
++    if (GetBlockIdx() < processTiling.usedCoreNum) {
++        if constexpr (processId == 0 && processId == processNum - 1) {
++            ReduceSumV2ARKernel<DTYPE_X, DTYPE_X, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        } else {
++            ReduceSumV2ARKernel<float, DTYPE_X, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        }
++    }
++}
++
++template<uint8_t processId, uint8_t processNum>
++__aicore__ inline void DoReduceSumARA(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, const ReduceSumV2TilingData &tilingData, TPipe *tpipe)
++{
++    ReduceSumV2Process processTiling;
++    GetProcessTilingData<processId>(tilingData, processTiling);
++    if (GetBlockIdx() < processTiling.usedCoreNum) {
++        if constexpr (processId == 0 && processId == processNum - 1) {
++            ReduceSumV2ARAKernel<DTYPE_X, DTYPE_X, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        } else if constexpr (processId == 0) {
++            ReduceSumV2ARAKernel<DTYPE_X, float, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        } else if constexpr (processId > 0 && processId == processNum - 1) {
++            ReduceSumV2ARAKernel<float, DTYPE_X, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        } else {
++            ReduceSumV2ARAKernel<float, float, processId, processNum> op(x, y, workspace, processTiling, tpipe);
++            op.Process();
++        }
++    }
++}
++
++
++extern "C" __global__ __aicore__ void reduce_sum_v2(GM_ADDR x, GM_ADDR axes, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
++    if (g_coreType == AIC) {
++        return;
++    }
++    if (workspace == nullptr) {
++        return;
++    }
++    GM_ADDR user = GetUserWorkspace(workspace);
++    if (user == nullptr) {
++        return;
++    }
++    GET_TILING_DATA(tilingData, tiling);
++    TPipe tpipe;
++    if (TILING_KEY_IS(0)) {
++        DoReduceSumAR<0, 1>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(1)) {
++        DoReduceSumARA<0, 1>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(10)) {
++        DoReduceSumARA<0, NUM_2>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumAR<1, NUM_2>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(11)) {
++        DoReduceSumARA<0, NUM_2>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<1, NUM_2>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(110)) {
++        DoReduceSumARA<0, NUM_3>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<1, NUM_3>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumAR<NUM_2, NUM_3>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(111)) {
++        DoReduceSumARA<0, NUM_3>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<1, NUM_3>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<NUM_2, NUM_3>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(1110)) {
++        DoReduceSumARA<0, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<1, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<NUM_2, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumAR<NUM_3, NUM_4>(x, y, workspace, tilingData, &tpipe);
++    } else if (TILING_KEY_IS(1111)) {
++        DoReduceSumARA<0, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<1, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<NUM_2, NUM_4>(x, y, workspace, tilingData, &tpipe);
++        tpipe.Reset();
++        SyncAll();
++        DoReduceSumARA<NUM_3, NUM_4>(x, y, workspace, tilingData, &tpipe);
++    }
++}
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ar.h b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ar.h
+new file mode 100644
+index 00000000..9ef5ac47
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ar.h
+@@ -0,0 +1,385 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_ar.h
++ * \brief
++ */
++
++#ifndef REDUCE_SUM_V2_AR_H
++#define REDUCE_SUM_V2_AR_H
++
++#include "kernel_tiling/kernel_tiling.h"
++#include "kernel_operator.h"
++#include "reduce_sum_v2_common.h"
++
++namespace AscendC {
++
++template<typename T_X, typename T_Y, uint8_t processId, uint8_t processNum>
++class ReduceSumV2ARKernel : public ReduceSumV2KernelBase<T_X, T_Y> {
++public:
++    __aicore__ inline ReduceSumV2ARKernel() = delete;
++    __aicore__ inline ReduceSumV2ARKernel(GM_ADDR x, GM_ADDR y, GM_ADDR workspace,
++                                          const ReduceSumV2Process &processTiling, TPipe *pipe)
++    {
++        InitParams(processTiling);
++        SetGmAddr(x, y, workspace);
++        InitBuffers(pipe);
++    }
++
++    __aicore__ inline void Process()
++    {   
++        uint64_t xAOffset; // 输入地址偏移
++        uint64_t yAOffset; // 输出地址偏移
++        // former
++        for (size_t a = 0; a < formerATimes; a++) {
++            xAOffset = a * formerA * this->R;
++            yAOffset = a * formerA;
++            ProcessR(xAOffset, yAOffset, formerA);
++        }
++        // tail
++        if (tailA) {
++            xAOffset = formerATimes * formerA * this->R;
++            yAOffset = formerATimes * formerA;
++            ProcessR(xAOffset, yAOffset, tailA);
++        }
++        // group WorkspaceReduceSum
++        if (needWorkspace) {
++            WorkspaceReduceSum();
++        }
++    }
++
++private:
++    __aicore__ inline void ProcessR(const uint64_t &xAOffset, const uint64_t &yOffset, const uint64_t &rows)
++    {
++        uint64_t xOffset;
++        rInCache_ = 0;
++        for (size_t r = 0; r < formerRTimes; r++) {
++            xOffset = xAOffset + r * formerR;
++            DoReduce(xOffset, yOffset, rows, formerR);
++            rInCache_++;
++        }
++        if (tailR) {
++            xOffset = xAOffset + formerRTimes * formerR;
++            DoReduce(xOffset, yOffset, rows, tailR);
++            rInCache_++;
++        }
++        // R处理完，reduceCache
++        if (needCache) {
++            BinaryReduceSumInCache<ReducePattern::AR, true>(rows, rInCache_);
++            if (needWorkspace) {
++                CopyOutY2Ws(0, rows);
++            } else {
++                CopyOutY2Gm(yOffset, rows);
++            }
++        }
++    }
++
++    __aicore__ inline void InitParams(const ReduceSumV2Process &processTiling)
++    {
++        needInCast_ = !std::is_same<T_X, float>::value;
++        needOutCast_ = !std::is_same<T_Y, float>::value;
++        this->InitBasicParams(processTiling);
++        blockAIdx_ = this->blockIdx_ / this->blockR.usedCoreNum;
++        blockRIdx_ = this->blockIdx_ % this->blockR.usedCoreNum;
++
++        // 0: 只切A；1: 切AR
++        uint64_t ubInfosOffset = 0;
++
++        if ((this->blockA.usedCoreNum && blockAIdx_ >= this->blockA.formerCoreNum) &&
++            (this->blockR.usedCoreNum && blockRIdx_ >= this->blockR.formerCoreNum)) {
++            ubInfosOffset = 1;
++        }
++
++        formerATimes = this->ubInfos[ubInfosOffset].formerATimes;
++        formerA = this->ubInfos[ubInfosOffset].formerA;
++        tailA = this->ubInfos[ubInfosOffset].tailA;
++        formerRTimes = this->ubInfos[ubInfosOffset].formerRTimes;
++        formerR = this->ubInfos[ubInfosOffset].formerR;
++        tailR = this->ubInfos[ubInfosOffset].tailR;
++        if (blockRIdx_ == this->blockR.usedCoreNum - 1) {
++            formerRTimes = this->ubInfos[ubInfosOffset].formerRealTimes;
++            tailR = this->ubInfos[ubInfosOffset].tailRealData;
++        }
++        inBufferSize_ = processTiling.inBufferSize;
++        cacheBufferSize_ = processTiling.cacheBufferSize;
++        outBufferSize_ = ops::CeilAlign(formerA, this->xFp32Align_) * sizeof(float);
++        needCache = formerRTimes != 0;
++        needWorkspace = this->blockR.usedCoreNum != 1;
++        maxRInCache_ = cacheBufferSize_ / formerA / BLOCK_SIZE;
++    }
++
++    __aicore__ inline void InitBuffers(TPipe *pipe)
++    {
++        pipe->InitBuffer(dataInQue_, BUFFER_NUM, inBufferSize_);
++        pipe->InitBuffer(dataOutQue_, BUFFER_NUM, outBufferSize_);
++        pipe->InitBuffer(cacheBuf_, cacheBufferSize_);
++        if (needInCast_) {
++            pipe->InitBuffer(dataInCastQue_, BUFFER_NUM, inBufferSize_ / 2);
++        }
++    }
++
++    __aicore__ inline void SetGmAddr(GM_ADDR x, GM_ADDR y, GM_ADDR workspace)
++    {
++        uint64_t xOffset = 0;
++        uint64_t yOffset = 0;
++        uint64_t baseWsOffset = 0;
++
++        xOffset += this->GetOffset(blockAIdx_, this->R, this->blockA);
++        xOffset += this->GetOffset(blockRIdx_, 1, this->blockR);
++
++        yOffset += this->GetOffset(blockAIdx_, 1, this->blockA);
++
++        if (processId % 2) {
++            this->xGm_.SetGlobalBuffer((__gm__ T_X*)workspace + xOffset);
++            baseWsOffset = this->A * this->R;
++        } else {
++            this->xGm_.SetGlobalBuffer((__gm__ T_X*)x + xOffset);
++        }
++        this->yGm_.SetGlobalBuffer((__gm__ T_Y*)y + yOffset);
++
++        if (needWorkspace) {
++            uint64_t syncOffset = this->blockA.usedCoreNum * this->blockR.usedCoreNum * BLOCK_SIZE / sizeof(float);
++            uint64_t wsOffset = blockAIdx_ * this->blockR.usedCoreNum + blockRIdx_;
++            
++            syncGm_.SetGlobalBuffer((__gm__ int32_t*)workspace + ops::CeilDiv(baseWsOffset * sizeof(float), sizeof(int32_t))); // group
++            wsGm_.SetGlobalBuffer((__gm__ float*)workspace + ops::CeilAlign(baseWsOffset * sizeof(float), sizeof(int32_t)) / sizeof(float)
++                                                         + syncOffset + wsOffset); // group
++            uint64_t syncDataNum = BLOCK_SIZE / sizeof(int32_t);
++            GlobalTensor<int32_t> thisSyncGm = syncGm_[this->blockIdx_ * syncDataNum];
++            InitGlobalMemory(thisSyncGm, syncDataNum, 0);
++            this->MTE3ToMTE2Sync();
++        }
++    }
++
++    __aicore__ inline void DoReduce(const uint64_t &xOffset, const uint64_t &yOffset, const uint64_t &rows, const uint64_t &cols)
++    {
++        CopyIn(xOffset, rows, cols);
++        if (needCache) {
++            if (rInCache_ == maxRInCache_) {
++                BinaryReduceSumInCache<ReducePattern::AR, false>(rows, rInCache_);
++                rInCache_ = 1;
++            }
++            ReduceSumProcess(rows, cols, rInCache_);
++        } else {
++            ReduceSumProcess(rows, cols);
++            if (needWorkspace) {
++                CopyOutY2Ws(0, rows);
++            } else {
++                CopyOutY2Gm(yOffset, rows);
++            }
++        }
++    }
++
++    __aicore__ inline void ReduceSumProcess(const uint64_t &rows, const uint64_t &cols, const uint64_t &cacheOffset = 0)
++    {
++        if (needCache) {
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> cacheLocal = cacheBuf_.Get<float>();
++            BinaryReduceSum<ReducePattern::AR>(cacheLocal[cacheOffset], xLocal, rows, cols);
++            dataInQue_.FreeTensor<float>(xLocal);
++            /////
++        } else {
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++            BinaryReduceSum<ReducePattern::AR>(yLocal, xLocal, rows, cols);
++            dataInQue_.FreeTensor<float>(xLocal);
++            dataOutQue_.EnQue<float>(yLocal);
++        }
++    }
++
++    // 多行 - 连续 A,A 不需要cache直接输出到yGm
++    template<ReducePattern pattern>
++    __aicore__ inline void BinaryReduceSum(const LocalTensor<float> &dstLocal,
++                                           const LocalTensor<float> &srcLocal,
++                                           const uint64_t &rows,
++                                           const uint64_t &cols)
++    {
++        uint64_t dstOffset;
++        for (size_t row = 0; row < rows; row++) {
++            uint64_t reduceNum = cols;
++            uint64_t offset0 = row * ops::CeilAlign(cols, this->xAlign_); // 32B对齐
++            while (reduceNum > wholeReduceNum) {
++                uint64_t point = this->FindCutPoint(reduceNum);
++                uint64_t remain = reduceNum - point;
++                uint64_t calCount = this->Min(point, remain);                    
++                uint64_t offset1 = offset0 + point;
++                Add(srcLocal[offset0], srcLocal[offset0], srcLocal[offset1], calCount);
++                reduceNum = point;
++            }
++            
++            if (needCache) {
++                dstOffset = row * ops::CeilAlign(formerRTimes + static_cast<uint64_t>(tailR != 0), this->xFp32Align_);
++            } else {
++                dstOffset = row;
++            }
++            UnitReduceSum(dstLocal[dstOffset], srcLocal[offset0], reduceNum);
++        }
++    }
++
++    template<ReducePattern pattern, bool is2Gm>
++    __aicore__ inline void BinaryReduceSumInCache(const uint64_t &rows, const uint64_t &reduceNum)
++    {
++        if (is2Gm) {
++            LocalTensor<float> cacheLocal = cacheBuf_.Get<float>();
++            LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++            uint64_t curReduceNum = reduceNum;
++            for (size_t row = 0; row < rows; row++) {
++                uint64_t offset0 = row * ops::CeilAlign(formerRTimes + static_cast<uint64_t>(tailR != 0), this->xFp32Align_); // 32B对齐
++                while (curReduceNum > wholeReduceNum) {
++                    uint64_t point = this->FindCutPoint(curReduceNum);
++                    uint64_t remain = curReduceNum - point;
++                    uint64_t calCount = this->Min(point, remain);                    
++                    uint64_t offset1 = offset0 + point;
++                    Add(cacheLocal[offset0], cacheLocal[offset0], cacheLocal[offset1], calCount);
++                    curReduceNum = point;
++                }
++                UnitReduceSum(yLocal[row], cacheLocal[offset0], curReduceNum);
++            }
++            dataOutQue_.EnQue<float>(yLocal);
++        }
++    }
++    
++    __aicore__ inline void UnitReduceSum(const LocalTensor<float> &dstLocal, const LocalTensor<float> &srcLocal, const uint64_t &curReduceNum)
++    {
++        if (likely(curReduceNum > 1)) {
++            WholeReduceSum<float>(dstLocal, srcLocal, curReduceNum, 1, 1, 1, 8);
++        } else {
++            dstLocal.SetValue(0, srcLocal.GetValue(0));
++        }
++    }
++
++    __aicore__ inline void CopyIn(const uint64_t &xOffset, const uint64_t &rows, const uint64_t &curReduceNum)
++    {
++        LocalTensor<T_X> xLocal;
++        if (needInCast_) {
++            xLocal = dataInCastQue_.AllocTensor<T_X>();
++        } else {
++            xLocal = dataInQue_.AllocTensor<T_X>();
++        }
++        uint8_t padNum = (this->xAlign_ - curReduceNum % this->xAlign_) % this->xAlign_;
++        // 非连续
++        DataCopyExtParams copyParams{static_cast<uint16_t>(rows), static_cast<uint32_t>(sizeof(T_X) * curReduceNum),
++                                     static_cast<uint32_t>((this->R - curReduceNum) * sizeof(T_X)), 0, 0};
++        DataCopyPadExtParams<T_X> padParams{true, 0, padNum, 0};
++        DataCopyPad(xLocal, this->xGm_[xOffset], copyParams, padParams);
++        if (needInCast_) {
++            dataInCastQue_.EnQue<T_X>(xLocal);
++            DoInCast(rows, curReduceNum);
++        } else {
++            dataInQue_.EnQue<T_X>(xLocal);
++        }
++    }
++
++    // group 连续搬出
++    __aicore__ inline void CopyOutY2Ws(const uint64_t &wsOffset, const uint64_t &dataNum)
++    {
++        LocalTensor<float> wsLocal = dataOutQue_.DeQue<float>();
++        DataCopyExtParams wsCopyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(sizeof(float) * dataNum), 0, 0, 0};
++        DataCopyPad(wsGm_[wsOffset], wsLocal, wsCopyParams);
++        dataOutQue_.FreeTensor<float>(wsLocal);
++    }
++
++    __aicore__ inline void CopyOutY2Gm(const uint64_t &yOffset, const uint64_t &dataNum)
++    {
++        if (needOutCast_) {
++            DoOutCast(dataNum);
++        }
++        LocalTensor<T_Y> yLocal = dataOutQue_.DeQue<T_Y>();
++        DataCopyExtParams yCopyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(sizeof(T_Y) * dataNum), 0, 0, 0};
++        DataCopyPad(this->yGm_[yOffset], yLocal, yCopyParams);
++        dataOutQue_.FreeTensor<T_Y>(yLocal);
++    }
++
++    // group AR处理，连续搬出，规约核处理
++    __aicore__ inline void WorkspaceReduceSum()
++    {
++        // 这行的其他核都算完了
++        LocalTensor<int32_t> syncBuf = cacheBuf_.Get<int32_t>();
++        IBSet(syncGm_, syncBuf, this->blockIdx_, 0);
++        if (this->blockRIdx_ == 0) {
++            for (size_t coreId = 0; coreId < this->blockR.usedCoreNum; coreId++) {
++                IBWait(syncGm_, syncBuf, this->blockIdx_ + coreId, 0);
++            }
++            // 统一在这行的首个核规约
++            CopyInFromWs(this->blockR.usedCoreNum);
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++            UnitReduceSum(yLocal, xLocal, this->blockR.usedCoreNum);
++            dataInQue_.FreeTensor<float>(xLocal);
++            dataOutQue_.EnQue<float>(yLocal);
++            CopyOutY2Gm(0, 1);
++        }
++    }
++
++    __aicore__ inline void CopyInFromWs(const uint64_t &curReduceNum)
++    {
++        LocalTensor<float> xLocal = dataInQue_.AllocTensor<float>();
++        uint8_t padNum = (this->xFp32Align_ - curReduceNum % this->xFp32Align_) % this->xFp32Align_;
++        // 非连续
++        DataCopyExtParams copyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(sizeof(float) * curReduceNum), 0, 0, 0};
++        
++        DataCopyPadExtParams<float> padParams{true, 0, padNum, 0};
++        DataCopyPad(xLocal, wsGm_, copyParams, padParams);
++        dataInQue_.EnQue<float>(xLocal);
++    }
++
++    __aicore__ inline void DoOutCast(const uint64_t &dataNum)
++    {
++        LocalTensor<float> yLocalFp32 = dataOutQue_.DeQue<float>();
++        LocalTensor<T_Y> yLocal = yLocalFp32.template ReinterpretCast<T_Y>();
++        Cast(yLocal, yLocalFp32, RoundMode::CAST_RINT, dataNum);
++        dataOutQue_.EnQue<float>(yLocalFp32);
++    }
++
++    __aicore__ inline void DoInCast(const uint64_t &rows, const uint64_t &cols)
++    {
++        uint64_t dataNum = rows * ops::CeilAlign(cols, this->xAlign_);
++        LocalTensor<T_X> xLocal = dataInCastQue_.DeQue<T_X>();
++        LocalTensor<float> xLocalFp32 = dataInQue_.AllocTensor<float>();
++        Cast(xLocalFp32, xLocal, RoundMode::CAST_NONE, dataNum);
++        dataInCastQue_.FreeTensor<T_X>(xLocal);
++        dataInQue_.EnQue<float>(xLocalFp32);
++    }
++
++private:
++    uint64_t inBufferSize_;
++    uint64_t cacheBufferSize_;
++    uint64_t outBufferSize_;
++    uint64_t wholeReduceNum = WHOLE_REDUCE_SIZE / sizeof(float);
++    uint64_t reduceNumInCache_ = 0;
++    uint64_t r2Cache;
++    bool needCache = false; //切分R需要cache
++    bool needWorkspace = false;
++    bool needInCast_ = false;
++    bool needOutCast_ = false;
++    uint64_t rInCache_;
++
++    TQue<TPosition::VECIN, BUFFER_NUM> dataInQue_;
++    TQue<TPosition::VECIN, BUFFER_NUM> dataInCastQue_;
++    TQue<TPosition::VECOUT, BUFFER_NUM> dataOutQue_;
++    TBuf<TPosition::VECCALC> cacheBuf_;
++
++    uint64_t blockAIdx_;
++    uint64_t blockRIdx_;
++    uint64_t formerATimes;
++    uint64_t formerA;
++    uint64_t tailA;
++    uint64_t formerRTimes;
++    uint64_t formerR;
++    uint64_t tailR;
++
++    GlobalTensor<float> wsGm_;
++    GlobalTensor<int32_t> syncGm_;
++    uint64_t maxRInCache_;
++};
++}
++
++#endif // REDUCE_SUM_V2_AR_H
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ara.h b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ara.h
+new file mode 100644
+index 00000000..f9e152e2
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_ara.h
+@@ -0,0 +1,454 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_ara.h
++ * \brief
++ */
++
++#ifndef REDUCE_SUM_V2_ARA_H
++#define REDUCE_SUM_V2_ARA_H
++
++#include "kernel_tiling/kernel_tiling.h"
++#include "kernel_operator.h"
++#include "reduce_sum_v2_common.h"
++
++namespace AscendC {
++
++template<typename T_X, typename T_Y, uint8_t processId, uint8_t processNum>
++class ReduceSumV2ARAKernel : public ReduceSumV2KernelBase<T_X, T_Y> {
++public:
++    __aicore__ inline ReduceSumV2ARAKernel() = delete;
++    __aicore__ inline ReduceSumV2ARAKernel(GM_ADDR x, GM_ADDR y, GM_ADDR workspace,
++                                          const ReduceSumV2Process &processTiling, TPipe *pipe)
++    {
++        InitParams(processTiling);
++        SetGmAddr(x, y, workspace);
++        InitBuffers(pipe);
++    }
++
++    // A -> A1 -> R
++    __aicore__ inline void Process()
++    {
++        uint64_t xAOffset; // 输入地址偏移
++        uint64_t yAOffset; // 输出地址偏移
++        // former
++        for (size_t a = 0; a < formerATimes; a++) {
++            for (size_t i = 0; i < formerA; i++) {
++                xAOffset = (a * formerA + i) * this->R * this->A1;
++                yAOffset = (a * formerA + i) * this->A1;
++                ProcessA1(xAOffset, yAOffset);
++            }
++        }
++        // tail
++        if (tailA) {
++            for (size_t i = 0; i < tailA; i++) {
++                xAOffset = (formerATimes * formerA + i) * this->R * this->A1;
++                yAOffset = (formerATimes * formerA + i) * this->A1;
++                ProcessA1(xAOffset, yAOffset);
++            }
++        }
++        // group WorkspaceReduceSum
++        if (needWorkspace) {
++            WorkspaceReduceSum();
++        }
++    }
++
++private:
++    __aicore__ inline void InitParams(const ReduceSumV2Process &processTiling)
++    {
++        needInCast_ = !std::is_same<T_X, float>::value;
++        needOutCast_ = !std::is_same<T_Y, float>::value;
++        this->InitBasicParams(processTiling);
++        this->InitBlockParams(this->blockA1, processTiling.blockA1);
++        blockAIdx_ = this->blockIdx_ / (this->blockR.usedCoreNum * this->blockA1.usedCoreNum);
++        blockRIdx_ = this->blockIdx_ % (this->blockR.usedCoreNum * this->blockA1.usedCoreNum) / this->blockA1.usedCoreNum;
++        blockA1Idx_ = this->blockIdx_ % (this->blockR.usedCoreNum * this->blockA1.usedCoreNum) % this->blockA1.usedCoreNum;
++
++        uint64_t ubInfosOffset = 0;
++        if ((this->blockA.usedCoreNum && blockAIdx_ >= this->blockA.formerCoreNum) &&
++            (this->blockR.usedCoreNum && blockRIdx_ >= this->blockR.formerCoreNum) &&
++            (this->blockA1.usedCoreNum && blockA1Idx_ >= this->blockA1.formerCoreNum)) {
++            ubInfosOffset = 1;
++        }
++        
++        formerATimes = this->ubInfos[ubInfosOffset].formerATimes;
++        formerA = this->ubInfos[ubInfosOffset].formerA;
++        tailA = this->ubInfos[ubInfosOffset].tailA;
++        formerRTimes = this->ubInfos[ubInfosOffset].formerRTimes;
++        formerR = this->ubInfos[ubInfosOffset].formerR;
++        tailR = this->ubInfos[ubInfosOffset].tailR;
++        formerA1Times = this->ubInfos[ubInfosOffset].formerA1Times;
++        formerA1 = this->ubInfos[ubInfosOffset].formerA1;
++        tailA1 = this->ubInfos[ubInfosOffset].tailA1;
++        if (blockA1Idx_ == this->blockA1.usedCoreNum - 1) {
++            formerA1Times = this->ubInfos[ubInfosOffset].formerRealTimes;
++            tailA1 = this->ubInfos[ubInfosOffset].tailRealData;
++        }
++        inBufferSize_ = processTiling.inBufferSize;
++        cacheBufferSize_ = processTiling.cacheBufferSize;
++        outBufferSize_ = ops::CeilAlign(formerA1, this->xFp32Align_) * sizeof(float);
++        needCache = this->R > inBufferSize_ / CACHELINE;
++        needWorkspace = this->blockR.usedCoreNum != 1;
++    }
++
++    __aicore__ inline void InitBuffers(TPipe *pipe)
++    {
++        pipe->InitBuffer(dataInQue_, BUFFER_NUM, inBufferSize_);
++        pipe->InitBuffer(dataOutQue_, BUFFER_NUM, outBufferSize_);
++        pipe->InitBuffer(cacheBuf_, cacheBufferSize_);
++        if (needWorkspace) {
++            pipe->InitBuffer(syncBuf_, BLOCK_SIZE);
++        }
++        if (needInCast_) {
++            pipe->InitBuffer(dataInCastQue_, BUFFER_NUM, inBufferSize_ / 2);
++        }
++    }
++
++    __aicore__ inline void SetGmAddr(GM_ADDR x, GM_ADDR y, GM_ADDR workspace)
++    {
++        uint64_t xOffset = 0;
++        uint64_t yOffset = 0;
++        uint64_t wsOffset = 0;
++        uint64_t syncOffset = 0;
++        uint64_t baseWsOffset = 0;
++
++        xOffset += this->GetOffset(blockAIdx_, this->R * this->A1, this->blockA);
++        xOffset += this->GetOffset(blockRIdx_, this->A1, this->blockR);
++        xOffset += this->GetOffset(blockA1Idx_, 1, this->blockA1);
++
++        yOffset += this->GetOffset(blockAIdx_, this->A1, this->blockA);
++        yOffset += this->GetOffset(blockA1Idx_, 1, this->blockA1);
++
++        if (processId == processNum - 1) {
++            if (processId % 2) {
++                this->xGm_.SetGlobalBuffer((__gm__ T_X*)workspace + xOffset);
++                baseWsOffset = this->A * this->R * this->A1;
++            } else {
++                this->xGm_.SetGlobalBuffer((__gm__ T_X*)x + xOffset);
++            }
++            this->yGm_.SetGlobalBuffer((__gm__ T_Y*)y + yOffset);
++        } else {
++            if (processId % 2) {
++                this->xGm_.SetGlobalBuffer((__gm__ T_X*)workspace + xOffset);
++                this->yGm_.SetGlobalBuffer((__gm__ T_Y*)x + yOffset);
++                baseWsOffset = this->A * this->R * this->A1;
++            } else {
++                this->xGm_.SetGlobalBuffer((__gm__ T_X*)x + xOffset);
++                this->yGm_.SetGlobalBuffer((__gm__ T_Y*)workspace + yOffset);
++                baseWsOffset = this->A * this->A1;
++            }            
++        }
++        
++        if (needWorkspace) {
++            syncOffset = this->blockA.usedCoreNum * this->blockR.usedCoreNum * this->blockA1.usedCoreNum * BLOCK_SIZE / sizeof(float);
++            wsOffset += blockAIdx_ * this->blockR.usedCoreNum * this->blockA1.usedCoreNum * this->blockA1.formerUnitDataLen;
++            wsOffset += blockRIdx_ * this->blockA1.usedCoreNum * this->blockA1.formerUnitDataLen;
++            wsOffset += blockA1Idx_ * this->blockA1.formerUnitDataLen;
++            syncGm_.SetGlobalBuffer((__gm__ int32_t*)workspace + ops::CeilDiv(baseWsOffset * sizeof(float), sizeof(int32_t))); // group
++            wsGm_.SetGlobalBuffer((__gm__ float*)workspace + ops::CeilAlign(baseWsOffset * sizeof(float), sizeof(int32_t)) / sizeof(float)
++                                                         + syncOffset + wsOffset); // group
++            uint64_t syncDataNum = BLOCK_SIZE / sizeof(int32_t);
++            GlobalTensor<int32_t> thisSyncGm = syncGm_[this->blockIdx_ * syncDataNum];
++            InitGlobalMemory(thisSyncGm, syncDataNum, 0);
++            this->MTE3ToMTE2Sync();
++        }
++    }
++
++    __aicore__ inline void ProcessA1(const uint64_t &xAOffset, const uint64_t &yAOffset)
++    {
++        uint64_t xAA1Offset;
++        uint64_t yOffset;
++        // former
++        for (size_t a1 = 0; a1 < formerA1Times; a1++) {
++            xAA1Offset = xAOffset + a1 * formerA1;
++            yOffset = yAOffset + a1 * formerA1;
++            ProcessR(xAA1Offset, yOffset, formerA1);
++        }
++        // tail
++        if (tailA1) {
++            xAA1Offset = xAOffset + formerA1Times * formerA1;
++            yOffset = yAOffset + formerA1Times * formerA1;
++            ProcessR(xAA1Offset, yOffset, tailA1);
++        }
++    }
++
++    __aicore__ inline void ProcessR(const uint64_t &xAA1Offset, const uint64_t &yOffset, const uint64_t &cols)
++    {
++        uint64_t xOffset;
++        uint64_t cacheOffset = 0;
++        rInCache_ = 0;   // 初始化
++        // calcMaxR
++        maxRInCache_ = cacheBufferSize_ / (ops::CeilAlign(cols, this->xFp32Align_) * sizeof(float));
++        // former
++        for (size_t rTime = 0; rTime < formerRTimes; rTime++) {
++            xOffset = xAA1Offset + rTime * formerR * this->A1;
++            cacheOffset += static_cast<uint64_t>(rTime != 0) * ops::CeilAlign(cols, this->xFp32Align_);
++            DoReduce(xOffset, yOffset, cacheOffset, formerR, cols);
++            rInCache_++;
++        }
++        // tail
++        if (tailR) {
++            xOffset = xAA1Offset + formerRTimes * formerR * this->A1;
++            cacheOffset += static_cast<uint64_t>(formerRTimes != 0) * ops::CeilAlign(cols, this->xFp32Align_);
++            DoReduce(xOffset, yOffset, cacheOffset, tailR, cols);
++            rInCache_++;
++        }
++        // 缓存内Reduce
++        if (needCache) {
++            BinaryReduceSumInCache<ReducePattern::RA, true>(rInCache_, cols);
++            if (needWorkspace) {
++                CopyOutY2Ws(0, cols);
++            } else {
++                CopyOutY2Gm(yOffset, cols);
++            }
++        }
++    }
++
++    __aicore__ inline void DoReduce(const uint64_t &xOffset, const uint64_t &yOffset, uint64_t &cacheOffset,
++                                    const uint64_t &rows, const uint64_t &cols)
++    {
++        CopyIn(xOffset, rows, cols, this->A1);
++        if (needCache) {
++            // 如果缓存满了，需要缓存内Reduce
++            if (rInCache_ == maxRInCache_) {
++                BinaryReduceSumInCache<ReducePattern::RA, false>(rInCache_, cols);
++                rInCache_ = 1;
++                cacheOffset -= (maxRInCache_ - 1) * ops::CeilAlign(cols, this->xFp32Align_); // ??
++            }
++            ReduceSumProcess(rows, cols, cacheOffset);
++        } else {
++            ReduceSumProcess(rows, cols);
++            if (needWorkspace) {
++                CopyOutY2Ws(0, cols);
++            } else {
++                CopyOutY2Gm(yOffset, cols);
++            }
++        }
++    }
++
++    __aicore__ inline void ReduceSumProcess(const uint64_t &rows, const uint64_t &cols, const uint64_t &cacheOffset = 0)
++    {
++        if (needCache) {
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> cacheLocal = cacheBuf_.Get<float>();
++            BinaryReduceSum<ReducePattern::RA>(cacheLocal[cacheOffset], xLocal, rows, cols, this->xAlign_);
++            dataInQue_.FreeTensor<float>(xLocal);
++        } else {
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++            BinaryReduceSum<ReducePattern::RA>(yLocal, xLocal, rows, cols, this->xAlign_);
++            dataInQue_.FreeTensor<float>(xLocal);
++            dataOutQue_.EnQue<float>(yLocal);
++        }
++    }
++
++    __aicore__ inline void DoCopy(const LocalTensor<float> &dstLocal,
++                                  const LocalTensor<float> &srcLocal,
++                                  const uint64_t &cols)
++    {
++        uint64_t repeatNum = REPEAT_SIZE / sizeof(float);
++        uint8_t maxRepeatTimes = REPEAT_SIZE - 1;
++        uint64_t copyTimes = cols / (maxRepeatTimes * repeatNum);
++        uint64_t remainCols = cols - copyTimes * maxRepeatTimes * repeatNum;
++        uint64_t dataOffset = 0;
++        for (size_t i = 0; i < copyTimes; i++) {
++            dataOffset = i * maxRepeatTimes * repeatNum;
++            Copy(dstLocal[dataOffset], srcLocal[dataOffset], repeatNum, maxRepeatTimes, {1, 1, REPEAT_STRIDE, REPEAT_STRIDE});
++        }
++        if (remainCols) {
++            uint8_t repeatTimes = remainCols / repeatNum;
++            uint64_t remainMask = remainCols - repeatNum * repeatTimes;
++            dataOffset = copyTimes * maxRepeatTimes * repeatNum;
++            Copy(dstLocal[dataOffset], srcLocal[dataOffset], repeatNum, repeatTimes, {1, 1, REPEAT_STRIDE, REPEAT_STRIDE});
++            if (remainMask) {
++                dataOffset = copyTimes * maxRepeatTimes * repeatNum + repeatTimes * repeatNum;
++                Copy(dstLocal[dataOffset], srcLocal[dataOffset], repeatNum, maxRepeatTimes, {1, 1, REPEAT_STRIDE, REPEAT_STRIDE});
++            }
++        }
++    }
++
++    // 多行 - 连续 A,A 不需要cache直接输出到yGm
++    template<ReducePattern pattern>
++    __aicore__ inline void BinaryReduceSum(const LocalTensor<float> &dstLocal,
++                                           const LocalTensor<float> &srcLocal,
++                                           const uint64_t &rows,
++                                           const uint64_t &cols,
++                                           const uint64_t &xAlign)
++    {
++        if constexpr (pattern == ReducePattern::RA) {
++            if (rows == 1) {
++                DoCopy(dstLocal, srcLocal, cols);
++                return;
++            }
++            uint64_t reduceNum = rows;
++            uint64_t alignA = ops::CeilAlign(cols, xAlign);
++            uint64_t calCount = cols;
++            // 找到R的二分点
++            while (reduceNum > 2) {
++                uint64_t point = this->FindCutPoint(reduceNum);
++                uint64_t remain = reduceNum - point;
++                // 遍历折叠部分，依次累加
++                for (size_t i = 0; i < remain; i++) {
++                    uint64_t offset0 = i * alignA;
++                    uint64_t offset1 = (point + i) * alignA;
++                    Add(srcLocal[offset0], srcLocal[offset0], srcLocal[offset1], calCount);
++                }
++                reduceNum = point;
++            }
++            // 最后一次累加到vecout
++            Add(dstLocal, srcLocal, srcLocal[alignA], calCount);
++        }
++    }
++
++    template<ReducePattern pattern, bool is2Gm>
++    __aicore__ inline void BinaryReduceSumInCache(const uint64_t &rows, const uint64_t &cols)
++    {
++        if constexpr (pattern == ReducePattern::RA) {
++            LocalTensor<float> cacheLocal = cacheBuf_.Get<float>();
++            if constexpr (is2Gm) {
++                LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++                BinaryReduceSum<ReducePattern::RA>(yLocal, cacheLocal, rows, cols, this->xFp32Align_);
++                dataOutQue_.EnQue<float>(yLocal);
++            } else {
++                BinaryReduceSum<ReducePattern::RA>(cacheLocal, cacheLocal, rows, cols, this->xFp32Align_);
++            }
++        }
++    }
++
++    __aicore__ inline void CopyIn(const uint64_t &xOffset, const uint64_t &rows, const uint64_t &cols, const uint64_t &originCols)
++    {
++        LocalTensor<T_X> xLocal;
++        if (needInCast_) {
++            xLocal = dataInCastQue_.AllocTensor<T_X>();
++        } else {
++            xLocal = dataInQue_.AllocTensor<T_X>();
++        }
++        uint8_t padNum = (this->xAlign_ - cols % this->xAlign_) % this->xAlign_;
++        // 非连续
++        DataCopyExtParams copyParams{static_cast<uint16_t>(rows), static_cast<uint32_t>(sizeof(T_X) * cols),
++                                     static_cast<uint32_t>((originCols - cols) * sizeof(T_X)), 0, 0};
++        DataCopyPadExtParams<T_X> padParams{true, 0, padNum, 0};
++        DataCopyPad(xLocal, this->xGm_[xOffset], copyParams, padParams);
++        if (needInCast_) {
++            dataInCastQue_.EnQue<T_X>(xLocal);
++            DoInCast(rows, cols);
++        } else {
++            dataInQue_.EnQue<T_X>(xLocal);
++        }
++    }
++
++    __aicore__ inline void CopyOutY2Gm(const uint64_t &yOffset, const uint64_t &dataNums)
++    {
++        if (needOutCast_) {
++            DoOutCast(dataNums);
++        }
++        LocalTensor<T_Y> yLocal = dataOutQue_.DeQue<T_Y>();
++        DataCopyExtParams yCopyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(sizeof(T_Y) * dataNums), 0, 0, 0};
++        DataCopyPad(this->yGm_[yOffset], yLocal, yCopyParams);
++        dataOutQue_.FreeTensor<T_Y>(yLocal);
++    }
++
++    __aicore__ inline void CopyOutY2Ws(const uint64_t &wsOffset, const uint64_t &dataNum)
++    {
++        LocalTensor<float> wsLocal = dataOutQue_.DeQue<float>();
++        DataCopyExtParams wsCopyParams{static_cast<uint16_t>(1), static_cast<uint32_t>(sizeof(float) * dataNum), 0, 0, 0};
++        DataCopyPad(wsGm_[wsOffset], wsLocal, wsCopyParams);
++        dataOutQue_.FreeTensor<float>(wsLocal);
++    }
++
++    // group AR处理，连续搬出，规约核处理
++    __aicore__ inline void WorkspaceReduceSum()
++    {
++        // 这行的其他核都算完了
++        LocalTensor<int32_t> syncBuf = syncBuf_.Get<int32_t>();
++        IBSet(syncGm_, syncBuf, this->blockIdx_, 0);
++        if (this->blockRIdx_ == 0) {
++            for (size_t coreId = 0; coreId < this->blockR.usedCoreNum; coreId++) {
++                IBWait(syncGm_, syncBuf, this->blockIdx_ + coreId * this->blockA1.usedCoreNum, 0);
++            }
++            // 统一在这行的首个核规约
++            CopyInFromWs(this->blockR.usedCoreNum, tailA1, this->blockA1.usedCoreNum * this->blockA1.formerUnitDataLen);
++            LocalTensor<float> xLocal = dataInQue_.DeQue<float>();
++            LocalTensor<float> yLocal = dataOutQue_.AllocTensor<float>();
++            BinaryReduceSum<ReducePattern::RA>(yLocal, xLocal, this->blockR.usedCoreNum, tailA1, this->xFp32Align_);
++            dataInQue_.FreeTensor<float>(xLocal);
++            dataOutQue_.EnQue<float>(yLocal);
++            CopyOutY2Gm(0, tailA1);
++        }
++    }
++
++    __aicore__ inline void CopyInFromWs(const uint64_t &rows, const uint64_t &cols, const uint64_t &originCols)
++    {
++        LocalTensor<float> xLocal = dataInQue_.AllocTensor<float>();
++        uint8_t padNum = (this->xFp32Align_ - cols % this->xFp32Align_) % this->xFp32Align_;
++        DataCopyExtParams copyParams{static_cast<uint16_t>(rows), static_cast<uint32_t>(sizeof(float) * cols),
++                                     static_cast<uint32_t>((originCols - cols) * sizeof(float)), 0, 0};
++        DataCopyPadExtParams<float> padParams{true, 0, padNum, 0};
++        DataCopyPad(xLocal, wsGm_, copyParams, padParams);
++        dataInQue_.EnQue<float>(xLocal);
++    }
++
++    __aicore__ inline void DoInCast(const uint64_t &rows, const uint64_t &cols)
++    {
++        uint64_t dataNums = rows * ops::CeilAlign(cols, this->xAlign_);
++        LocalTensor<T_X> xLocal = dataInCastQue_.DeQue<T_X>();
++        LocalTensor<float> xLocalFp32 = dataInQue_.AllocTensor<float>();
++        Cast(xLocalFp32, xLocal, RoundMode::CAST_NONE, dataNums);
++        dataInCastQue_.FreeTensor<T_X>(xLocal);
++        dataInQue_.EnQue<float>(xLocalFp32);
++    }
++
++    __aicore__ inline void DoOutCast(const uint64_t &dataNum)
++    {
++        LocalTensor<float> yLocalFp32 = dataOutQue_.DeQue<float>();
++        LocalTensor<T_Y> yLocal = yLocalFp32.template ReinterpretCast<T_Y>();
++        Cast(yLocal, yLocalFp32, RoundMode::CAST_RINT, dataNum);
++        dataOutQue_.EnQue<float>(yLocalFp32);
++    }
++
++private:
++    uint64_t inBufferSize_;
++    uint64_t cacheBufferSize_ ;
++    uint64_t outBufferSize_;
++    uint64_t maxRInCache_ = 0; // cache内r的最大值
++    uint64_t rInCache_; // cache内r的数量。即有多少行
++    uint64_t r2Cache;
++
++    TQue<TPosition::VECIN, BUFFER_NUM> dataInQue_;
++    TQue<TPosition::VECIN, BUFFER_NUM> dataInCastQue_;
++    TQue<TPosition::VECOUT, BUFFER_NUM> dataOutQue_;
++    TBuf<TPosition::VECCALC> cacheBuf_;
++
++    uint64_t formerATimes;
++    uint64_t formerA;
++    uint64_t tailA;
++    uint64_t formerRTimes;
++    uint64_t formerR;
++    uint64_t tailR;
++    uint64_t formerA1Times;
++    uint64_t formerA1;
++    uint64_t tailA1;
++
++    uint64_t blockAIdx_;
++    uint64_t blockRIdx_;
++    uint64_t blockA1Idx_;
++
++    bool needCache = false;
++    bool needWorkspace = false;
++    bool needInCast_ = false;
++    bool needOutCast_ = false;
++    GlobalTensor<float> wsGm_;
++    GlobalTensor<int32_t> syncGm_;
++    TBuf<TPosition::VECCALC> syncBuf_;
++};
++}
++
++#endif // REDUCE_SUM_V2_ARA_H
+\ No newline at end of file
+diff --git a/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_common.h b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_common.h
+new file mode 100644
+index 00000000..04f90610
+--- /dev/null
++++ b/src/math/reduce_sum_v2/op_kernel/reduce_sum_v2_common.h
+@@ -0,0 +1,179 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file reduce_sum_v2_common.h
++ * \brief
++ */
++#ifndef REDUCE_SUM_V2_COMMON_H
++#define REDUCE_SUM_V2_COMMON_H
++
++#include "kernel_operator.h"
++#include "kernel_utils.h"
++
++constexpr uint64_t BLOCK_SIZE = 32;
++constexpr uint64_t REPEAT_SIZE = 256;
++constexpr uint64_t REPEAT_STRIDE = 8;
++constexpr uint64_t BUFFER_NUM = 2;
++constexpr uint64_t CACHELINE = 512;
++constexpr uint64_t WHOLE_REDUCE_SIZE = 256;
++constexpr uint8_t NUM_2 = 2;
++constexpr uint8_t NUM_3 = 3;
++constexpr uint8_t NUM_4 = 4;
++constexpr uint8_t CONTINOUS_PROCESS = 0;
++constexpr uint8_t DISCONTINOUS_PROCESS = 1;
++// Pattern
++constexpr uint64_t PATTERN_AR = 0;
++constexpr uint64_t PATTERN_ARA = 1;
++
++enum class ReducePattern { AR, RA };
++
++struct UbInfos {
++    uint64_t formerATimes;
++    uint64_t formerA;
++    uint64_t tailA;
++    uint64_t formerRTimes;
++    uint64_t formerR;
++    uint64_t tailR;
++    uint64_t formerA1Times;
++    uint64_t formerA1;
++    uint64_t tailA1;
++    uint64_t formerRealTimes;
++    uint64_t tailRealData;
++};
++
++struct BlockInfos {
++    uint64_t usedCoreNum;
++    uint64_t formerCoreNum;
++    uint64_t tailCoreNum;
++    uint64_t formerUnitDataLen;
++    uint64_t tailUnitDataLen;
++    uint64_t tailRealDataLen;
++};
++
++namespace AscendC {
++template<typename T_X, typename T_Y>
++class ReduceSumV2KernelBase {
++public:
++    __aicore__ inline ReduceSumV2KernelBase() {}
++    
++protected:
++    __aicore__ inline uint64_t FindCutPoint(const uint64_t &num)
++    {
++        uint64_t point = 1;
++        while (point < num) {
++            point <<= 1;
++        }
++        point >>= 1;
++        return point;
++    }
++
++    __aicore__ inline void InitBlockParams(BlockInfos &blockInfos, const ReduceSumV2BlockInfos &blockTilingInfos)
++    {
++        blockInfos.usedCoreNum = blockTilingInfos.usedCoreNum;
++        blockInfos.formerCoreNum = blockTilingInfos.formerCoreNum;
++        blockInfos.tailCoreNum = blockTilingInfos.tailCoreNum;
++        blockInfos.formerUnitDataLen = blockTilingInfos.formerUnitDataLen;
++        blockInfos.tailUnitDataLen = blockTilingInfos.tailUnitDataLen;
++        blockInfos.tailRealDataLen = blockTilingInfos.tailRealDataLen;
++    }
++
++    __aicore__ inline void InitBasicParams(const ReduceSumV2Process &tiling)
++    {
++        blockIdx_ = GetBlockIdx();
++        xAlign_ = BLOCK_SIZE / sizeof(T_X);
++        xFp32Align_ = BLOCK_SIZE / sizeof(float);
++        uint64_t pattern = tiling.pattern;
++
++        A = tiling.A;
++        R = tiling.R;
++        A1 = tiling.A1;
++
++        for (size_t i = 0; i < NUM_2; i++) {
++            ubInfos[i].formerATimes = tiling.ubInfos.formerATimes[i];
++            ubInfos[i].formerA = tiling.ubInfos.formerA[i];
++            ubInfos[i].tailA = tiling.ubInfos.tailA[i];
++            ubInfos[i].formerRTimes = tiling.ubInfos.formerRTimes[i];
++            ubInfos[i].formerR = tiling.ubInfos.formerR[i];
++            ubInfos[i].tailR = tiling.ubInfos.tailR[i];
++            ubInfos[i].formerA1Times = tiling.ubInfos.formerA1Times[i];
++            ubInfos[i].formerA1 = tiling.ubInfos.formerA1[i];
++            ubInfos[i].tailA1 = tiling.ubInfos.tailA1[i];
++            ubInfos[i].formerRealTimes = tiling.ubInfos.formerRealTimes[i];
++            ubInfos[i].tailRealData = tiling.ubInfos.tailRealData[i];
++        }
++
++        InitBlockParams(blockA, tiling.blockA);
++        InitBlockParams(blockR, tiling.blockR);
++    }
++
++    __aicore__ inline uint64_t GetOffset(const uint64_t &blockIdx, const uint64_t &postDataNum, const BlockInfos &blockInfos)
++    {
++        uint64_t len;
++        if (blockIdx < blockInfos.formerCoreNum) {
++            len = blockIdx * blockInfos.formerUnitDataLen;
++        } else {
++            len = blockInfos.formerCoreNum * blockInfos.formerUnitDataLen +
++                  (blockIdx - blockInfos.formerCoreNum) * blockInfos.tailUnitDataLen;
++        }
++        return len * postDataNum;
++    }
++
++    __aicore__ inline void MTE3ToMTE2Sync()
++    {
++        event_t eventIDMTE3ToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
++        SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
++        WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToMTE2);
++    }
++
++    __aicore__ inline void VToMTE2Sync()
++    {
++        event_t eventIDVToMTE2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
++        SetFlag<HardEvent::V_MTE2>(eventIDVToMTE2);
++        WaitFlag<HardEvent::V_MTE2>(eventIDVToMTE2);
++    }
++
++    __aicore__ inline void MTE3ToVSync()
++    {
++        event_t eventIDMTE3ToV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
++        SetFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToV);
++        WaitFlag<HardEvent::MTE3_MTE2>(eventIDMTE3ToV);
++    }
++
++    template <typename T>
++    __aicore__ inline T Min(T a, T b)
++    {
++        return a > b ? b : a;
++    }
++
++    template <typename T>
++    __aicore__ inline T Max(T a, T b)
++    {
++        return a < b ? b : a;
++    }
++
++protected:
++    GlobalTensor<T_X> xGm_;
++    GlobalTensor<T_Y> yGm_;
++
++    uint64_t blockIdx_;
++    uint64_t xAlign_;
++    uint64_t xFp32Align_;
++    uint64_t A;
++    uint64_t R;
++    uint64_t A1;
++    UbInfos ubInfos[NUM_2];
++    BlockInfos blockA;
++    BlockInfos blockR;
++    BlockInfos blockA1;
++};
++}
++
++#endif // REDUCE_SUM_V2_COMMON_H
+diff --git a/src/math/reduce_sum_v2/tests/st/.gitkeep b/src/math/reduce_sum_v2/tests/st/.gitkeep
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/math/reduce_sum_v2/tests/ut/.gitkeep b/src/math/reduce_sum_v2/tests/ut/.gitkeep
+new file mode 100644
+index 00000000..e69de29b

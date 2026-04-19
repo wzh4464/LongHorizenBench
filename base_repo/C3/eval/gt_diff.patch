@@ -1,0 +1,934 @@
+diff --git a/test/allowlist_for_publicAPI.json b/test/allowlist_for_publicAPI.json
+index 761b4d160..88f3fb344 100644
+--- a/test/allowlist_for_publicAPI.json
++++ b/test/allowlist_for_publicAPI.json
+@@ -2865,7 +2865,9 @@
+     "BFloat16Tensor",
+     "restart_device",
+     "stop_device",
+-    "set_op_timeout_ms"
++    "set_op_timeout_ms",
++    "NpuGraphOpHandler",
++    "register_npu_graph_handler"
+   ],
+   "torch_npu.profiler": [
+     "ProfilerActivity",
+diff --git a/test/npu/test_npugraph_handler.py b/test/npu/test_npugraph_handler.py
+new file mode 100644
+index 000000000..c720cf960
+--- /dev/null
++++ b/test/npu/test_npugraph_handler.py
+@@ -0,0 +1,60 @@
++from torch_npu.testing.testcase import TestCase, run_tests
++from torch_npu.npu import (
++    NpuGraphOpHandler,
++    register_npu_graph_handler,
++)
++from torch_npu.npu._npugraph_handlers.npugraph_handler import _NPU_GRAPH_OP_HANDLERS
++
++
++class TestNpuGraphHandlerRegistry(TestCase):
++
++    def setUp(self):
++        self._snapshot = dict(_NPU_GRAPH_OP_HANDLERS)
++
++    def tearDown(self):
++        _NPU_GRAPH_OP_HANDLERS.clear()
++        _NPU_GRAPH_OP_HANDLERS.update(self._snapshot)
++
++    def test_register_single_name(self):
++        @register_npu_graph_handler("test_op_single")
++        class _H(NpuGraphOpHandler):
++            pass
++
++        self.assertIn("test_op_single", _NPU_GRAPH_OP_HANDLERS)
++        self.assertIs(_NPU_GRAPH_OP_HANDLERS["test_op_single"], _H)
++
++    def test_register_multiple_names(self):
++        @register_npu_graph_handler(["test_op_a", "test_op_a.default"])
++        class _H(NpuGraphOpHandler):
++            pass
++
++        self.assertIn("test_op_a", _NPU_GRAPH_OP_HANDLERS)
++        self.assertIn("test_op_a.default", _NPU_GRAPH_OP_HANDLERS)
++        self.assertIs(_NPU_GRAPH_OP_HANDLERS["test_op_a"], _H)
++
++
++class TestNpuGraphHandlerBuiltinRegistration(TestCase):
++
++    EXPECTED_OPS = [
++        "npu_fused_infer_attention_score",
++        "npu_fused_infer_attention_score.default",
++        "npu_fused_infer_attention_score.out",
++        "npu_fused_infer_attention_score_v2",
++        "npu_fused_infer_attention_score_v2.default",
++        "npu_fused_infer_attention_score_v2.out",
++        "_npu_paged_attention.default",
++        "npu_multi_head_latent_attention.out",
++    ]
++
++    def test_all_expected_ops_registered(self):
++        for op_name in self.EXPECTED_OPS:
++            with self.subTest(op_name=op_name):
++                self.assertIn(
++                    op_name,
++                    _NPU_GRAPH_OP_HANDLERS,
++                    f"Expected handler for '{op_name}' not found in registry",
++                )
++
++
++if __name__ == "__main__":
++    run_tests()
+diff --git a/test/torch_npu_schema.json b/test/torch_npu_schema.json
+index 9892ed82f..c7928345d 100644
+--- a/test/torch_npu_schema.json
++++ b/test/torch_npu_schema.json
+@@ -2282,6 +2282,24 @@
+   "torch_npu.npu.npugraph_ex.register_replacement": {
+     "signature": "(search_fn, replace_fn, example_inputs, trace_fn=<function fwd_only>, extra_check=<function _return_true>, search_fn_pattern=None, scalar_workaround=None, skip_duplicates=False)"
+   },
++  "torch_npu.npu.register_npu_graph_handler": {
++    "signature": "(op_names)"
++  },
++  "torch_npu.npu.NpuGraphOpHandler": {
++    "signature": "()"
++  },
++  "torch_npu.npu.NpuGraphOpHandler.prepare_capture": {
++    "signature": "(func, args, kwargs)"
++  },
++  "torch_npu.npu.NpuGraphOpHandler.postprocess_result": {
++    "signature": "(result, kwargs)"
++  },
++  "torch_npu.npu.NpuGraphOpHandler.update_args": {
++    "signature": "(dispatch_record, update_input)"
++  },
++  "torch_npu.npu.NpuGraphOpHandler.record_wrap_kwarg": {
++    "signature": "(key, value, tensor_param_names)"
++  },
+   "torch_npu.distributed.run.parse_args": {
+     "signature": "(args)"
+   },
+diff --git a/torch_npu/npu/__init__.py b/torch_npu/npu/__init__.py
+index 7bc2c0f2a..d40021e86 100644
+--- a/torch_npu/npu/__init__.py
++++ b/torch_npu/npu/__init__.py
+@@ -134,7 +134,9 @@ __all__ = [
+     "reset_peak_host_memory_stats",
+     "set_deterministic_level",
+     "use_compatible_impl",
+-    "are_compatible_impl_enabled"
++    "are_compatible_impl_enabled",
++    "NpuGraphOpHandler",
++    "register_npu_graph_handler",
+ ]
+ 
+ from typing import Tuple, Union, List, cast, Optional
+@@ -178,6 +180,11 @@ from .graphs import (
+     graph_task_update_end,
+ )
+ 
++from ._npugraph_handlers import (
++    NpuGraphOpHandler,
++    register_npu_graph_handler,
++)
++
+ # init profiler
+ if not torch_npu._C._profiler_init():
+     raise RuntimeError("proflier initialization failed" + prof_error(ErrCode.UNAVAIL))
+diff --git a/torch_npu/npu/_npugraph_handlers/__init__.py b/torch_npu/npu/_npugraph_handlers/__init__.py
+new file mode 100644
+index 000000000..33c4a45dd
+--- /dev/null
++++ b/torch_npu/npu/_npugraph_handlers/__init__.py
+@@ -0,0 +1,25 @@
++"""NPU Graph Operator Handler Framework (Registry + Template Method).
++
++This package exposes the public API for the NPU Graph operator handler
++mechanism and ensures that all **built-in** handlers are registered at
++import time.
++
++Public API (re-exported from :mod:`npugraph_handler`)
++-----------------------------------------------------
++- :class:`NpuGraphOpHandler`          -- base class for operator handlers.
++- :func:`register_npu_graph_handler`  -- class decorator to register a handler.
++
++"""
++
++# Re-export public API from the core module
++from .npugraph_handler import (
++    NpuGraphOpHandler,
++    register_npu_graph_handler,
++)
++
++# Auto-register built-in handlers, Import built-in handler classes to trigger their ``@register_npu_graph_handler`` decorators.
++from .ifa_handler import (  # noqa: F401
++    _IFAv1DefaultHandler,
++    _IFAv2DefaultHandler,
++)
++from .simple_handler import _SimpleGraphHandler  # noqa: F401
+diff --git a/torch_npu/npu/_npugraph_handlers/ifa_handler.py b/torch_npu/npu/_npugraph_handlers/ifa_handler.py
+new file mode 100644
+index 000000000..c0da822db
+--- /dev/null
++++ b/torch_npu/npu/_npugraph_handlers/ifa_handler.py
+@@ -0,0 +1,122 @@
++"""IFA (Infer Fused Attention) v1 / v2 Graph Handlers.
++
++This module defines the NPU Graph operator handlers for the
++``npu_fused_infer_attention_score`` (v1) and
++``npu_fused_infer_attention_score_v2`` (v2) operator families.
++
++Structure: ``_TensorListOutHandler`` provides ``postprocess_result`` (return
++kwargs["out"]).  ``IFAv1DefaultHandler`` and ``IFAv2DefaultHandler`` inherit
++it and each implement ``update_args`` and ``prepare_capture``; both
++``.default`` and ``.out`` are registered on the same handler class.
++"""
++__all__ = []
++
++import torch_npu
++from .npugraph_handler import NpuGraphOpHandler, register_npu_graph_handler
++
++
++class _TensorListOutHandler(NpuGraphOpHandler):
++    """Base for operators whose ``out`` kwarg is a ``TensorList``.
++
++    Returns ``kwargs["out"]`` from ``postprocess_result`` so callers get a
++    Python list instead of the raw C++ return.
++    """
++
++    @classmethod
++    def postprocess_result(cls, result, kwargs):
++        return kwargs["out"]
++
++
++# ========================= IFA v1 ================================
++
++@register_npu_graph_handler([
++    "npu_fused_infer_attention_score",
++    "npu_fused_infer_attention_score.default",
++    "npu_fused_infer_attention_score.out",
++])
++class _IFAv1DefaultHandler(_TensorListOutHandler):
++    """IFA v1: ``.default`` pre-allocates and swaps to ``.out``; ``.out`` passthrough."""
++
++    @classmethod
++    def update_args(cls, record, update_input):
++        if "actual_seq_lengths_kv" in update_input and len(record.args) >= 7:
++            record.args[6] = update_input["actual_seq_lengths_kv"]
++
++    @classmethod
++    def prepare_capture(cls, func, args, kwargs):
++        func_out = torch_npu.npu_fused_infer_attention_score.out
++        if func is func_out:
++            return func, args, kwargs
++
++        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
++            *args, **kwargs
++        )
++        out_args = [args[0], args[2]]
++        out_kwargs_keys = [
++            "input_layout",
++            "quant_scale2",
++            "block_table",
++            "num_heads",
++            "num_key_value_heads",
++            "softmax_lse_flag",
++            "query_rope",
++        ]
++        out_kwargs = {k: kwargs[k] for k in out_kwargs_keys if k in kwargs}
++        output, softmax_lse = (
++            torch_npu._npu_fused_infer_attention_score_infer_output(
++                *out_args, **out_kwargs
++            )
++        )
++        kwargs["workspace"] = workspace
++        kwargs["out"] = [output, softmax_lse]
++        return func_out, args, kwargs
++
++
++# ========================= IFA v2 ================================
++
++@register_npu_graph_handler([
++    "npu_fused_infer_attention_score_v2",
++    "npu_fused_infer_attention_score_v2.default",
++    "npu_fused_infer_attention_score_v2.out",
++])
++class _IFAv2DefaultHandler(_TensorListOutHandler):
++    """IFA v2: ``.default`` pre-allocates and swaps to ``.out``; ``.out`` passthrough."""
++
++    @classmethod
++    def update_args(cls, record, update_input):
++        if "actual_seq_kvlen" in update_input and len(record.args) >= 9:
++            record.args[8] = update_input["actual_seq_kvlen"]
++
++    @classmethod
++    def prepare_capture(cls, func, args, kwargs):
++        func_out = torch_npu.npu_fused_infer_attention_score_v2.out
++        if func is func_out:
++            return func, args, kwargs
++
++        workspace = (
++            torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
++                *args, **kwargs
++            )
++        )
++        out_args = [args[0], args[2]]
++        out_kwargs_keys = [
++            "query_dtype",
++            "value_dtype",
++            "input_layout",
++            "quant_scale_out",
++            "block_table",
++            "num_query_heads",
++            "num_key_value_heads",
++            "return_softmax_lse",
++            "query_rope",
++            "out_dtype",
++        ]
++        out_kwargs = {k: kwargs[k] for k in out_kwargs_keys if k in kwargs}
++        output, softmax_lse = (
++            torch_npu._npu_fused_infer_attention_score_v2_infer_output(
++                *out_args, **out_kwargs
++            )
++        )
++        kwargs["workspace"] = workspace
++        kwargs["out"] = [output, softmax_lse]
++        return func_out, args, kwargs
+diff --git a/torch_npu/npu/_npugraph_handlers/npugraph_handler.py b/torch_npu/npu/_npugraph_handlers/npugraph_handler.py
+new file mode 100644
+index 000000000..59920e341
+--- /dev/null
++++ b/torch_npu/npu/_npugraph_handlers/npugraph_handler.py
+@@ -0,0 +1,212 @@
++"""NPU Graph Operator Handler -- base class, global registry, and utilities.
++
++This module contains the core building blocks of the NPU Graph operator
++handler framework:
++
++- :class:`NpuGraphOpHandler`          -- abstract base class for handlers.
++- :data:`_NPU_GRAPH_OP_HANDLERS`      -- global registry (dict).
++- :func:`register_npu_graph_handler`  -- class-decorator for registration.
++
++Design Contracts
++----------------
++1. **Stateless Handler** -- All hook methods are ``@classmethod``; the
++   registry stores *class objects*, never instances.
++2. **Function Replacement Consistency** -- When ``prepare_capture``
++   substitutes ``func`` with ``actual_func``, the handler registered for
++   ``actual_func.__name__`` **must** implement a compatible
++   ``update_args`` (typically guaranteed by a shared intermediate base).
++
++See Also
++--------
++``torch_npu/npu/graphs.py`` for the template-method skeleton that
++consumes this registry.
++"""
++
++import logging
++from copy import deepcopy
++
++import torch
++from torch_npu._C import _weak_ref_tensor as TensorWeakRef
++
++logger = logging.getLogger(__name__)
++
++
++class NpuGraphOpHandler:
++    r"""Base class for NPU Graph operator handlers.
++
++    Subclasses override ``@classmethod`` hooks to customize capture / update
++    behavior for specific operators, while the framework keeps
++    stream / event / task-group orchestration in a common template.
++
++    **Stateless by design** -- All hook methods are ``@classmethod`` (first
++    parameter is ``cls``, not ``self``).  There is no instance; the global
++    registry stores **class objects** directly.  This structurally prevents
++    storing mutable per-invocation state.  Class-level constants (e.g.
++    ``_OP_ARG_SPECS``) are accessible via ``cls``.
++
++    Users should inherit this class and override the needed hooks:
++
++    .. code-block:: python
++
++        @register_npu_graph_handler(["my_op", "my_op.default"])
++        class MyHandler(NpuGraphOpHandler):
++            @classmethod
++            def update_args(cls, record, update_input):
++                if "batch" in update_input and len(record.args) >= 3:
++                    record.args[2] = update_input["batch"]
++    """
++
++    @classmethod
++    def prepare_capture(cls, func, args, kwargs):
++        r"""Prepare operator call before graph-task recording.
++
++        This hook runs **before** ``graph_task_group_begin`` and can be used
++        for operator-specific preprocessing such as workspace allocation,
++        output pre-allocation, or switching from ``.default`` to ``.out``
++        overloads.
++
++        .. note:: **Function Replacement Contract**
++
++            If ``actual_func`` differs from ``func``, ensure the handler
++            registered for ``actual_func.__name__`` implements a compatible
++            ``update_args``.  The recommended approach is to share a common
++            base class that defines ``update_args`` (see ``_IFAv1Base`` /
++            ``_IFAv2Base``).
++
++        Args:
++            func (OpOverload): Original operator callable.
++            args (tuple): Original arguments.
++            kwargs (dict): Original keyword arguments.
++
++        Returns:
++            tuple[Callable, tuple, dict]: ``(actual_func, args, kwargs)`` to
++            execute during recording.
++        """
++        return func, args, kwargs
++
++    @classmethod
++    def postprocess_result(cls, result, kwargs):
++        r"""Post-process operator return value after recording.
++
++        Called after ``graph_task_group_end`` and dispatch-record creation.
++
++        Args:
++            result: Raw return value from ``actual_func(*args, **kwargs)``.
++            kwargs (dict): Current keyword arguments (may contain ``"out"``).
++
++        Returns:
++            Final value returned to the Python caller.
++        """
++        return result
++
++    @classmethod
++    def update_args(cls, dispatch_record, update_input):
++        r"""Apply operator-specific indexed-arg updates.
++
++        Framework-level kwargs updates are handled by the dispatch skeleton.
++        Override this hook only when update values must be applied to
++        arguments by index.
++
++        Args:
++            dispatch_record (_GraphDispatchRecord): Recorded operator call.
++                Args can be modified via ``dispatch_record.args[i]``.
++            update_input (dict): User-provided update payload.
++        """
++        pass
++
++    @classmethod
++    def record_wrap_kwarg(cls, key, value, tensor_param_names):
++        r"""Convert a kwarg value into record-time storage representation.
++
++        Called only during the **capture** phase (creating the dispatch
++        record).  The purpose of ``TensorWeakRef`` conversion is to avoid the
++        Python-side record holding strong references to NPU tensors, letting
++        the C++ graph runtime manage tensor memory lifetimes.
++
++        .. note::
++
++            The **update** phase uses direct assignment for kwargs
++            (``record.kwargs[key] = update_input[key]``), consistent with the
++            original implementation and with how ``update_args`` handles
++            arguments.  Update is a short-lived "assign -> replay"
++            flow where weak-ref conversion is unnecessary.
++
++        Logic (consistent with original, with list/tuple generalisation):
++
++        - ``None`` -> ``None`` (fast path)
++        - ``list`` / ``tuple`` -> element-wise: NPU Tensor -> ``TensorWeakRef``,
++          else -> ``deepcopy`` (replaces old hardcoded ``if key == "out"``
++          that assumed exactly 2 Tensors).  Only NPU tensors are wrapped;
++          CPU tensors use ``deepcopy`` because ``TensorWeakRef`` from
++          torch_npu._C is only valid for NPU tensors.
++        - Single value where ``key`` in ``tensor_param_names`` and value is an
++          NPU Tensor -> ``TensorWeakRef``
++        - Everything else -> ``deepcopy``
++
++        Args:
++            key (str): Kwarg name.
++            value: Kwarg value.
++            tensor_param_names (list[str]): Tensor-typed kwarg names parsed
++                from operator schema.
++
++        Returns:
++            Stored value for the dispatch record.
++        """
++        if value is None:
++            return None
++
++        def _is_npu_tensor(t):
++            return torch.is_tensor(t) and "npu" in str(t.device)
++
++        if isinstance(value, (list, tuple)):
++            wrapped = [
++                TensorWeakRef(t) if _is_npu_tensor(t) else deepcopy(t)
++                for t in value
++            ]
++            return type(value)(wrapped)
++
++        if key in tensor_param_names and _is_npu_tensor(value):
++            return TensorWeakRef(value)
++
++        return deepcopy(value)
++
++
++# ---------------------------------------------------------------------------
++#  Global Registry
++# ---------------------------------------------------------------------------
++
++_NPU_GRAPH_OP_HANDLERS = {}
++
++
++def register_npu_graph_handler(op_names):
++    r"""Register an operator handler via class decorator.
++
++    The decorated class itself (not an instance) is stored in the global
++    registry.  All hook methods must be ``@classmethod``.
++
++    Args:
++        op_names (str or list[str]): Operator names resolved from
++            ``func.__name__`` in ``__torch_dispatch__`` (for example,
++            ``"my_op"``, ``"my_op.default"``, ``"my_op.out"``).
++
++    Returns:
++        A class decorator.
++
++    Example::
++
++        @register_npu_graph_handler(["my_op", "my_op.default"])
++        class MyHandler(NpuGraphOpHandler):
++            ...
++    """
++    def decorator(cls):
++        names = op_names if isinstance(op_names, (list, tuple)) else [op_names]
++        for name in names:
++            if name in _NPU_GRAPH_OP_HANDLERS:
++                existing = _NPU_GRAPH_OP_HANDLERS[name].__name__
++                logger.warning(
++                    f"NpuGraphOpHandler for '{name}' is being overridden: "
++                    f"{existing} -> {cls.__name__}"
++                )
++            _NPU_GRAPH_OP_HANDLERS[name] = cls   # store class, not instance
++        return cls
++    return decorator
+diff --git a/torch_npu/npu/_npugraph_handlers/simple_handler.py b/torch_npu/npu/_npugraph_handlers/simple_handler.py
+new file mode 100644
+index 000000000..d17505363
+--- /dev/null
++++ b/torch_npu/npu/_npugraph_handlers/simple_handler.py
+@@ -0,0 +1,32 @@
++"""Simple Graph Handlers (Paged Attention / MLA)."""
++
++__all__ = []
++
++from .npugraph_handler import NpuGraphOpHandler, register_npu_graph_handler
++
++
++@register_npu_graph_handler([
++    "_npu_paged_attention.default",
++    "npu_multi_head_latent_attention.out",
++])
++class _SimpleGraphHandler(NpuGraphOpHandler):
++    """Handler for PA (Paged Attention) and MLA operators.
++
++    Attributes:
++        _OP_ARG_SPECS (dict[str, tuple[int, str]]): Specifies
++            ``op_name -> (arg_index, update_key)`` for each supported
++            operator.
++    """
++
++    _OP_ARG_SPECS = {
++        "_npu_paged_attention.default": (7, "context_lens"),
++        "npu_multi_head_latent_attention.out": (5, "context_lens"),
++    }
++
++    @classmethod
++    def update_args(cls, record, update_input):
++        spec = cls._OP_ARG_SPECS.get(record.op_cache_entry.__name__)
++        if spec:
++            arg_index, key = spec
++            if key in update_input and len(record.args) >= (arg_index + 1):
++                record.args[arg_index] = update_input[key]
+diff --git a/torch_npu/npu/graphs.py b/torch_npu/npu/graphs.py
+index ceea142d9..3b5ef5e94 100644
+--- a/torch_npu/npu/graphs.py
++++ b/torch_npu/npu/graphs.py
+@@ -1,8 +1,17 @@
+-__all__ = ["is_current_stream_capturing", "graph_pool_handle", "graph_task_group_begin",
+-           "graph_task_group_end", "graph_task_update_begin", "graph_task_update_end",
+-           "NPUGraph", "graph", "make_graphed_callables"]
++__all__ = [
++    "is_current_stream_capturing",
++    "graph_pool_handle",
++    "graph_task_group_begin",
++    "graph_task_group_end",
++    "graph_task_update_begin",
++    "graph_task_update_end",
++    "NPUGraph",
++    "graph",
++    "make_graphed_callables",
++]
+ 
+ import gc
++import logging
+ import re
+ import typing
+ from copy import deepcopy
+@@ -12,10 +21,12 @@ from typing import List, Dict, Any, Optional, Tuple
+ import torch
+ import torch_npu._C
+ from torch_npu._C import _weak_ref_tensor as TensorWeakRef
++from torch_npu.npu._npugraph_handlers.npugraph_handler import _NPU_GRAPH_OP_HANDLERS
+ from torch_npu.utils._error_code import ErrCode, pta_error
+ from torch_npu._compiler._config import force_npugraph_gc
+ from .utils import _dummy_type
+ 
++
+ if not hasattr(torch_npu._C, "_NPUStreamBase"):
+     # Define dummy base classes
+     torch_npu._C.__dict__["_NPUGraph"] = _dummy_type("_NPUGraph")
+@@ -77,7 +88,7 @@ def graph_task_update_end(stream):
+ 
+ @dataclass
+ class _GraphDispatchRecord:
+-    """存储单次操作的完整记录"""
++    """Record of a single dispatched operator call during graph capture."""
+     event: Any = None
+     handle: Any = None
+     kwargs: Dict[str, Any] = field(default_factory=dict)
+@@ -86,6 +97,14 @@ class _GraphDispatchRecord:
+ 
+ 
+ class _GraphDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
++    """Template-method skeleton for NPU Graph capture and update.
++
++    The skeleton keeps the common stream / event / task-group orchestration
++    and delegates operator-specific logic to
++    :class:`~torch_npu.npu.NpuGraphOpHandler` classes
++    looked up in ``_NPU_GRAPH_OP_HANDLERS``.
++    """
++
+     tensor_schema_name = {}
+     update_stream = None
+ 
+@@ -102,153 +121,145 @@ class _GraphDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
+         return True
+ 
+     @classmethod
+-    def update_schema(cls, name, schame):
++    def update_schema(cls, name, schema):
+         if name in cls.tensor_schema_name:
+             return
+         # match: Tensor q_nope, Tensor? mask=None, Tensor(a!) output
+         pattern = r'Tensor(?:\(a!\)|\?)?\s+(\w+)'
+-        cls.tensor_schema_name[name] = re.findall(pattern, schame)
+-    
+-    def update_capture_record(self, cpu_update_input):
+-        if len(cpu_update_input) == 1:
+-            new_list = [cpu_update_input[0].copy() for _ in range(len(self.graph_dispatch_records))]
+-            cpu_update_input = new_list 
+-        if len(self.graph_dispatch_records) != len(self.graph_dispatch_records):
+-            raise RuntimeError(f"Currently, there are {len(self.graph_dispatch_records)} operators that need to be updated by capture, "
+-                f"and there are only {len(self.graph_dispatch_records)} elements in the incoming cpu_update_input list", pta_error(ErrCode.PARAM))
+-        with torch.npu.stream(self.update_stream):
+-            for graph_dispatch_record, update_input in zip(self.graph_dispatch_records, cpu_update_input):
+-                graph_task_update_begin(self.update_stream, graph_dispatch_record.handle)
+-                for key in update_input:
+-                    if key in graph_dispatch_record.kwargs:
+-                        graph_dispatch_record.kwargs[key] = update_input[key]
+-
+-                # When parameters are passed through args, position is position of the updated parameter.
+-                if graph_dispatch_record.op_cache_entry.__name__ in ["npu_fused_infer_attention_score", "npu_fused_infer_attention_score.out"]:
+-                    position, key = 6, "actual_seq_lengths_kv"
+-                elif graph_dispatch_record.op_cache_entry.__name__ in ["npu_fused_infer_attention_score_v2", "npu_fused_infer_attention_score_v2.out"]:
+-                    position, key = 8, "actual_seq_kvlen"
+-                elif graph_dispatch_record.op_cache_entry.__name__ == "_npu_paged_attention.default":
+-                    position, key = 7, "context_lens"
+-                elif graph_dispatch_record.op_cache_entry.__name__ == "npu_multi_head_latent_attention.out":
+-                    position, key = 5, "context_lens"
+-                if len(graph_dispatch_record.args) >= (position + 1):
+-                    graph_dispatch_record.args[position] = update_input[key]
+-                graph_dispatch_record.op_cache_entry(*graph_dispatch_record.args, **graph_dispatch_record.kwargs)
+-                graph_task_update_end(self.update_stream)
+-                graph_dispatch_record.event.record(self.update_stream)
++        cls.tensor_schema_name[name] = re.findall(pattern, schema)
+ 
+-    def _append_dispatch_record(self, event, handle, args, kwargs, func):
+-        args_ref = []
+-        for element in args:
+-            if torch.is_tensor(element) and "npu" in str(element.device):
+-                args_ref.append(TensorWeakRef(element))
+-            else:
+-                args_ref.append(deepcopy(element))
+-        kwargs_ref = {}
+-        for key, vaule in kwargs.items():
+-            if key == "out":
+-                kwargs_ref[key] = [TensorWeakRef(vaule[0]), TensorWeakRef(vaule[1])]
+-            elif key in self.tensor_schema_name[str(func.__name__)]:
+-                kwargs_ref[key] = TensorWeakRef(vaule)
+-            else:
+-                kwargs_ref[key] = deepcopy(vaule)
+-        return _GraphDispatchRecord(event=event, handle=handle, kwargs=kwargs_ref, args=list(args_ref), op_cache_entry=func)
++    # -----------------------------------------------------------------
++    #  Capture skeleton
++    # -----------------------------------------------------------------
+ 
+     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+-        if func.__name__ in ["npu_fused_infer_attention_score", "npu_fused_infer_attention_score.default"]:
+-            func_out = torch_npu.npu_fused_infer_attention_score.out
+-            self.update_schema(str(func_out.__name__), str(func_out._schema))
+-            stream = torch_npu.npu.current_stream()
+-            event = torch.npu.ExternalEvent()
+-            event.wait(stream)
+-            event.reset(stream)
+-            # apply tensor
+-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(*args, **kwargs)
+-            out_args = [args[0], args[2]]
+-            out_kwargs_keys = [
+-                'input_layout', 
+-                'quant_scale2',
+-                'block_table',
+-                'num_heads',
+-                'num_key_value_heads',
+-                'softmax_lse_flag',
+-                'query_rope']
+-            out_kwargs = {key: kwargs[key] for key in out_kwargs_keys if key in kwargs}
+-            output, softmax_lse = torch_npu._npu_fused_infer_attention_score_infer_output(*out_args, **out_kwargs)
+-            kwargs["workspace"] = workspace
+-            kwargs["out"] = [output, softmax_lse]
+-            # begin graph task
+-            graph_task_group_begin(stream)
+-            func_out(*args, **kwargs)
+-            handle = graph_task_group_end(stream)
+-            # save state for update
+-            self.graph_dispatch_records.append(
+-                self._append_dispatch_record(event, handle, args, kwargs, func_out))
+-            return kwargs["out"]
+-        elif func.__name__ in ["npu_fused_infer_attention_score_v2", "npu_fused_infer_attention_score_v2.default"]:
+-            func_out = torch_npu.npu_fused_infer_attention_score_v2.out
+-            self.update_schema(str(func_out.__name__), str(func_out._schema))
+-            stream = torch_npu.npu.current_stream()
+-            event = torch.npu.ExternalEvent()
+-            event.wait(stream)
+-            event.reset(stream)
+-            # apply tensor
+-            workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(*args, **kwargs)
+-            out_args = [args[0], args[2]]
+-            out_kwargs_keys = [
+-                'query_dtype',
+-                'value_dtype',
+-                'input_layout',
+-                'quant_scale_out',
+-                'block_table',
+-                'num_query_heads',
+-                'num_key_value_heads',
+-                'return_softmax_lse',
+-                'query_rope',
+-                'out_dtype']
+-            out_kwargs = {key: kwargs[key] for key in out_kwargs_keys if key in kwargs}
+-            output, softmax_lse = torch_npu._npu_fused_infer_attention_score_v2_infer_output(*out_args, **out_kwargs)
+-            kwargs["workspace"] = workspace
+-            kwargs["out"] = [output, softmax_lse]
+-            # begin graph task
+-            graph_task_group_begin(stream)
+-            func_out(*args, **kwargs)
+-            handle = graph_task_group_end(stream)
+-            # save state for update
+-            self.graph_dispatch_records.append(
+-                self._append_dispatch_record(event, handle, args, kwargs, func_out))
+-            return kwargs["out"]
+-        elif func.__name__ in ["npu_fused_infer_attention_score.out", "npu_fused_infer_attention_score_v2.out"]:
+-            self.update_schema(str(func.__name__), str(func._schema))
+-            stream = torch_npu.npu.current_stream()
+-            event = torch.npu.ExternalEvent()
+-            event.wait(stream)
+-            event.reset(stream)
+-            # begin graph task
+-            graph_task_group_begin(stream)
+-            func(*args, **kwargs)
+-            handle = graph_task_group_end(stream)
+-            # save state for update
+-            self.graph_dispatch_records.append(
+-                self._append_dispatch_record(event, handle, args, kwargs, func))
+-            return kwargs["out"]
+-        elif func.__name__ in ["_npu_paged_attention.default", "npu_multi_head_latent_attention.out"]:
+-            self.update_schema(str(func.__name__), str(func._schema))
++        # Registry stores class objects; call via cls.method()
++        handler_cls = _NPU_GRAPH_OP_HANDLERS.get(func.__name__)
++
++        if handler_cls:
++            # 1) Common: obtain stream and event
+             stream = torch_npu.npu.current_stream()
+             event = torch.npu.ExternalEvent()
+             event.wait(stream)
+             event.reset(stream)
+-            # begin graph task
++
++            # 2) Operator-specific: preprocessing (workspace, output pre-alloc, func swap)
++            actual_func, args, kwargs = handler_cls.prepare_capture(
++                func, args, kwargs
++            )
++
++            # 3) Common: parse operator schema
++            self.update_schema(
++                str(actual_func.__name__), str(actual_func._schema)
++            )
++
++            # 4) Common: record graph task group
+             graph_task_group_begin(stream)
+-            result = func(*args, **kwargs)
++            result = actual_func(*args, **kwargs)
+             handle = graph_task_group_end(stream)
+-            # save state for update
++
++            # 5) Common: create dispatch record (delegate kwarg conversion to handler)
+             self.graph_dispatch_records.append(
+-                self._append_dispatch_record(event, handle, args, kwargs, func))
+-            return result
+-        else:
+-            return func(*args, **kwargs)
++                self._append_dispatch_record(
++                    event, handle, args, kwargs, actual_func, handler_cls
++                )
++            )
++
++            # 6) Operator-specific: post-process return value
++            return handler_cls.postprocess_result(result, kwargs)
++
++        return func(*args, **kwargs)
++
++    def _append_dispatch_record(
++        self, event, handle, args, kwargs, func, handler_cls
++    ):
++        """Create a dispatch record, converting args / kwargs to weak-refs or deep copies.
++
++        ``handler_cls`` is a required parameter (class object) guaranteed by
++        the capture skeleton.
++        """
++        args_ref = []
++        for element in args:
++            if torch.is_tensor(element) and "npu" in str(element.device):
++                args_ref.append(TensorWeakRef(element))
++            else:
++                args_ref.append(deepcopy(element))
++
++        tensor_param_names = self.tensor_schema_name.get(
++            str(func.__name__), []
++        )
++        kwargs_ref = {}
++        for key, value in kwargs.items():
++            kwargs_ref[key] = handler_cls.record_wrap_kwarg(
++                key, value, tensor_param_names
++            )
++
++        return _GraphDispatchRecord(
++            event=event,
++            handle=handle,
++            kwargs=kwargs_ref,
++            args=list(args_ref),
++            op_cache_entry=func,
++        )
++
++    # -----------------------------------------------------------------
++    #  Update skeleton
++    # -----------------------------------------------------------------
++
++    def update_capture_record(self, cpu_update_input):
++        if len(cpu_update_input) == 1:
++            new_list = [
++                cpu_update_input[0].copy()
++                for _ in range(len(self.graph_dispatch_records))
++            ]
++            cpu_update_input = new_list
++
++        # BUG FIX: original code compared len(self.graph_dispatch_records)
++        # with itself -- always True.  Corrected to compare with
++        # cpu_update_input.
++        if len(cpu_update_input) != len(self.graph_dispatch_records):
++            raise RuntimeError(
++                f"Currently, there are {len(self.graph_dispatch_records)} "
++                f"operators that need to be updated by capture, and there "
++                f"are only {len(cpu_update_input)} elements in the incoming "
++                f"cpu_update_input list",
++                pta_error(ErrCode.PARAM),
++            )
++
++        with torch.npu.stream(self.update_stream):
++            for record, update_input in zip(
++                self.graph_dispatch_records, cpu_update_input
++            ):
++                graph_task_update_begin(self.update_stream, record.handle)
++
++                # 7) Common: update matching kwargs (direct assignment,
++                #    consistent with original implementation).
++                #    Capture-phase uses TensorWeakRef/deepcopy to avoid
++                #    strong references; update is a short "assign -> replay"
++                #    flow where direct assignment suffices.
++                for key in update_input:
++                    if key in record.kwargs:
++                        record.kwargs[key] = update_input[key]
++
++                # 8) Operator-specific: update args by index.
++                #    Defensive assert -- unregistered ops go through
++                #    passthrough in capture and never produce a dispatch
++                #    record, so handler_cls must not be None here.
++                handler_cls = _NPU_GRAPH_OP_HANDLERS.get(
++                    record.op_cache_entry.__name__
++                )
++                if handler_cls is None:
++                    raise RuntimeError(
++                        f"No handler for recorded op: {record.op_cache_entry.__name__}. "
++                        f"This indicates the handler was unregistered between capture and update.",
++                        pta_error(ErrCode.PARAM),
++                    )
++                handler_cls.update_args(record, update_input)
++
++                # 9) Common: replay the operator
++                record.op_cache_entry(*record.args, **record.kwargs)
++                graph_task_update_end(self.update_stream)
++                record.event.record(self.update_stream)
+ 
+ 
+ # Python shim helps Sphinx process docstrings more reliably.
+@@ -261,7 +272,7 @@ class NPUGraph(torch_npu._C._NPUGraph):
+ 
+     def __new__(cls):
+         return super().__new__(cls)
+-    
++
+     def __init__(self):
+         self.graph_dispatch_mode = _GraphDispatchMode()
+         self.auto_dispatch_capture = False
+@@ -315,8 +326,11 @@ class NPUGraph(torch_npu._C._NPUGraph):
+ 
+     def update(self, cpu_update_input):
+         if not self.auto_dispatch_capture:
+-            raise RuntimeError("The current graph configuration does not support update,"
+-                "Try to capture by setting auto_dispatch_capture=True during capture", pta_error(ErrCode.PARAM))
++            raise RuntimeError(
++                "The current graph configuration does not support update,"
++                "Try to capture by setting auto_dispatch_capture=True during capture",
++                pta_error(ErrCode.PARAM),
++            )
+         self.graph_dispatch_mode.update_capture_record(cpu_update_input)
+ 
+     def debug_dump(self, debug_path):
+@@ -324,8 +338,8 @@ class NPUGraph(torch_npu._C._NPUGraph):
+ 
+         Arguments:
+             debug_path (required): Path to dump the graph to.
+-        """        
+-        return super().debug_dump(debug_path)     
++        """
++        return super().debug_dump(debug_path)
+ 
+ 
+ class graph:
+@@ -699,4 +713,4 @@ def make_graphed_callables(
+     if just_one_callable:
+         return ret[0]
+ 
+-    return tuple(ret)
+\ No newline at end of file
++    return tuple(ret)

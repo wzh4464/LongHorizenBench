@@ -1,0 +1,5 @@
+Include/internal/pycore_global_objects_fini_generated.h
+Include/internal/pycore_global_strings.h
+Include/internal/pycore_runtime_init_generated.h
+Include/internal/pycore_unicodeobject_generated.h
+configure

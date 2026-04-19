@@ -1,0 +1,3 @@
+[submodule "paper2"]
+	path = paper2
+	url = git@github.com:wzh4464/LongHorizenBench-paper.git

@@ -1,0 +1,2335 @@
+diff --git a/examples/cpp/helloworld/BUILD b/examples/cpp/helloworld/BUILD
+index 747f0b2299..c9a0cc2050 100644
+--- a/examples/cpp/helloworld/BUILD
++++ b/examples/cpp/helloworld/BUILD
+@@ -44,6 +44,16 @@ cc_binary(
+     ],
+ )
+ 
++cc_binary(
++    name = "greeter_callback_client",
++    srcs = ["greeter_callback_client.cc"],
++    defines = ["BAZEL_BUILD"],
++    deps = [
++        "//:grpc++",
++        "//examples/protos:helloworld_cc_grpc",
++    ],
++)
++
+ cc_binary(
+     name = "xds_greeter_client",
+     srcs = ["xds_greeter_client.cc"],
+@@ -77,6 +87,17 @@ cc_binary(
+     ],
+ )
+ 
++cc_binary(
++    name = "greeter_callback_server",
++    srcs = ["greeter_callback_server.cc"],
++    defines = ["BAZEL_BUILD"],
++    deps = [
++        "//:grpc++",
++        "//:grpc++_reflection",
++        "//examples/protos:helloworld_cc_grpc",
++    ],
++)
++
+ cc_binary(
+     name = "xds_greeter_server",
+     srcs = ["xds_greeter_server.cc"],
+diff --git a/examples/cpp/helloworld/CMakeLists.txt b/examples/cpp/helloworld/CMakeLists.txt
+index f1c3147393..0b466a4b1d 100644
+--- a/examples/cpp/helloworld/CMakeLists.txt
++++ b/examples/cpp/helloworld/CMakeLists.txt
+@@ -58,7 +58,8 @@ target_link_libraries(hw_grpc_proto
+ 
+ # Targets greeter_[async_](client|server)
+ foreach(_target
+-  greeter_client greeter_server
++  greeter_client greeter_server 
++  greeter_callback_client greeter_callback_server 
+   greeter_async_client greeter_async_client2 greeter_async_server)
+   add_executable(${_target} "${_target}.cc")
+   target_link_libraries(${_target}
+diff --git a/examples/cpp/helloworld/Makefile b/examples/cpp/helloworld/Makefile
+index 8030ba2be2..cfd03ca672 100644
+--- a/examples/cpp/helloworld/Makefile
++++ b/examples/cpp/helloworld/Makefile
+@@ -38,7 +38,7 @@ PROTOS_PATH = ../../protos
+ 
+ vpath %.proto $(PROTOS_PATH)
+ 
+-all: system-check greeter_client greeter_server greeter_async_client greeter_async_client2 greeter_async_server
++all: system-check greeter_client greeter_server greeter_async_client greeter_async_client2 greeter_async_server greeter_callback_client greeter_callback_server 
+ 
+ greeter_client: helloworld.pb.o helloworld.grpc.pb.o greeter_client.o
+ 	$(CXX) $^ $(LDFLAGS) -o $@
+@@ -55,6 +55,12 @@ greeter_async_client2: helloworld.pb.o helloworld.grpc.pb.o greeter_async_client
+ greeter_async_server: helloworld.pb.o helloworld.grpc.pb.o greeter_async_server.o
+ 	$(CXX) $^ $(LDFLAGS) -o $@
+ 
++greeter_callback_client: helloworld.pb.o helloworld.grpc.pb.o greeter_callback_client.o
++	$(CXX) $^ $(LDFLAGS) -o $@
++
++greeter_callback_server: helloworld.pb.o helloworld.grpc.pb.o greeter_callback_server.o
++	$(CXX) $^ $(LDFLAGS) -o $@
++
+ .PRECIOUS: %.grpc.pb.cc
+ %.grpc.pb.cc: %.proto
+ 	$(PROTOC) -I $(PROTOS_PATH) --grpc_out=. --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN_PATH) $<
+@@ -64,7 +70,7 @@ greeter_async_server: helloworld.pb.o helloworld.grpc.pb.o greeter_async_server.
+ 	$(PROTOC) -I $(PROTOS_PATH) --cpp_out=. $<
+ 
+ clean:
+-	rm -f *.o *.pb.cc *.pb.h greeter_client greeter_server greeter_async_client greeter_async_client2 greeter_async_server
++	rm -f *.o *.pb.cc *.pb.h greeter_client greeter_server greeter_async_client greeter_async_client2 greeter_async_server greeter_callback_client greeter_callback_server 
+ 
+ 
+ # The following is to test your system and ensure a smoother experience.
+diff --git a/examples/cpp/helloworld/greeter_callback_client.cc b/examples/cpp/helloworld/greeter_callback_client.cc
+new file mode 100644
+index 0000000000..0e92cb9017
+--- /dev/null
++++ b/examples/cpp/helloworld/greeter_callback_client.cc
+@@ -0,0 +1,125 @@
++/*
++ *
++ * Copyright 2021 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++#include <condition_variable>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <string>
++
++#include <grpcpp/grpcpp.h>
++
++#ifdef BAZEL_BUILD
++#include "examples/protos/helloworld.grpc.pb.h"
++#else
++#include "helloworld.grpc.pb.h"
++#endif
++
++using grpc::Channel;
++using grpc::ClientContext;
++using grpc::Status;
++using helloworld::Greeter;
++using helloworld::HelloReply;
++using helloworld::HelloRequest;
++
++class GreeterClient {
++ public:
++  GreeterClient(std::shared_ptr<Channel> channel)
++      : stub_(Greeter::NewStub(channel)) {}
++
++  // Assembles the client's payload, sends it and presents the response back
++  // from the server.
++  std::string SayHello(const std::string& user) {
++    // Data we are sending to the server.
++    HelloRequest request;
++    request.set_name(user);
++
++    // Container for the data we expect from the server.
++    HelloReply reply;
++
++    // Context for the client. It could be used to convey extra information to
++    // the server and/or tweak certain RPC behaviors.
++    ClientContext context;
++
++    // The actual RPC.
++    std::mutex mu;
++    std::condition_variable cv;
++    bool done = false;
++    Status status;
++    stub_->async()->SayHello(&context, &request, &reply,
++                             [&mu, &cv, &done, &status](Status s) {
++                               status = std::move(s);
++                               std::lock_guard<std::mutex> lock(mu);
++                               done = true;
++                               cv.notify_one();
++                             });
++
++    std::unique_lock<std::mutex> lock(mu);
++    while (!done) {
++      cv.wait(lock);
++    }
++
++    // Act upon its status.
++    if (status.ok()) {
++      return reply.message();
++    } else {
++      std::cout << status.error_code() << ": " << status.error_message()
++                << std::endl;
++      return "RPC failed";
++    }
++  }
++
++ private:
++  std::unique_ptr<Greeter::Stub> stub_;
++};
++
++int main(int argc, char** argv) {
++  // Instantiate the client. It requires a channel, out of which the actual RPCs
++  // are created. This channel models a connection to an endpoint specified by
++  // the argument "--target=" which is the only expected argument.
++  // We indicate that the channel isn't authenticated (use of
++  // InsecureChannelCredentials()).
++  std::string target_str;
++  std::string arg_str("--target");
++  if (argc > 1) {
++    std::string arg_val = argv[1];
++    size_t start_pos = arg_val.find(arg_str);
++    if (start_pos != std::string::npos) {
++      start_pos += arg_str.size();
++      if (arg_val[start_pos] == '=') {
++        target_str = arg_val.substr(start_pos + 1);
++      } else {
++        std::cout << "The only correct argument syntax is --target="
++                  << std::endl;
++        return 0;
++      }
++    } else {
++      std::cout << "The only acceptable argument is --target=" << std::endl;
++      return 0;
++    }
++  } else {
++    target_str = "localhost:50051";
++  }
++  GreeterClient greeter(
++      grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials()));
++  std::string user("world");
++  std::string reply = greeter.SayHello(user);
++  std::cout << "Greeter received: " << reply << std::endl;
++
++  return 0;
++}
+diff --git a/examples/cpp/helloworld/greeter_callback_server.cc b/examples/cpp/helloworld/greeter_callback_server.cc
+new file mode 100644
+index 0000000000..8f935611e6
+--- /dev/null
++++ b/examples/cpp/helloworld/greeter_callback_server.cc
+@@ -0,0 +1,81 @@
++/*
++ *
++ * Copyright 2021 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++#include <iostream>
++#include <memory>
++#include <string>
++
++#include <grpcpp/ext/proto_server_reflection_plugin.h>
++#include <grpcpp/grpcpp.h>
++#include <grpcpp/health_check_service_interface.h>
++
++#ifdef BAZEL_BUILD
++#include "examples/protos/helloworld.grpc.pb.h"
++#else
++#include "helloworld.grpc.pb.h"
++#endif
++
++using grpc::CallbackServerContext;
++using grpc::Server;
++using grpc::ServerBuilder;
++using grpc::ServerUnaryReactor;
++using grpc::Status;
++using helloworld::Greeter;
++using helloworld::HelloReply;
++using helloworld::HelloRequest;
++
++// Logic and data behind the server's behavior.
++class GreeterServiceImpl final : public Greeter::CallbackService {
++  ServerUnaryReactor* SayHello(CallbackServerContext* context,
++                               const HelloRequest* request,
++                               HelloReply* reply) override {
++    std::string prefix("Hello ");
++    reply->set_message(prefix + request->name());
++
++    ServerUnaryReactor* reactor = context->DefaultReactor();
++    reactor->Finish(Status::OK);
++    return reactor;
++  }
++};
++
++void RunServer() {
++  std::string server_address("0.0.0.0:50051");
++  GreeterServiceImpl service;
++
++  grpc::EnableDefaultHealthCheckService(true);
++  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
++  ServerBuilder builder;
++  // Listen on the given address without any authentication mechanism.
++  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
++  // Register "service" as the instance through which we'll communicate with
++  // clients. In this case it corresponds to an *synchronous* service.
++  builder.RegisterService(&service);
++  // Finally assemble the server.
++  std::unique_ptr<Server> server(builder.BuildAndStart());
++  std::cout << "Server listening on " << server_address << std::endl;
++
++  // Wait for the server to shutdown. Note that some other thread must be
++  // responsible for shutting down the server for this call to ever return.
++  server->Wait();
++}
++
++int main(int argc, char** argv) {
++  RunServer();
++
++  return 0;
++}
+diff --git a/examples/cpp/route_guide/BUILD b/examples/cpp/route_guide/BUILD
+index 8aac557c44..6f93549fb0 100644
+--- a/examples/cpp/route_guide/BUILD
++++ b/examples/cpp/route_guide/BUILD
+@@ -54,3 +54,31 @@ cc_binary(
+         "//examples/protos:route_guide",
+     ],
+ )
++
++cc_binary(
++    name = "route_guide_callback_client",
++    srcs = [
++        "route_guide_callback_client.cc",
++    ],
++    data = ["route_guide_db.json"],
++    defines = ["BAZEL_BUILD"],
++    deps = [
++        ":route_guide_helper",
++        "//:grpc++",
++        "//examples/protos:route_guide",
++    ],
++)
++
++cc_binary(
++    name = "route_guide_callback_server",
++    srcs = [
++        "route_guide_callback_server.cc",
++    ],
++    data = ["route_guide_db.json"],
++    defines = ["BAZEL_BUILD"],
++    deps = [
++        ":route_guide_helper",
++        "//:grpc++",
++        "//examples/protos:route_guide",
++    ],
++)
+diff --git a/examples/cpp/route_guide/route_guide_callback_client.cc b/examples/cpp/route_guide/route_guide_callback_client.cc
+new file mode 100644
+index 0000000000..93eeaecb94
+--- /dev/null
++++ b/examples/cpp/route_guide/route_guide_callback_client.cc
+@@ -0,0 +1,359 @@
++/*
++ *
++ * Copyright 2021 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++#include <chrono>
++#include <condition_variable>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <string>
++#include <thread>
++
++#include <grpc/grpc.h>
++#include <grpcpp/alarm.h>
++#include <grpcpp/channel.h>
++#include <grpcpp/client_context.h>
++#include <grpcpp/create_channel.h>
++#include <grpcpp/security/credentials.h>
++#include "helper.h"
++#ifdef BAZEL_BUILD
++#include "examples/protos/route_guide.grpc.pb.h"
++#else
++#include "route_guide.grpc.pb.h"
++#endif
++
++using grpc::Channel;
++using grpc::ClientContext;
++using grpc::Status;
++using routeguide::Feature;
++using routeguide::Point;
++using routeguide::Rectangle;
++using routeguide::RouteGuide;
++using routeguide::RouteNote;
++using routeguide::RouteSummary;
++
++Point MakePoint(long latitude, long longitude) {
++  Point p;
++  p.set_latitude(latitude);
++  p.set_longitude(longitude);
++  return p;
++}
++
++Feature MakeFeature(const std::string& name, long latitude, long longitude) {
++  Feature f;
++  f.set_name(name);
++  f.mutable_location()->CopyFrom(MakePoint(latitude, longitude));
++  return f;
++}
++
++RouteNote MakeRouteNote(const std::string& message, long latitude,
++                        long longitude) {
++  RouteNote n;
++  n.set_message(message);
++  n.mutable_location()->CopyFrom(MakePoint(latitude, longitude));
++  return n;
++}
++
++class RouteGuideClient {
++ public:
++  RouteGuideClient(std::shared_ptr<Channel> channel, const std::string& db)
++      : stub_(RouteGuide::NewStub(channel)) {
++    routeguide::ParseDb(db, &feature_list_);
++  }
++
++  void GetFeature() {
++    Point point;
++    Feature feature;
++    point = MakePoint(409146138, -746188906);
++    GetOneFeature(point, &feature);
++    point = MakePoint(0, 0);
++    GetOneFeature(point, &feature);
++  }
++
++  void ListFeatures() {
++    routeguide::Rectangle rect;
++    Feature feature;
++
++    rect.mutable_lo()->set_latitude(400000000);
++    rect.mutable_lo()->set_longitude(-750000000);
++    rect.mutable_hi()->set_latitude(420000000);
++    rect.mutable_hi()->set_longitude(-730000000);
++    std::cout << "Looking for features between 40, -75 and 42, -73"
++              << std::endl;
++
++    class Reader : public grpc::ClientReadReactor<Feature> {
++     public:
++      Reader(RouteGuide::Stub* stub, float coord_factor,
++             const routeguide::Rectangle& rect)
++          : coord_factor_(coord_factor) {
++        stub->async()->ListFeatures(&context_, &rect, this);
++        StartRead(&feature_);
++        StartCall();
++      }
++      void OnReadDone(bool ok) override {
++        if (ok) {
++          std::cout << "Found feature called " << feature_.name() << " at "
++                    << feature_.location().latitude() / coord_factor_ << ", "
++                    << feature_.location().longitude() / coord_factor_
++                    << std::endl;
++          StartRead(&feature_);
++        }
++      }
++      void OnDone(const Status& s) override {
++        std::unique_lock<std::mutex> l(mu_);
++        status_ = s;
++        done_ = true;
++        cv_.notify_one();
++      }
++      Status Await() {
++        std::unique_lock<std::mutex> l(mu_);
++        cv_.wait(l, [this] { return done_; });
++        return std::move(status_);
++      }
++
++     private:
++      ClientContext context_;
++      float coord_factor_;
++      Feature feature_;
++      std::mutex mu_;
++      std::condition_variable cv_;
++      Status status_;
++      bool done_ = false;
++    };
++    Reader reader(stub_.get(), kCoordFactor_, rect);
++    Status status = std::move(reader.Await());
++    if (status.ok()) {
++      std::cout << "ListFeatures rpc succeeded." << std::endl;
++    } else {
++      std::cout << "ListFeatures rpc failed." << std::endl;
++    }
++  }
++
++  void RecordRoute() {
++    class Recorder : public grpc::ClientWriteReactor<Point> {
++     public:
++      Recorder(RouteGuide::Stub* stub, float coord_factor,
++               const std::vector<Feature>* feature_list)
++          : coord_factor_(coord_factor),
++            feature_list_(feature_list),
++            generator_(
++                std::chrono::system_clock::now().time_since_epoch().count()),
++            feature_distribution_(0, feature_list->size() - 1),
++            delay_distribution_(500, 1500) {
++        stub->async()->RecordRoute(&context_, &stats_, this);
++        // Use a hold since some StartWrites are invoked indirectly from a
++        // delayed lambda in OnWriteDone rather than directly from the reaction
++        // itself
++        AddHold();
++        NextWrite();
++        StartCall();
++      }
++      void OnWriteDone(bool ok) override {
++        // Delay and then do the next write or WritesDone
++        alarm_.Set(
++            std::chrono::system_clock::now() +
++                std::chrono::milliseconds(delay_distribution_(generator_)),
++            [this](bool /*ok*/) { NextWrite(); });
++      }
++      void OnDone(const Status& s) override {
++        std::unique_lock<std::mutex> l(mu_);
++        status_ = s;
++        done_ = true;
++        cv_.notify_one();
++      }
++      Status Await(RouteSummary* stats) {
++        std::unique_lock<std::mutex> l(mu_);
++        cv_.wait(l, [this] { return done_; });
++        *stats = stats_;
++        return std::move(status_);
++      }
++
++     private:
++      void NextWrite() {
++        if (points_remaining_ != 0) {
++          const Feature& f =
++              (*feature_list_)[feature_distribution_(generator_)];
++          std::cout << "Visiting point "
++                    << f.location().latitude() / coord_factor_ << ", "
++                    << f.location().longitude() / coord_factor_ << std::endl;
++          StartWrite(&f.location());
++          points_remaining_--;
++        } else {
++          StartWritesDone();
++          RemoveHold();
++        }
++      }
++      ClientContext context_;
++      float coord_factor_;
++      int points_remaining_ = 10;
++      Point point_;
++      RouteSummary stats_;
++      const std::vector<Feature>* feature_list_;
++      std::default_random_engine generator_;
++      std::uniform_int_distribution<int> feature_distribution_;
++      std::uniform_int_distribution<int> delay_distribution_;
++      grpc::Alarm alarm_;
++      std::mutex mu_;
++      std::condition_variable cv_;
++      Status status_;
++      bool done_ = false;
++    };
++    Recorder recorder(stub_.get(), kCoordFactor_, &feature_list_);
++    RouteSummary stats;
++    Status status = std::move(recorder.Await(&stats));
++    if (status.ok()) {
++      std::cout << "Finished trip with " << stats.point_count() << " points\n"
++                << "Passed " << stats.feature_count() << " features\n"
++                << "Travelled " << stats.distance() << " meters\n"
++                << "It took " << stats.elapsed_time() << " seconds"
++                << std::endl;
++    } else {
++      std::cout << "RecordRoute rpc failed." << std::endl;
++    }
++  }
++
++  void RouteChat() {
++    class Chatter : public grpc::ClientBidiReactor<RouteNote, RouteNote> {
++     public:
++      explicit Chatter(RouteGuide::Stub* stub)
++          : notes_{MakeRouteNote("First message", 0, 0),
++                   MakeRouteNote("Second message", 0, 1),
++                   MakeRouteNote("Third message", 1, 0),
++                   MakeRouteNote("Fourth message", 0, 0)},
++            notes_iterator_(notes_.begin()) {
++        stub->async()->RouteChat(&context_, this);
++        NextWrite();
++        StartRead(&server_note_);
++        StartCall();
++      }
++      void OnWriteDone(bool /*ok*/) override { NextWrite(); }
++      void OnReadDone(bool ok) override {
++        if (ok) {
++          std::cout << "Got message " << server_note_.message() << " at "
++                    << server_note_.location().latitude() << ", "
++                    << server_note_.location().longitude() << std::endl;
++          StartRead(&server_note_);
++        }
++      }
++      void OnDone(const Status& s) override {
++        std::unique_lock<std::mutex> l(mu_);
++        status_ = s;
++        done_ = true;
++        cv_.notify_one();
++      }
++      Status Await() {
++        std::unique_lock<std::mutex> l(mu_);
++        cv_.wait(l, [this] { return done_; });
++        return std::move(status_);
++      }
++
++     private:
++      void NextWrite() {
++        if (notes_iterator_ != notes_.end()) {
++          const auto& note = *notes_iterator_;
++          std::cout << "Sending message " << note.message() << " at "
++                    << note.location().latitude() << ", "
++                    << note.location().longitude() << std::endl;
++          StartWrite(&note);
++          notes_iterator_++;
++        } else {
++          StartWritesDone();
++        }
++      }
++      ClientContext context_;
++      const std::vector<RouteNote> notes_;
++      std::vector<RouteNote>::const_iterator notes_iterator_;
++      RouteNote server_note_;
++      std::mutex mu_;
++      std::condition_variable cv_;
++      Status status_;
++      bool done_ = false;
++    };
++
++    Chatter chatter(stub_.get());
++    Status status = std::move(chatter.Await());
++    if (!status.ok()) {
++      std::cout << "RouteChat rpc failed." << std::endl;
++    }
++  }
++
++ private:
++  bool GetOneFeature(const Point& point, Feature* feature) {
++    ClientContext context;
++    bool result;
++    std::mutex mu;
++    std::condition_variable cv;
++    bool done = false;
++    stub_->async()->GetFeature(
++        &context, &point, feature,
++        [&result, &mu, &cv, &done, feature, this](Status status) {
++          bool ret;
++          if (!status.ok()) {
++            std::cout << "GetFeature rpc failed." << std::endl;
++            ret = false;
++          } else if (!feature->has_location()) {
++            std::cout << "Server returns incomplete feature." << std::endl;
++            ret = false;
++          } else if (feature->name().empty()) {
++            std::cout << "Found no feature at "
++                      << feature->location().latitude() / kCoordFactor_ << ", "
++                      << feature->location().longitude() / kCoordFactor_
++                      << std::endl;
++            ret = true;
++          } else {
++            std::cout << "Found feature called " << feature->name() << " at "
++                      << feature->location().latitude() / kCoordFactor_ << ", "
++                      << feature->location().longitude() / kCoordFactor_
++                      << std::endl;
++            ret = true;
++          }
++          std::lock_guard<std::mutex> lock(mu);
++          result = ret;
++          done = true;
++          cv.notify_one();
++        });
++    std::unique_lock<std::mutex> lock(mu);
++    cv.wait(lock, [&done] { return done; });
++    return result;
++  }
++
++  const float kCoordFactor_ = 10000000.0;
++  std::unique_ptr<RouteGuide::Stub> stub_;
++  std::vector<Feature> feature_list_;
++};
++
++int main(int argc, char** argv) {
++  // Expect only arg: --db_path=path/to/route_guide_db.json.
++  std::string db = routeguide::GetDbFileContent(argc, argv);
++  RouteGuideClient guide(
++      grpc::CreateChannel("localhost:50051",
++                          grpc::InsecureChannelCredentials()),
++      db);
++
++  std::cout << "-------------- GetFeature --------------" << std::endl;
++  guide.GetFeature();
++  std::cout << "-------------- ListFeatures --------------" << std::endl;
++  guide.ListFeatures();
++  std::cout << "-------------- RecordRoute --------------" << std::endl;
++  guide.RecordRoute();
++  std::cout << "-------------- RouteChat --------------" << std::endl;
++  guide.RouteChat();
++
++  return 0;
++}
+diff --git a/examples/cpp/route_guide/route_guide_callback_server.cc b/examples/cpp/route_guide/route_guide_callback_server.cc
+new file mode 100644
+index 0000000000..cf99d05ffc
+--- /dev/null
++++ b/examples/cpp/route_guide/route_guide_callback_server.cc
+@@ -0,0 +1,277 @@
++/*
++ *
++ * Copyright 2021 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <iostream>
++#include <memory>
++#include <string>
++#include <thread>
++
++#include <grpc/grpc.h>
++#include <grpcpp/security/server_credentials.h>
++#include <grpcpp/server.h>
++#include <grpcpp/server_builder.h>
++#include <grpcpp/server_context.h>
++#include "helper.h"
++#ifdef BAZEL_BUILD
++#include "examples/protos/route_guide.grpc.pb.h"
++#else
++#include "route_guide.grpc.pb.h"
++#endif
++
++using grpc::CallbackServerContext;
++using grpc::Server;
++using grpc::ServerBuilder;
++using grpc::Status;
++using routeguide::Feature;
++using routeguide::Point;
++using routeguide::Rectangle;
++using routeguide::RouteGuide;
++using routeguide::RouteNote;
++using routeguide::RouteSummary;
++using std::chrono::system_clock;
++
++float ConvertToRadians(float num) { return num * 3.1415926 / 180; }
++
++// The formula is based on http://mathforum.org/library/drmath/view/51879.html
++float GetDistance(const Point& start, const Point& end) {
++  const float kCoordFactor = 10000000.0;
++  float lat_1 = start.latitude() / kCoordFactor;
++  float lat_2 = end.latitude() / kCoordFactor;
++  float lon_1 = start.longitude() / kCoordFactor;
++  float lon_2 = end.longitude() / kCoordFactor;
++  float lat_rad_1 = ConvertToRadians(lat_1);
++  float lat_rad_2 = ConvertToRadians(lat_2);
++  float delta_lat_rad = ConvertToRadians(lat_2 - lat_1);
++  float delta_lon_rad = ConvertToRadians(lon_2 - lon_1);
++
++  float a = pow(sin(delta_lat_rad / 2), 2) +
++            cos(lat_rad_1) * cos(lat_rad_2) * pow(sin(delta_lon_rad / 2), 2);
++  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
++  int R = 6371000;  // metres
++
++  return R * c;
++}
++
++std::string GetFeatureName(const Point& point,
++                           const std::vector<Feature>& feature_list) {
++  for (const Feature& f : feature_list) {
++    if (f.location().latitude() == point.latitude() &&
++        f.location().longitude() == point.longitude()) {
++      return f.name();
++    }
++  }
++  return "";
++}
++
++class RouteGuideImpl final : public RouteGuide::CallbackService {
++ public:
++  explicit RouteGuideImpl(const std::string& db) {
++    routeguide::ParseDb(db, &feature_list_);
++  }
++
++  grpc::ServerUnaryReactor* GetFeature(CallbackServerContext* context,
++                                       const Point* point,
++                                       Feature* feature) override {
++    feature->set_name(GetFeatureName(*point, feature_list_));
++    feature->mutable_location()->CopyFrom(*point);
++    auto* reactor = context->DefaultReactor();
++    reactor->Finish(Status::OK);
++    return reactor;
++  }
++
++  grpc::ServerWriteReactor<Feature>* ListFeatures(
++      CallbackServerContext* context,
++      const routeguide::Rectangle* rectangle) override {
++    class Lister : public grpc::ServerWriteReactor<Feature> {
++     public:
++      Lister(const routeguide::Rectangle* rectangle,
++             const std::vector<Feature>* feature_list)
++          : left_((std::min)(rectangle->lo().longitude(),
++                             rectangle->hi().longitude())),
++            right_((std::max)(rectangle->lo().longitude(),
++                              rectangle->hi().longitude())),
++            top_((std::max)(rectangle->lo().latitude(),
++                            rectangle->hi().latitude())),
++            bottom_((std::min)(rectangle->lo().latitude(),
++                               rectangle->hi().latitude())),
++            feature_list_(feature_list),
++            next_feature_(feature_list_->begin()) {
++        NextWrite();
++      }
++      void OnDone() override { delete this; }
++      void OnWriteDone(bool /*ok*/) override { NextWrite(); }
++
++     private:
++      void NextWrite() {
++        while (next_feature_ != feature_list_->end()) {
++          const Feature& f = *next_feature_;
++          next_feature_++;
++          if (f.location().longitude() >= left_ &&
++              f.location().longitude() <= right_ &&
++              f.location().latitude() >= bottom_ &&
++              f.location().latitude() <= top_) {
++            StartWrite(&f);
++            return;
++          }
++        }
++        // Didn't write anything, all is done.
++        Finish(Status::OK);
++      }
++      const long left_;
++      const long right_;
++      const long top_;
++      const long bottom_;
++      const std::vector<Feature>* feature_list_;
++      std::vector<Feature>::const_iterator next_feature_;
++    };
++    return new Lister(rectangle, &feature_list_);
++  }
++
++  grpc::ServerReadReactor<Point>* RecordRoute(CallbackServerContext* context,
++                                              RouteSummary* summary) override {
++    class Recorder : public grpc::ServerReadReactor<Point> {
++     public:
++      Recorder(RouteSummary* summary, const std::vector<Feature>* feature_list)
++          : start_time_(system_clock::now()),
++            summary_(summary),
++            feature_list_(feature_list) {
++        StartRead(&point_);
++      }
++      void OnDone() { delete this; }
++      void OnReadDone(bool ok) {
++        if (ok) {
++          point_count_++;
++          if (!GetFeatureName(point_, *feature_list_).empty()) {
++            feature_count_++;
++          }
++          if (point_count_ != 1) {
++            distance_ += GetDistance(previous_, point_);
++          }
++          previous_ = point_;
++          StartRead(&point_);
++        } else {
++          summary_->set_point_count(point_count_);
++          summary_->set_feature_count(feature_count_);
++          summary_->set_distance(static_cast<long>(distance_));
++          auto secs = std::chrono::duration_cast<std::chrono::seconds>(
++              system_clock::now() - start_time_);
++          summary_->set_elapsed_time(secs.count());
++          Finish(Status::OK);
++        }
++      }
++
++     private:
++      system_clock::time_point start_time_;
++      RouteSummary* summary_;
++      const std::vector<Feature>* feature_list_;
++      Point point_;
++      int point_count_ = 0;
++      int feature_count_ = 0;
++      float distance_ = 0.0;
++      Point previous_;
++    };
++    return new Recorder(summary, &feature_list_);
++  }
++
++  grpc::ServerBidiReactor<RouteNote, RouteNote>* RouteChat(
++      CallbackServerContext* context) override {
++    class Chatter : public grpc::ServerBidiReactor<RouteNote, RouteNote> {
++     public:
++      Chatter(std::mutex* mu, std::vector<RouteNote>* received_notes)
++          : mu_(mu), received_notes_(received_notes) {
++        StartRead(&note_);
++      }
++      void OnDone() override {
++        // Collect the read_starter thread if needed
++        if (read_starter_.joinable()) {
++          read_starter_.join();
++        }
++        delete this;
++      }
++      void OnReadDone(bool ok) override {
++        if (ok) {
++          // We may need to wait an arbitary amount of time on this mutex
++          // and we cannot delay the reaction, so start it in a thread
++          // Collect the previous read_starter thread if needed
++          if (read_starter_.joinable()) {
++            read_starter_.join();
++          }
++          read_starter_ = std::thread([this] {
++            mu_->lock();
++            notes_iterator_ = received_notes_->begin();
++            NextWrite();
++          });
++        } else {
++          Finish(Status::OK);
++        }
++      }
++      void OnWriteDone(bool /*ok*/) override { NextWrite(); }
++
++     private:
++      void NextWrite() {
++        while (notes_iterator_ != received_notes_->end()) {
++          const RouteNote& n = *notes_iterator_;
++          notes_iterator_++;
++          if (n.location().latitude() == note_.location().latitude() &&
++              n.location().longitude() == note_.location().longitude()) {
++            StartWrite(&n);
++            return;
++          }
++        }
++        // Didn't write anything, so all done with this note
++        received_notes_->push_back(note_);
++        mu_->unlock();
++        StartRead(&note_);
++      }
++      RouteNote note_;
++      std::mutex* mu_;
++      std::vector<RouteNote>* received_notes_;
++      std::vector<RouteNote>::iterator notes_iterator_;
++      std::thread read_starter_;
++    };
++    return new Chatter(&mu_, &received_notes_);
++  }
++
++ private:
++  std::vector<Feature> feature_list_;
++  std::mutex mu_;
++  std::vector<RouteNote> received_notes_;
++};
++
++void RunServer(const std::string& db_path) {
++  std::string server_address("0.0.0.0:50051");
++  RouteGuideImpl service(db_path);
++
++  ServerBuilder builder;
++  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
++  builder.RegisterService(&service);
++  std::unique_ptr<Server> server(builder.BuildAndStart());
++  std::cout << "Server listening on " << server_address << std::endl;
++  server->Wait();
++}
++
++int main(int argc, char** argv) {
++  // Expect only arg: --db_path=path/to/route_guide_db.json.
++  std::string db = routeguide::GetDbFileContent(argc, argv);
++  RunServer(db);
++
++  return 0;
++}
+diff --git a/include/grpc/impl/codegen/port_platform.h b/include/grpc/impl/codegen/port_platform.h
+index 387639bf83..613eff040a 100644
+--- a/include/grpc/impl/codegen/port_platform.h
++++ b/include/grpc/impl/codegen/port_platform.h
+@@ -664,4 +664,6 @@ typedef unsigned __int64 uint64_t;
+ #define __STDC_FORMAT_MACROS
+ #endif
+ 
++#define GRPC_CALLBACK_API_NONEXPERIMENTAL
++
+ #endif /* GRPC_IMPL_CODEGEN_PORT_PLATFORM_H */
+diff --git a/include/grpcpp/generic/generic_stub.h b/include/grpcpp/generic/generic_stub.h
+index e9564c33e7..cb4c401097 100644
+--- a/include/grpcpp/generic/generic_stub.h
++++ b/include/grpcpp/generic/generic_stub.h
+@@ -90,6 +90,17 @@ class TemplatedGenericStub final {
+ #ifdef GRPC_CALLBACK_API_NONEXPERIMENTAL
+   /// Setup and start a unary call to a named method \a method using
+   /// \a context and specifying the \a request and \a response buffers.
++  void UnaryCall(ClientContext* context, const std::string& method,
++                 StubOptions options, const RequestType* request,
++                 ResponseType* response,
++                 std::function<void(grpc::Status)> on_completion) {
++    UnaryCallInternal(context, method, options, request, response,
++                      std::move(on_completion));
++  }
++
++  /// NOTE: THE FOLLOWING VERSION IS NOT API. It is present only to
++  /// breakage of some existing codes that were de-experimentalized
++  /// before gRFC L67 completed. This will be removed soon.
+   void UnaryCall(ClientContext* context, const std::string& method,
+                  const RequestType* request, ResponseType* response,
+                  std::function<void(grpc::Status)> on_completion) {
+@@ -102,15 +113,24 @@ class TemplatedGenericStub final {
+   /// Like any other reactor-based RPC, it will not be activated until
+   /// StartCall is invoked on its reactor.
+   void PrepareUnaryCall(ClientContext* context, const std::string& method,
+-                        const RequestType* request, ResponseType* response,
+-                        ClientUnaryReactor* reactor) {
+-    PrepareUnaryCallInternal(context, method, /*options=*/{}, request, response,
++                        StubOptions options, const RequestType* request,
++                        ResponseType* response, ClientUnaryReactor* reactor) {
++    PrepareUnaryCallInternal(context, method, options, request, response,
+                              reactor);
+   }
+ 
+   /// Setup a call to a named method \a method using \a context and tied to
+   /// \a reactor . Like any other bidi streaming RPC, it will not be activated
+   /// until StartCall is invoked on its reactor.
++  void PrepareBidiStreamingCall(
++      ClientContext* context, const std::string& method, StubOptions options,
++      ClientBidiReactor<RequestType, ResponseType>* reactor) {
++    PrepareBidiStreamingCallInternal(context, method, options, reactor);
++  }
++
++  /// NOTE: THE FOLLOWING VERSION IS NOT API. It is present only to
++  /// breakage of some existing codes that were de-experimentalized
++  /// before gRFC L67 completed. This will be removed soon.
+   void PrepareBidiStreamingCall(
+       ClientContext* context, const std::string& method,
+       ClientBidiReactor<RequestType, ResponseType>* reactor) {
+diff --git a/include/grpcpp/impl/codegen/client_context.h b/include/grpcpp/impl/codegen/client_context.h
+index 763a836e42..c4df62aa8c 100644
+--- a/include/grpcpp/impl/codegen/client_context.h
++++ b/include/grpcpp/impl/codegen/client_context.h
+@@ -206,7 +206,7 @@ class ClientContext {
+   /// \return A newly constructed \a ClientContext instance based on \a
+   /// server_context, with traits propagated (copied) according to \a options.
+   static std::unique_ptr<ClientContext> FromServerContext(
+-      const grpc::ServerContext& server_context,
++      const grpc::ServerContextBase& server_context,
+       PropagationOptions options = PropagationOptions());
+   static std::unique_ptr<ClientContext> FromCallbackServerContext(
+       const grpc::CallbackServerContext& server_context,
+diff --git a/include/grpcpp/server_builder.h b/include/grpcpp/server_builder.h
+index 1a3b722c56..0016c8df6c 100644
+--- a/include/grpcpp/server_builder.h
++++ b/include/grpcpp/server_builder.h
+@@ -269,12 +269,12 @@ class ServerBuilder {
+       builder_->interceptor_creators_ = std::move(interceptor_creators);
+     }
+ 
++#ifndef GRPC_CALLBACK_API_NONEXPERIMENTAL
+     /// Set the allocator for creating and releasing callback server context.
+     /// Takes the owndership of the allocator.
+     ServerBuilder& SetContextAllocator(
+         std::unique_ptr<grpc::ContextAllocator> context_allocator);
+ 
+-#ifndef GRPC_CALLBACK_API_NONEXPERIMENTAL
+     /// Register a generic service that uses the callback API.
+     /// Matches requests with any :authority
+     /// This is mostly useful for writing generic gRPC Proxies where the exact
+@@ -300,6 +300,11 @@ class ServerBuilder {
+   };
+ 
+ #ifdef GRPC_CALLBACK_API_NONEXPERIMENTAL
++  /// Set the allocator for creating and releasing callback server context.
++  /// Takes the owndership of the allocator.
++  ServerBuilder& SetContextAllocator(
++      std::unique_ptr<grpc::ContextAllocator> context_allocator);
++
+   /// Register a generic service that uses the callback API.
+   /// Matches requests with any :authority
+   /// This is mostly useful for writing generic gRPC Proxies where the exact
+diff --git a/src/cpp/client/client_context.cc b/src/cpp/client/client_context.cc
+index 386b731c0f..4d35cceef4 100644
+--- a/src/cpp/client/client_context.cc
++++ b/src/cpp/client/client_context.cc
+@@ -98,7 +98,7 @@ std::unique_ptr<ClientContext> ClientContext::FromInternalServerContext(
+ }
+ 
+ std::unique_ptr<ClientContext> ClientContext::FromServerContext(
+-    const grpc::ServerContext& server_context, PropagationOptions options) {
++    const grpc::ServerContextBase& server_context, PropagationOptions options) {
+   return FromInternalServerContext(server_context, options);
+ }
+ 
+diff --git a/src/cpp/server/server_builder.cc b/src/cpp/server/server_builder.cc
+index 695aa541dd..d98ab44bee 100644
+--- a/src/cpp/server/server_builder.cc
++++ b/src/cpp/server/server_builder.cc
+@@ -109,12 +109,18 @@ ServerBuilder& ServerBuilder::RegisterCallbackGenericService(
+     gpr_log(GPR_ERROR,
+             "Adding multiple generic services is unsupported for now. "
+             "Dropping the service %p",
+-            (void*)service);
++            service);
+   } else {
+     callback_generic_service_ = service;
+   }
+   return *this;
+ }
++
++ServerBuilder& ServerBuilder::SetContextAllocator(
++    std::unique_ptr<grpc::ContextAllocator> context_allocator) {
++  context_allocator_ = std::move(context_allocator);
++  return *this;
++}
+ #else
+ ServerBuilder& ServerBuilder::experimental_type::RegisterCallbackGenericService(
+     experimental::CallbackGenericService* service) {
+@@ -128,13 +134,13 @@ ServerBuilder& ServerBuilder::experimental_type::RegisterCallbackGenericService(
+   }
+   return *builder_;
+ }
+-#endif
+ 
+ ServerBuilder& ServerBuilder::experimental_type::SetContextAllocator(
+     std::unique_ptr<grpc::ContextAllocator> context_allocator) {
+   builder_->context_allocator_ = std::move(context_allocator);
+   return *builder_;
+ }
++#endif
+ 
+ std::unique_ptr<grpc::experimental::ExternalConnectionAcceptor>
+ ServerBuilder::experimental_type::AddExternalConnectionAcceptor(
+diff --git a/test/cpp/common/alarm_test.cc b/test/cpp/common/alarm_test.cc
+index e0a3d15deb..6238caaa02 100644
+--- a/test/cpp/common/alarm_test.cc
++++ b/test/cpp/common/alarm_test.cc
+@@ -95,13 +95,13 @@ TEST(AlarmTest, CallbackRegularExpiry) {
+   Alarm alarm;
+ 
+   auto c = std::make_shared<Completion>();
+-  alarm.experimental().Set(
+-      std::chrono::system_clock::now() + std::chrono::seconds(1), [c](bool ok) {
+-        EXPECT_TRUE(ok);
+-        std::lock_guard<std::mutex> l(c->mu);
+-        c->completed = true;
+-        c->cv.notify_one();
+-      });
++  alarm.Set(std::chrono::system_clock::now() + std::chrono::seconds(1),
++            [c](bool ok) {
++              EXPECT_TRUE(ok);
++              std::lock_guard<std::mutex> l(c->mu);
++              c->completed = true;
++              c->cv.notify_one();
++            });
+ 
+   std::unique_lock<std::mutex> l(c->mu);
+   EXPECT_TRUE(c->cv.wait_until(
+@@ -113,7 +113,7 @@ TEST(AlarmTest, CallbackZeroExpiry) {
+   Alarm alarm;
+ 
+   auto c = std::make_shared<Completion>();
+-  alarm.experimental().Set(grpc_timeout_seconds_to_deadline(0), [c](bool ok) {
++  alarm.Set(grpc_timeout_seconds_to_deadline(0), [c](bool ok) {
+     EXPECT_TRUE(ok);
+     std::lock_guard<std::mutex> l(c->mu);
+     c->completed = true;
+@@ -130,14 +130,13 @@ TEST(AlarmTest, CallbackNegativeExpiry) {
+   Alarm alarm;
+ 
+   auto c = std::make_shared<Completion>();
+-  alarm.experimental().Set(
+-      std::chrono::system_clock::now() + std::chrono::seconds(-1),
+-      [c](bool ok) {
+-        EXPECT_TRUE(ok);
+-        std::lock_guard<std::mutex> l(c->mu);
+-        c->completed = true;
+-        c->cv.notify_one();
+-      });
++  alarm.Set(std::chrono::system_clock::now() + std::chrono::seconds(-1),
++            [c](bool ok) {
++              EXPECT_TRUE(ok);
++              std::lock_guard<std::mutex> l(c->mu);
++              c->completed = true;
++              c->cv.notify_one();
++            });
+ 
+   std::unique_lock<std::mutex> l(c->mu);
+   EXPECT_TRUE(c->cv.wait_until(
+@@ -288,14 +287,13 @@ TEST(AlarmTest, CallbackCancellation) {
+   Alarm alarm;
+ 
+   auto c = std::make_shared<Completion>();
+-  alarm.experimental().Set(
+-      std::chrono::system_clock::now() + std::chrono::seconds(10),
+-      [c](bool ok) {
+-        EXPECT_FALSE(ok);
+-        std::lock_guard<std::mutex> l(c->mu);
+-        c->completed = true;
+-        c->cv.notify_one();
+-      });
++  alarm.Set(std::chrono::system_clock::now() + std::chrono::seconds(10),
++            [c](bool ok) {
++              EXPECT_FALSE(ok);
++              std::lock_guard<std::mutex> l(c->mu);
++              c->completed = true;
++              c->cv.notify_one();
++            });
+   alarm.Cancel();
+ 
+   std::unique_lock<std::mutex> l(c->mu);
+@@ -308,14 +306,13 @@ TEST(AlarmTest, CallbackCancellationLocked) {
+   Alarm alarm;
+ 
+   auto c = std::make_shared<Completion>();
+-  alarm.experimental().Set(
+-      std::chrono::system_clock::now() + std::chrono::seconds(10),
+-      [c](bool ok) {
+-        EXPECT_FALSE(ok);
+-        std::lock_guard<std::mutex> l(c->mu);
+-        c->completed = true;
+-        c->cv.notify_one();
+-      });
++  alarm.Set(std::chrono::system_clock::now() + std::chrono::seconds(10),
++            [c](bool ok) {
++              EXPECT_FALSE(ok);
++              std::lock_guard<std::mutex> l(c->mu);
++              c->completed = true;
++              c->cv.notify_one();
++            });
+   std::unique_lock<std::mutex> l(c->mu);
+   alarm.Cancel();
+ 
+@@ -346,14 +343,13 @@ TEST(AlarmTest, CallbackSetDestruction) {
+   auto c = std::make_shared<Completion>();
+   {
+     Alarm alarm;
+-    alarm.experimental().Set(
+-        std::chrono::system_clock::now() + std::chrono::seconds(10),
+-        [c](bool ok) {
+-          EXPECT_FALSE(ok);
+-          std::lock_guard<std::mutex> l(c->mu);
+-          c->completed = true;
+-          c->cv.notify_one();
+-        });
++    alarm.Set(std::chrono::system_clock::now() + std::chrono::seconds(10),
++              [c](bool ok) {
++                EXPECT_FALSE(ok);
++                std::lock_guard<std::mutex> l(c->mu);
++                c->completed = true;
++                c->cv.notify_one();
++              });
+   }
+ 
+   std::unique_lock<std::mutex> l(c->mu);
+diff --git a/test/cpp/end2end/client_callback_end2end_test.cc b/test/cpp/end2end/client_callback_end2end_test.cc
+index 9d9c609036..2425ea4e04 100644
+--- a/test/cpp/end2end/client_callback_end2end_test.cc
++++ b/test/cpp/end2end/client_callback_end2end_test.cc
+@@ -191,7 +191,7 @@ class ClientCallbackEnd2endTest
+       std::mutex mu;
+       std::condition_variable cv;
+       bool done = false;
+-      stub_->experimental_async()->Echo(
++      stub_->async()->Echo(
+           &cli_ctx, &request, &response,
+           [&cli_ctx, &request, &response, &done, &mu, &cv, val,
+            with_binary_metadata](Status s) {
+@@ -234,7 +234,7 @@ class ClientCallbackEnd2endTest
+       std::condition_variable cv;
+       bool done = false;
+       StubOptions options(suffix_for_stats);
+-      generic_stub_->experimental().UnaryCall(
++      generic_stub_->UnaryCall(
+           &cli_ctx, kMethodName, options, send_buf.get(), &recv_buf,
+           [&request, &recv_buf, &done, &mu, &cv, maybe_except](Status s) {
+             GPR_ASSERT(s.ok());
+@@ -266,8 +266,7 @@ class ClientCallbackEnd2endTest
+     std::string test_string("");
+     for (int i = 0; i < num_rpcs; i++) {
+       test_string += "Hello world. ";
+-      class Client : public grpc::experimental::ClientBidiReactor<ByteBuffer,
+-                                                                  ByteBuffer> {
++      class Client : public grpc::ClientBidiReactor<ByteBuffer, ByteBuffer> {
+        public:
+         Client(ClientCallbackEnd2endTest* test, const std::string& method_name,
+                const char* suffix_for_stats, const std::string& test_str,
+@@ -278,7 +277,7 @@ class ClientCallbackEnd2endTest
+               cli_ctx_ = absl::make_unique<ClientContext>();
+               reuses_remaining_--;
+               StubOptions options(suffix_for_stats);
+-              test->generic_stub_->experimental().PrepareBidiStreamingCall(
++              test->generic_stub_->PrepareBidiStreamingCall(
+                   cli_ctx_.get(), method_name, options, this);
+               request_.set_message(test_str);
+               send_buf_ = SerializeToByteBuffer(&request_);
+@@ -365,16 +364,16 @@ TEST_P(ClientCallbackEnd2endTest, SimpleRpcExpectedError) {
+   std::condition_variable cv;
+   bool done = false;
+ 
+-  stub_->experimental_async()->Echo(
+-      &cli_ctx, &request, &response,
+-      [&response, &done, &mu, &cv, &error_status](Status s) {
+-        EXPECT_EQ("", response.message());
+-        EXPECT_EQ(error_status.code(), s.error_code());
+-        EXPECT_EQ(error_status.error_message(), s.error_message());
+-        std::lock_guard<std::mutex> l(mu);
+-        done = true;
+-        cv.notify_one();
+-      });
++  stub_->async()->Echo(&cli_ctx, &request, &response,
++                       [&response, &done, &mu, &cv, &error_status](Status s) {
++                         EXPECT_EQ("", response.message());
++                         EXPECT_EQ(error_status.code(), s.error_code());
++                         EXPECT_EQ(error_status.error_message(),
++                                   s.error_message());
++                         std::lock_guard<std::mutex> l(mu);
++                         done = true;
++                         cv.notify_one();
++                       });
+ 
+   std::unique_lock<std::mutex> l(mu);
+   while (!done) {
+@@ -415,19 +414,18 @@ TEST_P(ClientCallbackEnd2endTest, SimpleRpcUnderLockNested) {
+   std::function<void(int)> nested_call = [this, &nested_call,
+                                           &rpc_state](int index) {
+     std::lock_guard<std::mutex> l(rpc_state[index].mu);
+-    stub_->experimental_async()->Echo(
+-        &rpc_state[index].cli_ctx, &rpc_state[index].request,
+-        &rpc_state[index].response,
+-        [index, &nested_call, &rpc_state](Status s) {
+-          std::lock_guard<std::mutex> l1(rpc_state[index].mu);
+-          EXPECT_TRUE(s.ok());
+-          rpc_state[index].done = true;
+-          rpc_state[index].cv.notify_all();
+-          // Call the next level of nesting if possible
+-          if (index + 1 < int(rpc_state.size())) {
+-            nested_call(index + 1);
+-          }
+-        });
++    stub_->async()->Echo(&rpc_state[index].cli_ctx, &rpc_state[index].request,
++                         &rpc_state[index].response,
++                         [index, &nested_call, &rpc_state](Status s) {
++                           std::lock_guard<std::mutex> l1(rpc_state[index].mu);
++                           EXPECT_TRUE(s.ok());
++                           rpc_state[index].done = true;
++                           rpc_state[index].cv.notify_all();
++                           // Call the next level of nesting if possible
++                           if (index + 1 < int(rpc_state.size())) {
++                             nested_call(index + 1);
++                           }
++                         });
+   };
+ 
+   nested_call(0);
+@@ -453,15 +451,14 @@ TEST_P(ClientCallbackEnd2endTest, SimpleRpcUnderLock) {
+   ClientContext cli_ctx;
+   {
+     std::lock_guard<std::mutex> l(mu);
+-    stub_->experimental_async()->Echo(
+-        &cli_ctx, &request, &response,
+-        [&mu, &cv, &done, &request, &response](Status s) {
+-          std::lock_guard<std::mutex> l(mu);
+-          EXPECT_TRUE(s.ok());
+-          EXPECT_EQ(request.message(), response.message());
+-          done = true;
+-          cv.notify_one();
+-        });
++    stub_->async()->Echo(&cli_ctx, &request, &response,
++                         [&mu, &cv, &done, &request, &response](Status s) {
++                           std::lock_guard<std::mutex> l(mu);
++                           EXPECT_TRUE(s.ok());
++                           EXPECT_EQ(request.message(), response.message());
++                           done = true;
++                           cv.notify_one();
++                         });
+   }
+   std::unique_lock<std::mutex> l(mu);
+   while (!done) {
+@@ -486,7 +483,7 @@ TEST_P(ClientCallbackEnd2endTest, SendClientInitialMetadata) {
+   std::mutex mu;
+   std::condition_variable cv;
+   bool done = false;
+-  stub_->experimental_async()->CheckClientInitialMetadata(
++  stub_->async()->CheckClientInitialMetadata(
+       &cli_ctx, &request, &response, [&done, &mu, &cv](Status s) {
+         GPR_ASSERT(s.ok());
+ 
+@@ -589,14 +586,14 @@ TEST_P(ClientCallbackEnd2endTest, CancelRpcBeforeStart) {
+   std::mutex mu;
+   std::condition_variable cv;
+   bool done = false;
+-  stub_->experimental_async()->Echo(
+-      &context, &request, &response, [&response, &done, &mu, &cv](Status s) {
+-        EXPECT_EQ("", response.message());
+-        EXPECT_EQ(grpc::StatusCode::CANCELLED, s.error_code());
+-        std::lock_guard<std::mutex> l(mu);
+-        done = true;
+-        cv.notify_one();
+-      });
++  stub_->async()->Echo(&context, &request, &response,
++                       [&response, &done, &mu, &cv](Status s) {
++                         EXPECT_EQ("", response.message());
++                         EXPECT_EQ(grpc::StatusCode::CANCELLED, s.error_code());
++                         std::lock_guard<std::mutex> l(mu);
++                         done = true;
++                         cv.notify_one();
++                       });
+   std::unique_lock<std::mutex> l(mu);
+   while (!done) {
+     cv.wait(l);
+@@ -618,14 +615,14 @@ TEST_P(ClientCallbackEnd2endTest, RequestEchoServerCancel) {
+   std::mutex mu;
+   std::condition_variable cv;
+   bool done = false;
+-  stub_->experimental_async()->Echo(
+-      &context, &request, &response, [&done, &mu, &cv](Status s) {
+-        EXPECT_FALSE(s.ok());
+-        EXPECT_EQ(grpc::StatusCode::CANCELLED, s.error_code());
+-        std::lock_guard<std::mutex> l(mu);
+-        done = true;
+-        cv.notify_one();
+-      });
++  stub_->async()->Echo(&context, &request, &response,
++                       [&done, &mu, &cv](Status s) {
++                         EXPECT_FALSE(s.ok());
++                         EXPECT_EQ(grpc::StatusCode::CANCELLED, s.error_code());
++                         std::lock_guard<std::mutex> l(mu);
++                         done = true;
++                         cv.notify_one();
++                       });
+   std::unique_lock<std::mutex> l(mu);
+   while (!done) {
+     cv.wait(l);
+@@ -640,7 +637,7 @@ struct ClientCancelInfo {
+   explicit ClientCancelInfo(int ops) : cancel{true}, ops_before_cancel{ops} {}
+ };
+ 
+-class WriteClient : public grpc::experimental::ClientWriteReactor<EchoRequest> {
++class WriteClient : public grpc::ClientWriteReactor<EchoRequest> {
+  public:
+   WriteClient(grpc::testing::EchoTestService::Stub* stub,
+               ServerTryCancelRequestPhase server_try_cancel,
+@@ -658,7 +655,7 @@ class WriteClient : public grpc::experimental::ClientWriteReactor<EchoRequest> {
+                            std::to_string(server_try_cancel));
+     }
+     context_.set_initial_metadata_corked(true);
+-    stub->experimental_async()->RequestStream(&context_, &response_, this);
++    stub->async()->RequestStream(&context_, &response_, this);
+     StartCall();
+     request_.set_message(msg);
+     MaybeWrite();
+@@ -792,14 +789,14 @@ TEST_P(ClientCallbackEnd2endTest, RequestStreamServerCancelAfterReads) {
+ 
+ TEST_P(ClientCallbackEnd2endTest, UnaryReactor) {
+   ResetStub();
+-  class UnaryClient : public grpc::experimental::ClientUnaryReactor {
++  class UnaryClient : public grpc::ClientUnaryReactor {
+    public:
+     explicit UnaryClient(grpc::testing::EchoTestService::Stub* stub) {
+       cli_ctx_.AddMetadata("key1", "val1");
+       cli_ctx_.AddMetadata("key2", "val2");
+       request_.mutable_param()->set_echo_metadata_initially(true);
+       request_.set_message("Hello metadata");
+-      stub->experimental_async()->Echo(&cli_ctx_, &request_, &response_, this);
++      stub->async()->Echo(&cli_ctx_, &request_, &response_, this);
+       StartCall();
+     }
+     void OnReadInitialMetadataDone(bool ok) override {
+@@ -853,7 +850,7 @@ TEST_P(ClientCallbackEnd2endTest, GenericUnaryReactor) {
+   constexpr char kSuffixForStats[] = "TestSuffixForStats";
+   ResetStub(
+       absl::make_unique<TestInterceptorFactory>(kMethodName, kSuffixForStats));
+-  class UnaryClient : public grpc::experimental::ClientUnaryReactor {
++  class UnaryClient : public grpc::ClientUnaryReactor {
+    public:
+     UnaryClient(grpc::GenericStub* stub, const std::string& method_name,
+                 const char* suffix_for_stats) {
+@@ -864,8 +861,8 @@ TEST_P(ClientCallbackEnd2endTest, GenericUnaryReactor) {
+       send_buf_ = SerializeToByteBuffer(&request_);
+ 
+       StubOptions options(suffix_for_stats);
+-      stub->experimental().PrepareUnaryCall(&cli_ctx_, method_name, options,
+-                                            send_buf_.get(), &recv_buf_, this);
++      stub->PrepareUnaryCall(&cli_ctx_, method_name, options, send_buf_.get(),
++                             &recv_buf_, this);
+       StartCall();
+     }
+     void OnReadInitialMetadataDone(bool ok) override {
+@@ -917,7 +914,7 @@ TEST_P(ClientCallbackEnd2endTest, GenericUnaryReactor) {
+   }
+ }
+ 
+-class ReadClient : public grpc::experimental::ClientReadReactor<EchoResponse> {
++class ReadClient : public grpc::ClientReadReactor<EchoResponse> {
+  public:
+   ReadClient(grpc::testing::EchoTestService::Stub* stub,
+              ServerTryCancelRequestPhase server_try_cancel,
+@@ -929,7 +926,7 @@ class ReadClient : public grpc::experimental::ClientReadReactor<EchoResponse> {
+                            std::to_string(server_try_cancel));
+     }
+     request_.set_message("Hello client ");
+-    stub->experimental_async()->ResponseStream(&context_, &request_, this);
++    stub->async()->ResponseStream(&context_, &request_, this);
+     if (client_cancel_.cancel &&
+         reads_complete_ == client_cancel_.ops_before_cancel) {
+       context_.TryCancel();
+@@ -1069,8 +1066,7 @@ TEST_P(ClientCallbackEnd2endTest, ResponseStreamServerCancelAfter) {
+   }
+ }
+ 
+-class BidiClient
+-    : public grpc::experimental::ClientBidiReactor<EchoRequest, EchoResponse> {
++class BidiClient : public grpc::ClientBidiReactor<EchoRequest, EchoResponse> {
+  public:
+   BidiClient(grpc::testing::EchoTestService::Stub* stub,
+              ServerTryCancelRequestPhase server_try_cancel,
+@@ -1086,7 +1082,7 @@ class BidiClient
+     }
+     request_.set_message("Hello fren ");
+     context_.set_initial_metadata_corked(cork_metadata);
+-    stub->experimental_async()->BidiStream(&context_, this);
++    stub->async()->BidiStream(&context_, this);
+     MaybeAsyncWrite(first_write_async);
+     StartRead(&response_);
+     StartCall();
+@@ -1325,12 +1321,11 @@ TEST_P(ClientCallbackEnd2endTest, BidiStreamServerCancelAfter) {
+ 
+ TEST_P(ClientCallbackEnd2endTest, SimultaneousReadAndWritesDone) {
+   ResetStub();
+-  class Client : public grpc::experimental::ClientBidiReactor<EchoRequest,
+-                                                              EchoResponse> {
++  class Client : public grpc::ClientBidiReactor<EchoRequest, EchoResponse> {
+    public:
+     explicit Client(grpc::testing::EchoTestService::Stub* stub) {
+       request_.set_message("Hello bidi ");
+-      stub->experimental_async()->BidiStream(&context_, this);
++      stub->async()->BidiStream(&context_, this);
+       StartWrite(&request_);
+       StartCall();
+     }
+@@ -1388,7 +1383,7 @@ TEST_P(ClientCallbackEnd2endTest, UnimplementedRpc) {
+   std::mutex mu;
+   std::condition_variable cv;
+   bool done = false;
+-  stub->experimental_async()->Unimplemented(
++  stub->async()->Unimplemented(
+       &cli_ctx, &request, &response, [&done, &mu, &cv](Status s) {
+         EXPECT_EQ(StatusCode::UNIMPLEMENTED, s.error_code());
+         EXPECT_EQ("", s.error_message());
+@@ -1448,12 +1443,12 @@ TEST_P(ClientCallbackEnd2endTest,
+        ResponseStreamExtraReactionFlowReadsUntilDone) {
+   ResetStub();
+   class ReadAllIncomingDataClient
+-      : public grpc::experimental::ClientReadReactor<EchoResponse> {
++      : public grpc::ClientReadReactor<EchoResponse> {
+    public:
+     explicit ReadAllIncomingDataClient(
+         grpc::testing::EchoTestService::Stub* stub) {
+       request_.set_message("Hello client ");
+-      stub->experimental_async()->ResponseStream(&context_, &request_, this);
++      stub->async()->ResponseStream(&context_, &request_, this);
+     }
+     bool WaitForReadDone() {
+       std::unique_lock<std::mutex> l(mu_);
+diff --git a/test/cpp/end2end/client_interceptors_end2end_test.cc b/test/cpp/end2end/client_interceptors_end2end_test.cc
+index 79b272cbe6..8035134ab2 100644
+--- a/test/cpp/end2end/client_interceptors_end2end_test.cc
++++ b/test/cpp/end2end/client_interceptors_end2end_test.cc
+@@ -213,12 +213,11 @@ class HijackingInterceptorMakesAnotherCall : public experimental::Interceptor {
+           methods->GetInterceptedChannel());
+       ctx_.AddMetadata(metadata_map_.begin()->first,
+                        metadata_map_.begin()->second);
+-      stub_->experimental_async()->Echo(&ctx_, &req_, &resp_,
+-                                        [this, methods](Status s) {
+-                                          EXPECT_EQ(s.ok(), true);
+-                                          EXPECT_EQ(resp_.message(), "Hello");
+-                                          methods->Hijack();
+-                                        });
++      stub_->async()->Echo(&ctx_, &req_, &resp_, [this, methods](Status s) {
++        EXPECT_EQ(s.ok(), true);
++        EXPECT_EQ(resp_.message(), "Hello");
++        methods->Hijack();
++      });
+       // This is a Unary RPC and we have got nothing interesting to do in the
+       // PRE_SEND_CLOSE interception hook point for this interceptor, so let's
+       // return here. (We do not want to call methods->Proceed(). When the new
+diff --git a/test/cpp/end2end/context_allocator_end2end_test.cc b/test/cpp/end2end/context_allocator_end2end_test.cc
+index 21979277c4..a2e202da11 100644
+--- a/test/cpp/end2end/context_allocator_end2end_test.cc
++++ b/test/cpp/end2end/context_allocator_end2end_test.cc
+@@ -49,10 +49,6 @@ namespace {
+ 
+ enum class Protocol { INPROC, TCP };
+ 
+-#ifndef GRPC_CALLBACK_API_NONEXPERIMENTAL
+-using experimental::GenericCallbackServerContext;
+-#endif
+-
+ class TestScenario {
+  public:
+   TestScenario(Protocol protocol, const std::string& creds_type)
+@@ -96,7 +92,7 @@ class ContextAllocatorEnd2endTestBase
+       server_address_ << "localhost:" << picked_port_;
+       builder.AddListeningPort(server_address_.str(), server_creds);
+     }
+-    builder.experimental().SetContextAllocator(std::move(context_allocator));
++    builder.SetContextAllocator(std::move(context_allocator));
+     builder.RegisterService(&callback_service_);
+ 
+     server_ = builder.BuildAndStart();
+@@ -149,7 +145,7 @@ class ContextAllocatorEnd2endTestBase
+       std::mutex mu;
+       std::condition_variable cv;
+       bool done = false;
+-      stub_->experimental_async()->Echo(
++      stub_->async()->Echo(
+           &cli_ctx, &request, &response,
+           [&request, &response, &done, &mu, &cv, val](Status s) {
+             GPR_ASSERT(s.ok());
+diff --git a/test/cpp/end2end/hybrid_end2end_test.cc b/test/cpp/end2end/hybrid_end2end_test.cc
+index 76e1f83059..c399930399 100644
+--- a/test/cpp/end2end/hybrid_end2end_test.cc
++++ b/test/cpp/end2end/hybrid_end2end_test.cc
+@@ -43,12 +43,6 @@ namespace grpc {
+ namespace testing {
+ namespace {
+ 
+-#ifndef GRPC_CALLBACK_API_NONEXPERIMENTAL
+-using ::grpc::experimental::CallbackGenericService;
+-using ::grpc::experimental::GenericCallbackServerContext;
+-using ::grpc::experimental::ServerGenericBidiReactor;
+-#endif
+-
+ void* tag(int i) { return reinterpret_cast<void*>(i); }
+ 
+ bool VerifyReturnSuccess(CompletionQueue* cq, int i) {
+@@ -273,12 +267,7 @@ class HybridEnd2endTest : public ::testing::TestWithParam<bool> {
+       builder.RegisterAsyncGenericService(generic_service);
+     }
+     if (callback_generic_service) {
+-#ifdef GRPC_CALLBACK_API_NONEXPERIMENTAL
+       builder.RegisterCallbackGenericService(callback_generic_service);
+-#else
+-      builder.experimental().RegisterCallbackGenericService(
+-          callback_generic_service);
+-#endif
+     }
+ 
+     if (max_message_size != 0) {
+diff --git a/test/cpp/end2end/interceptors_util.cc b/test/cpp/end2end/interceptors_util.cc
+index b90c8dcde7..55684a499c 100644
+--- a/test/cpp/end2end/interceptors_util.cc
++++ b/test/cpp/end2end/interceptors_util.cc
+@@ -165,14 +165,13 @@ void MakeCallbackCall(const std::shared_ptr<Channel>& channel) {
+   ctx.AddMetadata("testkey", "testvalue");
+   req.set_message("Hello");
+   EchoResponse resp;
+-  stub->experimental_async()->Echo(&ctx, &req, &resp,
+-                                   [&resp, &mu, &done, &cv](Status s) {
+-                                     EXPECT_EQ(s.ok(), true);
+-                                     EXPECT_EQ(resp.message(), "Hello");
+-                                     std::lock_guard<std::mutex> l(mu);
+-                                     done = true;
+-                                     cv.notify_one();
+-                                   });
++  stub->async()->Echo(&ctx, &req, &resp, [&resp, &mu, &done, &cv](Status s) {
++    EXPECT_EQ(s.ok(), true);
++    EXPECT_EQ(resp.message(), "Hello");
++    std::lock_guard<std::mutex> l(mu);
++    done = true;
++    cv.notify_one();
++  });
+   std::unique_lock<std::mutex> l(mu);
+   while (!done) {
+     cv.wait(l);
+diff --git a/test/cpp/end2end/message_allocator_end2end_test.cc b/test/cpp/end2end/message_allocator_end2end_test.cc
+index ee632c0c14..7924715af1 100644
+--- a/test/cpp/end2end/message_allocator_end2end_test.cc
++++ b/test/cpp/end2end/message_allocator_end2end_test.cc
+@@ -49,21 +49,20 @@ namespace grpc {
+ namespace testing {
+ namespace {
+ 
+-class CallbackTestServiceImpl
+-    : public EchoTestService::ExperimentalCallbackService {
++class CallbackTestServiceImpl : public EchoTestService::CallbackService {
+  public:
+   explicit CallbackTestServiceImpl() {}
+ 
+   void SetAllocatorMutator(
+-      std::function<void(experimental::RpcAllocatorState* allocator_state,
++      std::function<void(RpcAllocatorState* allocator_state,
+                          const EchoRequest* req, EchoResponse* resp)>
+           mutator) {
+     allocator_mutator_ = std::move(mutator);
+   }
+ 
+-  experimental::ServerUnaryReactor* Echo(
+-      experimental::CallbackServerContext* context, const EchoRequest* request,
+-      EchoResponse* response) override {
++  ServerUnaryReactor* Echo(CallbackServerContext* context,
++                           const EchoRequest* request,
++                           EchoResponse* response) override {
+     response->set_message(request->message());
+     if (allocator_mutator_) {
+       allocator_mutator_(context->GetRpcAllocatorState(), request, response);
+@@ -74,8 +73,8 @@ class CallbackTestServiceImpl
+   }
+ 
+  private:
+-  std::function<void(experimental::RpcAllocatorState* allocator_state,
+-                     const EchoRequest* req, EchoResponse* resp)>
++  std::function<void(RpcAllocatorState* allocator_state, const EchoRequest* req,
++                     EchoResponse* resp)>
+       allocator_mutator_;
+ };
+ 
+@@ -110,8 +109,7 @@ class MessageAllocatorEnd2endTestBase
+ 
+   ~MessageAllocatorEnd2endTestBase() override = default;
+ 
+-  void CreateServer(
+-      experimental::MessageAllocator<EchoRequest, EchoResponse>* allocator) {
++  void CreateServer(MessageAllocator<EchoRequest, EchoResponse>* allocator) {
+     ServerBuilder builder;
+ 
+     auto server_creds = GetCredentialsProvider()->GetServerCredentials(
+@@ -174,7 +172,7 @@ class MessageAllocatorEnd2endTestBase
+       std::mutex mu;
+       std::condition_variable cv;
+       bool done = false;
+-      stub_->experimental_async()->Echo(
++      stub_->async()->Echo(
+           &cli_ctx, &request, &response,
+           [&request, &response, &done, &mu, &cv, val](Status s) {
+             GPR_ASSERT(s.ok());
+@@ -209,11 +207,9 @@ TEST_P(NullAllocatorTest, SimpleRpc) {
+ 
+ class SimpleAllocatorTest : public MessageAllocatorEnd2endTestBase {
+  public:
+-  class SimpleAllocator
+-      : public experimental::MessageAllocator<EchoRequest, EchoResponse> {
++  class SimpleAllocator : public MessageAllocator<EchoRequest, EchoResponse> {
+    public:
+-    class MessageHolderImpl
+-        : public experimental::MessageHolder<EchoRequest, EchoResponse> {
++    class MessageHolderImpl : public MessageHolder<EchoRequest, EchoResponse> {
+      public:
+       MessageHolderImpl(std::atomic_int* request_deallocation_count,
+                         std::atomic_int* messages_deallocation_count)
+@@ -244,8 +240,7 @@ class SimpleAllocatorTest : public MessageAllocatorEnd2endTestBase {
+       std::atomic_int* const request_deallocation_count_;
+       std::atomic_int* const messages_deallocation_count_;
+     };
+-    experimental::MessageHolder<EchoRequest, EchoResponse>* AllocateMessages()
+-        override {
++    MessageHolder<EchoRequest, EchoResponse>* AllocateMessages() override {
+       allocation_count++;
+       return new MessageHolderImpl(&request_deallocation_count,
+                                    &messages_deallocation_count);
+@@ -273,8 +268,8 @@ TEST_P(SimpleAllocatorTest, SimpleRpc) {
+ TEST_P(SimpleAllocatorTest, RpcWithEarlyFreeRequest) {
+   const int kRpcCount = 10;
+   std::unique_ptr<SimpleAllocator> allocator(new SimpleAllocator);
+-  auto mutator = [](experimental::RpcAllocatorState* allocator_state,
+-                    const EchoRequest* req, EchoResponse* resp) {
++  auto mutator = [](RpcAllocatorState* allocator_state, const EchoRequest* req,
++                    EchoResponse* resp) {
+     auto* info =
+         static_cast<SimpleAllocator::MessageHolderImpl*>(allocator_state);
+     EXPECT_EQ(req, info->request());
+@@ -298,9 +293,9 @@ TEST_P(SimpleAllocatorTest, RpcWithReleaseRequest) {
+   const int kRpcCount = 10;
+   std::unique_ptr<SimpleAllocator> allocator(new SimpleAllocator);
+   std::vector<EchoRequest*> released_requests;
+-  auto mutator = [&released_requests](
+-                     experimental::RpcAllocatorState* allocator_state,
+-                     const EchoRequest* req, EchoResponse* resp) {
++  auto mutator = [&released_requests](RpcAllocatorState* allocator_state,
++                                      const EchoRequest* req,
++                                      EchoResponse* resp) {
+     auto* info =
+         static_cast<SimpleAllocator::MessageHolderImpl*>(allocator_state);
+     EXPECT_EQ(req, info->request());
+@@ -326,11 +321,9 @@ TEST_P(SimpleAllocatorTest, RpcWithReleaseRequest) {
+ 
+ class ArenaAllocatorTest : public MessageAllocatorEnd2endTestBase {
+  public:
+-  class ArenaAllocator
+-      : public experimental::MessageAllocator<EchoRequest, EchoResponse> {
++  class ArenaAllocator : public MessageAllocator<EchoRequest, EchoResponse> {
+    public:
+-    class MessageHolderImpl
+-        : public experimental::MessageHolder<EchoRequest, EchoResponse> {
++    class MessageHolderImpl : public MessageHolder<EchoRequest, EchoResponse> {
+      public:
+       MessageHolderImpl() {
+         set_request(
+@@ -344,8 +337,7 @@ class ArenaAllocatorTest : public MessageAllocatorEnd2endTestBase {
+      private:
+       google::protobuf::Arena arena_;
+     };
+-    experimental::MessageHolder<EchoRequest, EchoResponse>* AllocateMessages()
+-        override {
++    MessageHolder<EchoRequest, EchoResponse>* AllocateMessages() override {
+       allocation_count++;
+       return new MessageHolderImpl;
+     }
+diff --git a/test/cpp/end2end/mock_test.cc b/test/cpp/end2end/mock_test.cc
+index 1e83ad5053..82b955d3c4 100644
+--- a/test/cpp/end2end/mock_test.cc
++++ b/test/cpp/end2end/mock_test.cc
+@@ -160,12 +160,11 @@ class FakeClient {
+   EchoTestService::StubInterface* stub_;
+ };
+ 
+-class CallbackTestServiceImpl
+-    : public EchoTestService::ExperimentalCallbackService {
++class CallbackTestServiceImpl : public EchoTestService::CallbackService {
+  public:
+-  experimental::ServerUnaryReactor* Echo(
+-      experimental::CallbackServerContext* context, const EchoRequest* request,
+-      EchoResponse* response) override {
++  ServerUnaryReactor* Echo(CallbackServerContext* context,
++                           const EchoRequest* request,
++                           EchoResponse* response) override {
+     // Make the mock service explicitly treat empty input messages as invalid
+     // arguments so that we can test various results of status. In general, a
+     // mocked service should just use the original service methods, but we are
+@@ -189,7 +188,7 @@ class MockCallbackTest : public ::testing::Test {
+ };
+ 
+ TEST_F(MockCallbackTest, MockedCallSucceedsWithWait) {
+-  experimental::CallbackServerContext ctx;
++  CallbackServerContext ctx;
+   EchoRequest req;
+   EchoResponse resp;
+   grpc::internal::Mutex mu;
+@@ -218,7 +217,7 @@ TEST_F(MockCallbackTest, MockedCallSucceedsWithWait) {
+ }
+ 
+ TEST_F(MockCallbackTest, MockedCallSucceeds) {
+-  experimental::CallbackServerContext ctx;
++  CallbackServerContext ctx;
+   EchoRequest req;
+   EchoResponse resp;
+   DefaultReactorTestPeer peer(&ctx);
+@@ -231,7 +230,7 @@ TEST_F(MockCallbackTest, MockedCallSucceeds) {
+ }
+ 
+ TEST_F(MockCallbackTest, MockedCallFails) {
+-  experimental::CallbackServerContext ctx;
++  CallbackServerContext ctx;
+   EchoRequest req;
+   EchoResponse resp;
+   DefaultReactorTestPeer peer(&ctx);
+diff --git a/test/cpp/end2end/test_service_impl.cc b/test/cpp/end2end/test_service_impl.cc
+index 945c25d18d..d8d85fb450 100644
+--- a/test/cpp/end2end/test_service_impl.cc
++++ b/test/cpp/end2end/test_service_impl.cc
+@@ -38,8 +38,8 @@ namespace internal {
+ 
+ // When echo_deadline is requested, deadline seen in the ServerContext is set in
+ // the response in seconds.
+-void MaybeEchoDeadline(experimental::ServerContextBase* context,
+-                       const EchoRequest* request, EchoResponse* response) {
++void MaybeEchoDeadline(ServerContextBase* context, const EchoRequest* request,
++                       EchoResponse* response) {
+   if (request->has_param() && request->param().echo_deadline()) {
+     gpr_timespec deadline = gpr_inf_future(GPR_CLOCK_REALTIME);
+     if (context->deadline() != system_clock::time_point::max()) {
+@@ -49,7 +49,7 @@ void MaybeEchoDeadline(experimental::ServerContextBase* context,
+   }
+ }
+ 
+-void CheckServerAuthContext(const experimental::ServerContextBase* context,
++void CheckServerAuthContext(const ServerContextBase* context,
+                             const std::string& expected_transport_security_type,
+                             const std::string& expected_client_identity) {
+   std::shared_ptr<const AuthContext> auth_ctx = context->auth_context();
+@@ -115,7 +115,7 @@ void ServerTryCancel(ServerContext* context) {
+   }
+ }
+ 
+-void ServerTryCancelNonblocking(experimental::CallbackServerContext* context) {
++void ServerTryCancelNonblocking(CallbackServerContext* context) {
+   EXPECT_FALSE(context->IsCancelled());
+   context->TryCancel();
+   gpr_log(GPR_INFO,
+@@ -124,13 +124,12 @@ void ServerTryCancelNonblocking(experimental::CallbackServerContext* context) {
+ 
+ }  // namespace internal
+ 
+-experimental::ServerUnaryReactor* CallbackTestServiceImpl::Echo(
+-    experimental::CallbackServerContext* context, const EchoRequest* request,
++ServerUnaryReactor* CallbackTestServiceImpl::Echo(
++    CallbackServerContext* context, const EchoRequest* request,
+     EchoResponse* response) {
+-  class Reactor : public ::grpc::experimental::ServerUnaryReactor {
++  class Reactor : public ::grpc::ServerUnaryReactor {
+    public:
+-    Reactor(CallbackTestServiceImpl* service,
+-            experimental::CallbackServerContext* ctx,
++    Reactor(CallbackTestServiceImpl* service, CallbackServerContext* ctx,
+             const EchoRequest* request, EchoResponse* response)
+         : service_(service), ctx_(ctx), req_(request), resp_(response) {
+       // It should be safe to call IsCancelled here, even though we don't know
+@@ -159,7 +158,7 @@ experimental::ServerUnaryReactor* CallbackTestServiceImpl::Echo(
+     void StartRpc() {
+       if (req_->has_param() && req_->param().server_sleep_us() > 0) {
+         // Set an alarm for that much time
+-        alarm_.experimental().Set(
++        alarm_.Set(
+             gpr_time_add(gpr_now(GPR_CLOCK_MONOTONIC),
+                          gpr_time_from_micros(req_->param().server_sleep_us(),
+                                               GPR_TIMESPAN)),
+@@ -241,12 +240,11 @@ experimental::ServerUnaryReactor* CallbackTestServiceImpl::Echo(
+         FinishWhenCancelledAsync();
+         return;
+       } else if (req_->has_param() && req_->param().server_cancel_after_us()) {
+-        alarm_.experimental().Set(
+-            gpr_time_add(
+-                gpr_now(GPR_CLOCK_REALTIME),
+-                gpr_time_from_micros(req_->param().server_cancel_after_us(),
+-                                     GPR_TIMESPAN)),
+-            [this](bool) { Finish(Status::CANCELLED); });
++        alarm_.Set(gpr_time_add(gpr_now(GPR_CLOCK_REALTIME),
++                                gpr_time_from_micros(
++                                    req_->param().server_cancel_after_us(),
++                                    GPR_TIMESPAN)),
++                   [this](bool) { Finish(Status::CANCELLED); });
+         return;
+       } else if (!req_->has_param() || !req_->param().skip_cancelled_check()) {
+         EXPECT_FALSE(ctx_->IsCancelled());
+@@ -305,7 +303,7 @@ experimental::ServerUnaryReactor* CallbackTestServiceImpl::Echo(
+     }
+ 
+     CallbackTestServiceImpl* const service_;
+-    experimental::CallbackServerContext* const ctx_;
++    CallbackServerContext* const ctx_;
+     const EchoRequest* const req_;
+     EchoResponse* const resp_;
+     Alarm alarm_;
+@@ -322,13 +320,11 @@ experimental::ServerUnaryReactor* CallbackTestServiceImpl::Echo(
+   return new Reactor(this, context, request, response);
+ }
+ 
+-experimental::ServerUnaryReactor*
+-CallbackTestServiceImpl::CheckClientInitialMetadata(
+-    experimental::CallbackServerContext* context, const SimpleRequest*,
+-    SimpleResponse*) {
+-  class Reactor : public ::grpc::experimental::ServerUnaryReactor {
++ServerUnaryReactor* CallbackTestServiceImpl::CheckClientInitialMetadata(
++    CallbackServerContext* context, const SimpleRequest*, SimpleResponse*) {
++  class Reactor : public ::grpc::ServerUnaryReactor {
+    public:
+-    explicit Reactor(experimental::CallbackServerContext* ctx) {
++    explicit Reactor(CallbackServerContext* ctx) {
+       EXPECT_EQ(internal::MetadataMatchCount(ctx->client_metadata(),
+                                              kCheckClientInitialMetadataKey,
+                                              kCheckClientInitialMetadataVal),
+@@ -343,9 +339,8 @@ CallbackTestServiceImpl::CheckClientInitialMetadata(
+   return new Reactor(context);
+ }
+ 
+-experimental::ServerReadReactor<EchoRequest>*
+-CallbackTestServiceImpl::RequestStream(
+-    experimental::CallbackServerContext* context, EchoResponse* response) {
++ServerReadReactor<EchoRequest>* CallbackTestServiceImpl::RequestStream(
++    CallbackServerContext* context, EchoResponse* response) {
+   // If 'server_try_cancel' is set in the metadata, the RPC is cancelled by
+   // the server by calling ServerContext::TryCancel() depending on the
+   // value:
+@@ -362,9 +357,9 @@ CallbackTestServiceImpl::RequestStream(
+     return nullptr;
+   }
+ 
+-  class Reactor : public ::grpc::experimental::ServerReadReactor<EchoRequest> {
++  class Reactor : public ::grpc::ServerReadReactor<EchoRequest> {
+    public:
+-    Reactor(experimental::CallbackServerContext* ctx, EchoResponse* response,
++    Reactor(CallbackServerContext* ctx, EchoResponse* response,
+             int server_try_cancel)
+         : ctx_(ctx),
+           response_(response),
+@@ -414,7 +409,7 @@ CallbackTestServiceImpl::RequestStream(
+       }
+     }
+ 
+-    experimental::CallbackServerContext* const ctx_;
++    CallbackServerContext* const ctx_;
+     EchoResponse* const response_;
+     EchoRequest request_;
+     int num_msgs_read_{0};
+@@ -429,9 +424,8 @@ CallbackTestServiceImpl::RequestStream(
+ 
+ // Return 'kNumResponseStreamMsgs' messages.
+ // TODO(yangg) make it generic by adding a parameter into EchoRequest
+-experimental::ServerWriteReactor<EchoResponse>*
+-CallbackTestServiceImpl::ResponseStream(
+-    experimental::CallbackServerContext* context, const EchoRequest* request) {
++ServerWriteReactor<EchoResponse>* CallbackTestServiceImpl::ResponseStream(
++    CallbackServerContext* context, const EchoRequest* request) {
+   // If 'server_try_cancel' is set in the metadata, the RPC is cancelled by
+   // the server by calling ServerContext::TryCancel() depending on the
+   // value:
+@@ -446,11 +440,10 @@ CallbackTestServiceImpl::ResponseStream(
+     internal::ServerTryCancelNonblocking(context);
+   }
+ 
+-  class Reactor
+-      : public ::grpc::experimental::ServerWriteReactor<EchoResponse> {
++  class Reactor : public ::grpc::ServerWriteReactor<EchoResponse> {
+    public:
+-    Reactor(experimental::CallbackServerContext* ctx,
+-            const EchoRequest* request, int server_try_cancel)
++    Reactor(CallbackServerContext* ctx, const EchoRequest* request,
++            int server_try_cancel)
+         : ctx_(ctx), request_(request), server_try_cancel_(server_try_cancel) {
+       server_coalescing_api_ = internal::GetIntValueFromMetadata(
+           kServerUseCoalescingApi, ctx->client_metadata(), 0);
+@@ -518,7 +511,7 @@ CallbackTestServiceImpl::ResponseStream(
+         }
+       }
+     }
+-    experimental::CallbackServerContext* const ctx_;
++    CallbackServerContext* const ctx_;
+     const EchoRequest* const request_;
+     EchoResponse response_;
+     int num_msgs_sent_{0};
+@@ -532,13 +525,11 @@ CallbackTestServiceImpl::ResponseStream(
+   return new Reactor(context, request, server_try_cancel);
+ }
+ 
+-experimental::ServerBidiReactor<EchoRequest, EchoResponse>*
+-CallbackTestServiceImpl::BidiStream(
+-    experimental::CallbackServerContext* context) {
+-  class Reactor : public ::grpc::experimental::ServerBidiReactor<EchoRequest,
+-                                                                 EchoResponse> {
++ServerBidiReactor<EchoRequest, EchoResponse>*
++CallbackTestServiceImpl::BidiStream(CallbackServerContext* context) {
++  class Reactor : public ::grpc::ServerBidiReactor<EchoRequest, EchoResponse> {
+    public:
+-    explicit Reactor(experimental::CallbackServerContext* ctx) : ctx_(ctx) {
++    explicit Reactor(CallbackServerContext* ctx) : ctx_(ctx) {
+       // If 'server_try_cancel' is set in the metadata, the RPC is cancelled by
+       // the server by calling ServerContext::TryCancel() depending on the
+       // value:
+@@ -623,7 +614,7 @@ CallbackTestServiceImpl::BidiStream(
+       }
+     }
+ 
+-    experimental::CallbackServerContext* const ctx_;
++    CallbackServerContext* const ctx_;
+     EchoRequest request_;
+     EchoResponse response_;
+     int num_msgs_read_{0};
+diff --git a/test/cpp/end2end/test_service_impl.h b/test/cpp/end2end/test_service_impl.h
+index 033738c5d5..682ef31c4c 100644
+--- a/test/cpp/end2end/test_service_impl.h
++++ b/test/cpp/end2end/test_service_impl.h
+@@ -59,10 +59,10 @@ typedef enum {
+ namespace internal {
+ // When echo_deadline is requested, deadline seen in the ServerContext is set in
+ // the response in seconds.
+-void MaybeEchoDeadline(experimental::ServerContextBase* context,
+-                       const EchoRequest* request, EchoResponse* response);
++void MaybeEchoDeadline(ServerContextBase* context, const EchoRequest* request,
++                       EchoResponse* response);
+ 
+-void CheckServerAuthContext(const experimental::ServerContextBase* context,
++void CheckServerAuthContext(const ServerContextBase* context,
+                             const std::string& expected_transport_security_type,
+                             const std::string& expected_client_identity);
+ 
+@@ -443,30 +443,28 @@ class TestMultipleServiceImpl : public RpcService {
+ };
+ 
+ class CallbackTestServiceImpl
+-    : public ::grpc::testing::EchoTestService::ExperimentalCallbackService {
++    : public ::grpc::testing::EchoTestService::CallbackService {
+  public:
+   CallbackTestServiceImpl() : signal_client_(false), host_() {}
+   explicit CallbackTestServiceImpl(const std::string& host)
+       : signal_client_(false), host_(new std::string(host)) {}
+ 
+-  experimental::ServerUnaryReactor* Echo(
+-      experimental::CallbackServerContext* context, const EchoRequest* request,
+-      EchoResponse* response) override;
++  ServerUnaryReactor* Echo(CallbackServerContext* context,
++                           const EchoRequest* request,
++                           EchoResponse* response) override;
+ 
+-  experimental::ServerUnaryReactor* CheckClientInitialMetadata(
+-      experimental::CallbackServerContext* context, const SimpleRequest*,
+-      SimpleResponse*) override;
++  ServerUnaryReactor* CheckClientInitialMetadata(CallbackServerContext* context,
++                                                 const SimpleRequest*,
++                                                 SimpleResponse*) override;
+ 
+-  experimental::ServerReadReactor<EchoRequest>* RequestStream(
+-      experimental::CallbackServerContext* context,
+-      EchoResponse* response) override;
++  ServerReadReactor<EchoRequest>* RequestStream(
++      CallbackServerContext* context, EchoResponse* response) override;
+ 
+-  experimental::ServerWriteReactor<EchoResponse>* ResponseStream(
+-      experimental::CallbackServerContext* context,
+-      const EchoRequest* request) override;
++  ServerWriteReactor<EchoResponse>* ResponseStream(
++      CallbackServerContext* context, const EchoRequest* request) override;
+ 
+-  experimental::ServerBidiReactor<EchoRequest, EchoResponse>* BidiStream(
+-      experimental::CallbackServerContext* context) override;
++  ServerBidiReactor<EchoRequest, EchoResponse>* BidiStream(
++      CallbackServerContext* context) override;
+ 
+   // Unimplemented is left unimplemented to test the returned error.
+   bool signal_client() {
+diff --git a/test/cpp/microbenchmarks/callback_streaming_ping_pong.h b/test/cpp/microbenchmarks/callback_streaming_ping_pong.h
+index 4807f53529..436286becc 100644
+--- a/test/cpp/microbenchmarks/callback_streaming_ping_pong.h
++++ b/test/cpp/microbenchmarks/callback_streaming_ping_pong.h
+@@ -34,8 +34,7 @@ namespace testing {
+  * BENCHMARKING KERNELS
+  */
+ 
+-class BidiClient
+-    : public grpc::experimental::ClientBidiReactor<EchoRequest, EchoResponse> {
++class BidiClient : public grpc::ClientBidiReactor<EchoRequest, EchoResponse> {
+  public:
+   BidiClient(benchmark::State* state, EchoTestService::Stub* stub,
+              ClientContext* cli_ctx, EchoRequest* request,
+@@ -84,7 +83,7 @@ class BidiClient
+     cli_ctx_->~ClientContext();
+     new (cli_ctx_) ClientContext();
+     cli_ctx_->AddMetadata(kServerMessageSize, std::to_string(msgs_size_));
+-    stub_->experimental_async()->BidiStream(cli_ctx_, this);
++    stub_->async()->BidiStream(cli_ctx_, this);
+     MaybeWrite();
+     StartCall();
+   }
+diff --git a/test/cpp/microbenchmarks/callback_test_service.cc b/test/cpp/microbenchmarks/callback_test_service.cc
+index 3d52bce51d..049e361cc4 100644
+--- a/test/cpp/microbenchmarks/callback_test_service.cc
++++ b/test/cpp/microbenchmarks/callback_test_service.cc
+@@ -46,9 +46,9 @@ int GetIntValueFromMetadata(
+ }
+ }  // namespace
+ 
+-experimental::ServerUnaryReactor* CallbackStreamingTestService::Echo(
+-    experimental::CallbackServerContext* context,
+-    const EchoRequest* /*request*/, EchoResponse* response) {
++ServerUnaryReactor* CallbackStreamingTestService::Echo(
++    CallbackServerContext* context, const EchoRequest* /*request*/,
++    EchoResponse* response) {
+   int response_msgs_size = GetIntValueFromMetadata(
+       kServerMessageSize, context->client_metadata(), 0);
+   if (response_msgs_size > 0) {
+@@ -61,13 +61,11 @@ experimental::ServerUnaryReactor* CallbackStreamingTestService::Echo(
+   return reactor;
+ }
+ 
+-experimental::ServerBidiReactor<EchoRequest, EchoResponse>*
+-CallbackStreamingTestService::BidiStream(
+-    experimental::CallbackServerContext* context) {
+-  class Reactor
+-      : public experimental::ServerBidiReactor<EchoRequest, EchoResponse> {
++ServerBidiReactor<EchoRequest, EchoResponse>*
++CallbackStreamingTestService::BidiStream(CallbackServerContext* context) {
++  class Reactor : public ServerBidiReactor<EchoRequest, EchoResponse> {
+    public:
+-    explicit Reactor(experimental::CallbackServerContext* context) {
++    explicit Reactor(CallbackServerContext* context) {
+       message_size_ = GetIntValueFromMetadata(kServerMessageSize,
+                                               context->client_metadata(), 0);
+       StartRead(&request_);
+diff --git a/test/cpp/microbenchmarks/callback_test_service.h b/test/cpp/microbenchmarks/callback_test_service.h
+index f793d4887c..010c8e8684 100644
+--- a/test/cpp/microbenchmarks/callback_test_service.h
++++ b/test/cpp/microbenchmarks/callback_test_service.h
+@@ -32,17 +32,16 @@ namespace testing {
+ 
+ const char* const kServerMessageSize = "server_message_size";
+ 
+-class CallbackStreamingTestService
+-    : public EchoTestService::ExperimentalCallbackService {
++class CallbackStreamingTestService : public EchoTestService::CallbackService {
+  public:
+   CallbackStreamingTestService() {}
+ 
+-  experimental::ServerUnaryReactor* Echo(
+-      experimental::CallbackServerContext* context, const EchoRequest* request,
+-      EchoResponse* response) override;
++  ServerUnaryReactor* Echo(CallbackServerContext* context,
++                           const EchoRequest* request,
++                           EchoResponse* response) override;
+ 
+-  experimental::ServerBidiReactor<EchoRequest, EchoResponse>* BidiStream(
+-      experimental::CallbackServerContext* context) override;
++  ServerBidiReactor<EchoRequest, EchoResponse>* BidiStream(
++      CallbackServerContext* context) override;
+ };
+ }  // namespace testing
+ }  // namespace grpc
+diff --git a/test/cpp/microbenchmarks/callback_unary_ping_pong.h b/test/cpp/microbenchmarks/callback_unary_ping_pong.h
+index 1caa4f489f..80e9310331 100644
+--- a/test/cpp/microbenchmarks/callback_unary_ping_pong.h
++++ b/test/cpp/microbenchmarks/callback_unary_ping_pong.h
+@@ -42,7 +42,7 @@ inline void SendCallbackUnaryPingPong(
+     std::mutex* mu, std::condition_variable* cv) {
+   int response_msgs_size = state->range(1);
+   cli_ctx->AddMetadata(kServerMessageSize, std::to_string(response_msgs_size));
+-  stub_->experimental_async()->Echo(
++  stub_->async()->Echo(
+       cli_ctx, request, response,
+       [state, cli_ctx, request, response, stub_, done, mu, cv](Status s) {
+         GPR_ASSERT(s.ok());
+diff --git a/test/cpp/qps/client_callback.cc b/test/cpp/qps/client_callback.cc
+index d0d3d4c30e..95e5a86b8c 100644
+--- a/test/cpp/qps/client_callback.cc
++++ b/test/cpp/qps/client_callback.cc
+@@ -176,10 +176,10 @@ class CallbackUnaryClient final : public CallbackClient {
+       if (ctx_[vector_idx]->alarm_ == nullptr) {
+         ctx_[vector_idx]->alarm_ = absl::make_unique<Alarm>();
+       }
+-      ctx_[vector_idx]->alarm_->experimental().Set(
+-          next_issue_time, [this, t, vector_idx](bool /*ok*/) {
+-            IssueUnaryCallbackRpc(t, vector_idx);
+-          });
++      ctx_[vector_idx]->alarm_->Set(next_issue_time,
++                                    [this, t, vector_idx](bool /*ok*/) {
++                                      IssueUnaryCallbackRpc(t, vector_idx);
++                                    });
+     } else {
+       IssueUnaryCallbackRpc(t, vector_idx);
+     }
+@@ -188,7 +188,7 @@ class CallbackUnaryClient final : public CallbackClient {
+   void IssueUnaryCallbackRpc(Thread* t, size_t vector_idx) {
+     GPR_TIMER_SCOPE("CallbackUnaryClient::ThreadFunc", 0);
+     double start = UsageTimer::Now();
+-    ctx_[vector_idx]->stub_->experimental_async()->UnaryCall(
++    ctx_[vector_idx]->stub_->async()->UnaryCall(
+         (&ctx_[vector_idx]->context_), &request_, &ctx_[vector_idx]->response_,
+         [this, t, start, vector_idx](grpc::Status s) {
+           // Update Histogram with data from the callback run
+@@ -251,8 +251,7 @@ class CallbackStreamingPingPongClient : public CallbackStreamingClient {
+ };
+ 
+ class CallbackStreamingPingPongReactor final
+-    : public grpc::experimental::ClientBidiReactor<SimpleRequest,
+-                                                   SimpleResponse> {
++    : public grpc::ClientBidiReactor<SimpleRequest, SimpleResponse> {
+  public:
+   CallbackStreamingPingPongReactor(
+       CallbackStreamingPingPongClient* client,
+@@ -260,7 +259,7 @@ class CallbackStreamingPingPongReactor final
+       : client_(client), ctx_(std::move(ctx)), messages_issued_(0) {}
+ 
+   void StartNewRpc() {
+-    ctx_->stub_->experimental_async()->StreamingCall(&(ctx_->context_), this);
++    ctx_->stub_->async()->StreamingCall(&(ctx_->context_), this);
+     write_time_ = UsageTimer::Now();
+     StartWrite(client_->request());
+     writes_done_started_.clear();
+@@ -296,7 +295,7 @@ class CallbackStreamingPingPongReactor final
+       gpr_timespec next_issue_time = client_->NextRPCIssueTime();
+       // Start an alarm callback to run the internal callback after
+       // next_issue_time
+-      ctx_->alarm_->experimental().Set(next_issue_time, [this](bool /*ok*/) {
++      ctx_->alarm_->Set(next_issue_time, [this](bool /*ok*/) {
+         write_time_ = UsageTimer::Now();
+         StartWrite(client_->request());
+       });
+@@ -323,8 +322,8 @@ class CallbackStreamingPingPongReactor final
+       if (ctx_->alarm_ == nullptr) {
+         ctx_->alarm_ = absl::make_unique<Alarm>();
+       }
+-      ctx_->alarm_->experimental().Set(next_issue_time,
+-                                       [this](bool /*ok*/) { StartNewRpc(); });
++      ctx_->alarm_->Set(next_issue_time,
++                        [this](bool /*ok*/) { StartNewRpc(); });
+     } else {
+       StartNewRpc();
+     }
+diff --git a/test/cpp/qps/server_callback.cc b/test/cpp/qps/server_callback.cc
+index a0a9531222..e05f736470 100644
+--- a/test/cpp/qps/server_callback.cc
++++ b/test/cpp/qps/server_callback.cc
+@@ -31,22 +31,22 @@ namespace grpc {
+ namespace testing {
+ 
+ class BenchmarkCallbackServiceImpl final
+-    : public BenchmarkService::ExperimentalCallbackService {
++    : public BenchmarkService::CallbackService {
+  public:
+-  ::grpc::experimental::ServerUnaryReactor* UnaryCall(
+-      ::grpc::experimental::CallbackServerContext* context,
+-      const SimpleRequest* request, SimpleResponse* response) override {
++  ::grpc::ServerUnaryReactor* UnaryCall(::grpc::CallbackServerContext* context,
++                                        const SimpleRequest* request,
++                                        SimpleResponse* response) override {
+     auto* reactor = context->DefaultReactor();
+     reactor->Finish(SetResponse(request, response));
+     return reactor;
+   }
+ 
+-  ::grpc::experimental::ServerBidiReactor<::grpc::testing::SimpleRequest,
+-                                          ::grpc::testing::SimpleResponse>*
+-  StreamingCall(::grpc::experimental::CallbackServerContext*) override {
++  ::grpc::ServerBidiReactor<::grpc::testing::SimpleRequest,
++                            ::grpc::testing::SimpleResponse>*
++  StreamingCall(::grpc::CallbackServerContext*) override {
+     class Reactor
+-        : public ::grpc::experimental::ServerBidiReactor<
+-              ::grpc::testing::SimpleRequest, ::grpc::testing::SimpleResponse> {
++        : public ::grpc::ServerBidiReactor<::grpc::testing::SimpleRequest,
++                                           ::grpc::testing::SimpleResponse> {
+      public:
+       Reactor() { StartRead(&request_); }
+ 

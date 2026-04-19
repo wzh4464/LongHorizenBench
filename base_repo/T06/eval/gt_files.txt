@@ -1,0 +1,14 @@
+core/config/project_settings.cpp
+core/config/project_settings.h
+editor/editor_file_system.cpp
+editor/editor_file_system.h
+editor/group_settings_editor.cpp
+editor/group_settings_editor.h
+editor/groups_editor.cpp
+editor/groups_editor.h
+editor/project_settings_editor.cpp
+editor/project_settings_editor.h
+scene/main/node.cpp
+scene/main/scene_tree.cpp
+scene/resources/packed_scene.cpp
+scene/resources/packed_scene.h

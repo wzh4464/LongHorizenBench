@@ -1,0 +1,3830 @@
+diff --git a/clang/docs/PointerAuthentication.rst b/clang/docs/PointerAuthentication.rst
+index 68674f318c84..41818d43ac68 100644
+--- a/clang/docs/PointerAuthentication.rst
++++ b/clang/docs/PointerAuthentication.rst
+@@ -280,6 +280,52 @@ a number of different tests.
+   normal interface.  This may be true even on targets where pointer
+   authentication is not enabled by default.
+ 
++__ptrauth Qualifier
++^^^^^^^^^^^^^^^^^^^
++
++``__ptrauth(key, address, discriminator)`` is an extended type
++qualifier which causes so-qualified objects to hold pointers signed using the
++specified schema rather than the default schema for such types.
++
++In the current implementation in Clang, the qualified type must be a C pointer
++type, either to a function or to an object.  It currently cannot be an
++Objective-C pointer type, a C++ reference type, or a block pointer type; these
++restrictions may be lifted in the future.
++
++The qualifier's operands are as follows:
++
++- ``key`` - an expression evaluating to a key value from ``<ptrauth.h>``; must
++  be a constant expression
++
++- ``address`` - whether to use address diversity (1) or not (0); must be
++  a constant expression with one of these two values
++
++- ``discriminator`` - a constant discriminator; must be a constant expression
++
++See `Discriminators`_ for more information about discriminators.
++
++Currently the operands must be constant-evaluable even within templates. In the
++future this restriction may be lifted to allow value-dependent expressions as
++long as they instantiate to a constant expression.
++
++Consistent with the ordinary C/C++ rule for parameters, top-level ``__ptrauth``
++qualifiers on a parameter (after parameter type adjustment) are ignored when
++deriving the type of the function.  The parameter will be passed using the
++default ABI for the unqualified pointer type.
++
++If ``x`` is an object of type ``__ptrauth(key, address, discriminator) T``,
++then the signing schema of the value stored in ``x`` is a key of ``key`` and
++a discriminator determined as follows:
++
++- if ``address`` is 0, then the discriminator is ``discriminator``;
++
++- if ``address`` is 1 and ``discriminator`` is 0, then the discriminator is
++  ``&x``; otherwise
++
++- if ``address`` is 1 and ``discriminator`` is non-zero, then the discriminator
++  is ``ptrauth_blend_discriminator(&x, discriminator)``; see
++  `ptrauth_blend_discriminator`_.
++
+ ``<ptrauth.h>``
+ ~~~~~~~~~~~~~~~
+ 
+diff --git a/clang/docs/ReleaseNotes.rst b/clang/docs/ReleaseNotes.rst
+index 6025e76029d1..38142ad32bea 100644
+--- a/clang/docs/ReleaseNotes.rst
++++ b/clang/docs/ReleaseNotes.rst
+@@ -552,6 +552,8 @@ Arm and AArch64 Support
+   ARM targets, however this will now disable NEON instructions being generated. The ``simd`` option is 
+   also now printed when the ``--print-supported-extensions`` option is used.
+ 
++-  Support for __ptrauth type qualifier has been added.
++
+ Android Support
+ ^^^^^^^^^^^^^^^
+ 
+diff --git a/clang/include/clang/AST/Type.h b/clang/include/clang/AST/Type.h
+index 74886ef0cd82..5bf036e3347e 100644
+--- a/clang/include/clang/AST/Type.h
++++ b/clang/include/clang/AST/Type.h
+@@ -312,6 +312,12 @@ public:
+     return Result;
+   }
+ 
++  std::string getAsString() const;
++  std::string getAsString(const PrintingPolicy &Policy) const;
++
++  bool isEmptyWhenPrinted(const PrintingPolicy &Policy) const;
++  void print(raw_ostream &OS, const PrintingPolicy &Policy) const;
++
+   void Profile(llvm::FoldingSetNodeID &ID) const { ID.AddInteger(Data); }
+ };
+ 
+@@ -562,7 +568,7 @@ public:
+ 
+   bool hasAddressSpace() const { return Mask & AddressSpaceMask; }
+   LangAS getAddressSpace() const {
+-    return static_cast<LangAS>(Mask >> AddressSpaceShift);
++    return static_cast<LangAS>((Mask & AddressSpaceMask) >> AddressSpaceShift);
+   }
+   bool hasTargetSpecificAddressSpace() const {
+     return isTargetAddressSpace(getAddressSpace());
+@@ -803,6 +809,9 @@ private:
+   static_assert(sizeof(PointerAuthQualifier) == sizeof(uint32_t),
+                 "PointerAuthQualifier must be 32 bits");
+ 
++  static constexpr uint64_t PtrAuthShift = 32;
++  static constexpr uint64_t PtrAuthMask = UINT64_C(0xffffffff) << PtrAuthShift;
++
+   static constexpr uint64_t UMask = 0x8;
+   static constexpr uint64_t UShift = 3;
+   static constexpr uint64_t GCAttrMask = 0x30;
+@@ -810,10 +819,8 @@ private:
+   static constexpr uint64_t LifetimeMask = 0x1C0;
+   static constexpr uint64_t LifetimeShift = 6;
+   static constexpr uint64_t AddressSpaceMask =
+-      ~(CVRMask | UMask | GCAttrMask | LifetimeMask);
++      ~(CVRMask | UMask | GCAttrMask | LifetimeMask | PtrAuthMask);
+   static constexpr uint64_t AddressSpaceShift = 9;
+-  static constexpr uint64_t PtrAuthShift = 32;
+-  static constexpr uint64_t PtrAuthMask = uint64_t(0xffffffff) << PtrAuthShift;
+ };
+ 
+ class QualifiersAndAtomic {
+@@ -1449,6 +1456,12 @@ public:
+     return getQualifiers().getPointerAuth();
+   }
+ 
++  bool hasAddressDiscriminatedPointerAuth() const {
++    if (PointerAuthQualifier PtrAuth = getPointerAuth())
++      return PtrAuth.isAddressDiscriminated();
++    return false;
++  }
++
+   enum PrimitiveDefaultInitializeKind {
+     /// The type does not fall into any of the following categories. Note that
+     /// this case is zero-valued so that values of this enum can be used as a
+diff --git a/clang/include/clang/Basic/Attr.td b/clang/include/clang/Basic/Attr.td
+index b7ad432738b2..9d4900f3029c 100644
+--- a/clang/include/clang/Basic/Attr.td
++++ b/clang/include/clang/Basic/Attr.td
+@@ -3548,6 +3548,14 @@ def ObjCRequiresPropertyDefs : InheritableAttr {
+   let SimpleHandler = 1;
+ }
+ 
++def PointerAuth : TypeAttr {
++  let Spellings = [CustomKeyword<"__ptrauth">];
++  let Args = [IntArgument<"Key">,
++              BoolArgument<"AddressDiscriminated", 1>,
++              IntArgument<"ExtraDiscriminator", 1>];
++  let Documentation = [PtrAuthDocs];
++}
++
+ def Unused : InheritableAttr {
+   let Spellings = [CXX11<"", "maybe_unused", 201603>, GCC<"unused">,
+                    C23<"", "maybe_unused", 202106>];
+diff --git a/clang/include/clang/Basic/AttrDocs.td b/clang/include/clang/Basic/AttrDocs.td
+index 97a5f24d35d7..76f805ef373d 100644
+--- a/clang/include/clang/Basic/AttrDocs.td
++++ b/clang/include/clang/Basic/AttrDocs.td
+@@ -2179,6 +2179,34 @@ Also see the documentation for `@available
+   }];
+ }
+ 
++def PtrAuthDocs : Documentation {
++  let Category = DocCatVariable;
++  let Heading = "__ptrauth";
++  let Content = [{
++The ``__ptrauth`` qualifier allows the programmer to directly control
++how pointers are signed when they are stored in a particular variable.
++This can be used to strengthen the default protections of pointer
++authentication and make it more difficult for an attacker to escalate
++an ability to alter memory into full control of a process.
++
++.. code-block:: c
++
++  #include <ptrauth.h>
++
++  typedef void (*my_callback)(const void*);
++  my_callback __ptrauth(ptrauth_key_process_dependent_code, 1, 0xe27a) callback;
++
++The first argument to ``__ptrauth`` is the name of the signing key.
++Valid key names for the target are defined in ``<ptrauth.h>``.
++
++The second argument to ``__ptrauth`` is a flag (0 or 1) specifying whether
++the object should use address discrimination.
++
++The third argument to ``__ptrauth`` is a 16-bit non-negative integer which
++allows additional discrimination between objects.
++  }];
++}
++
+ def ExternalSourceSymbolDocs : Documentation {
+   let Category = DocCatDecl;
+   let Content = [{
+diff --git a/clang/include/clang/Basic/DiagnosticParseKinds.td b/clang/include/clang/Basic/DiagnosticParseKinds.td
+index 7a3cac528a36..9975520f4f9f 100644
+--- a/clang/include/clang/Basic/DiagnosticParseKinds.td
++++ b/clang/include/clang/Basic/DiagnosticParseKinds.td
+@@ -1721,6 +1721,9 @@ def warn_pragma_unroll_cuda_value_in_parens : Warning<
+   "argument to '#pragma unroll' should not be in parentheses in CUDA C/C++">,
+   InGroup<CudaCompat>;
+ 
++def err_ptrauth_qualifier_bad_arg_count : Error<
++  "'__ptrauth' qualifier must take between 1 and 3 arguments">;
++
+ def warn_cuda_attr_lambda_position : Warning<
+   "nvcc does not allow '__%0__' to appear after the parameter list in lambdas">,
+   InGroup<CudaCompat>;
+diff --git a/clang/include/clang/Basic/DiagnosticSemaKinds.td b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+index f4ab620ae61d..3f7499d8656b 100644
+--- a/clang/include/clang/Basic/DiagnosticSemaKinds.td
++++ b/clang/include/clang/Basic/DiagnosticSemaKinds.td
+@@ -1014,6 +1014,22 @@ def err_ptrauth_indirect_goto_addrlabel_arithmetic : Error<
+   "%select{subtraction|addition}0 of address-of-label expressions is not "
+   "supported with ptrauth indirect gotos">;
+ 
++// __ptrauth qualifier
++def err_ptrauth_qualifier_invalid : Error<
++  "%select{return type|parameter type|property}1 may not be qualified with '__ptrauth'; type is %0">;
++def err_ptrauth_qualifier_cast : Error<
++  "cannot cast to '__ptrauth'-qualified type %0">;
++def err_ptrauth_qualifier_nonpointer : Error<
++  "'__ptrauth' qualifier only applies to pointer types; %0 is invalid">;
++def err_ptrauth_qualifier_redundant : Error<
++  "type %0 is already %1-qualified">;
++def err_ptrauth_arg_not_ice : Error<
++  "argument to '__ptrauth' must be an integer constant expression">;
++def err_ptrauth_address_discrimination_invalid : Error<
++  "invalid address discrimination flag '%0'; '__ptrauth' requires '0' or '1'">;
++def err_ptrauth_extra_discriminator_invalid : Error<
++  "invalid extra discriminator flag '%0'; '__ptrauth' requires a value between '0' and '%1'">;
++
+ /// main()
+ // static main() is not an error in C, just in C++.
+ def warn_static_main : Warning<"'main' should not be declared static">,
+@@ -3923,7 +3939,8 @@ def note_cannot_use_trivial_abi_reason : Note<
+   "its copy constructors and move constructors are all deleted|"
+   "it is polymorphic|"
+   "it has a base of a non-trivial class type|it has a virtual base|"
+-  "it has a __weak field|it has a field of a non-trivial class type}1">;
++  "it has a __weak field|it has a field of a non-trivial class type|"
++  "it has an address-discriminated '__ptrauth' field}1">;
+ 
+ // Availability attribute
+ def warn_availability_unknown_platform : Warning<
+@@ -5021,6 +5038,10 @@ def note_ovl_candidate_bad_ownership : Note<
+     "%select{no|__unsafe_unretained|__strong|__weak|__autoreleasing}4 ownership,"
+     " but parameter has %select{no|__unsafe_unretained|__strong|__weak|"
+     "__autoreleasing}5 ownership">;
++def note_ovl_candidate_bad_ptrauth : Note<
++    "candidate %sub{select_ovl_candidate_kind}0,1,2 not viable: "
++    "%ordinal8 argument (%3) has %select{no '__ptrauth'|%5}4 qualifier,"
++    " but parameter has %select{no '__ptrauth'|%7}6 qualifier">;
+ def note_ovl_candidate_bad_cvr_this : Note<
+     "candidate %sub{select_ovl_candidate_kind}0,1,2 not viable: "
+     "'this' argument has type %3, but method is not marked "
+@@ -6092,7 +6113,7 @@ def note_deleted_special_member_class_subobject : Note<
+   "%select{default|corresponding|default|default|default}4 constructor}0|"
+   "destructor}5"
+   "%select{||s||}4"
+-  "|is an ObjC pointer}6">;
++  "|is an ObjC pointer|has an address-discriminated '__ptrauth' qualifier}6">;
+ def note_default_constructed_field
+     : Note<"default constructed field %0 declared here">;
+ def note_deleted_default_ctor_uninit_field : Note<
+@@ -8938,6 +8959,19 @@ def err_typecheck_incompatible_ownership : Error<
+   "sending to parameter of different type}0,1"
+   "|%diff{casting $ to type $|casting between types}0,1}2"
+   " changes retain/release properties of pointer">;
++def err_typecheck_incompatible_ptrauth : Error<
++  "%enum_select<AssignmentAction>{%Assigning{%diff{assigning $ to $|assigning to different types}1,0}"
++  "|%Passing{%diff{passing $ to parameter of type $|"
++  "passing to parameter of different type}0,1}"
++  "|%Returning{%diff{returning $ from a function with result type $|"
++  "returning from function with different return type}0,1}"
++  "|%Converting{%diff{converting $ to type $|converting between types}0,1}"
++  "|%Initializing{%diff{initializing $ with an expression of type $|"
++  "initializing with expression of different type}0,1}"
++  "|%Sending{%diff{sending $ to parameter of type $|"
++  "sending to parameter of different type}0,1}"
++  "|%Casting{%diff{casting $ to type $|casting between types}0,1}}2"
++  " changes pointer authentication of pointee type">;
+ def err_typecheck_comparison_of_distinct_blocks : Error<
+   "comparison of distinct block types%diff{ ($ and $)|}0,1">;
+ 
+@@ -9066,6 +9100,9 @@ def err_atomic_op_needs_non_const_atomic : Error<
+ def err_atomic_op_needs_non_const_pointer : Error<
+   "address argument to atomic operation must be a pointer to non-const "
+   "type (%0 invalid)">;
++def err_atomic_op_needs_non_address_discriminated_pointer : Error<
++  "address argument to %select{atomic|__sync}0 operation must be a pointer to a non address discriminated "
++  "type (%1 invalid)">;
+ def err_atomic_op_needs_trivial_copy : Error<
+   "address argument to atomic operation must be a pointer to a "
+   "trivially-copyable type (%0 invalid)">;
+@@ -9343,6 +9380,8 @@ def ext_typecheck_cond_pointer_integer_mismatch : ExtWarn<
+   "pointer/integer type mismatch in conditional expression"
+   "%diff{ ($ and $)|}0,1">,
+   InGroup<DiagGroup<"conditional-type-mismatch">>;
++def err_typecheck_cond_incompatible_ptrauth : Error<
++  "'__ptrauth' qualification mismatch%diff{ ($ and $)|}0,1">;
+ def err_typecheck_choose_expr_requires_constant : Error<
+   "'__builtin_choose_expr' requires a constant expression">;
+ def warn_unused_expr : Warning<"expression result unused">,
+diff --git a/clang/include/clang/Basic/Features.def b/clang/include/clang/Basic/Features.def
+index b4409efaa9c0..14bff8a68846 100644
+--- a/clang/include/clang/Basic/Features.def
++++ b/clang/include/clang/Basic/Features.def
+@@ -107,6 +107,7 @@ FEATURE(thread_sanitizer, LangOpts.Sanitize.has(SanitizerKind::Thread))
+ FEATURE(dataflow_sanitizer, LangOpts.Sanitize.has(SanitizerKind::DataFlow))
+ FEATURE(scudo, LangOpts.Sanitize.hasOneOf(SanitizerKind::Scudo))
+ FEATURE(ptrauth_intrinsics, LangOpts.PointerAuthIntrinsics)
++EXTENSION(ptrauth_qualifier, LangOpts.PointerAuthIntrinsics)
+ FEATURE(ptrauth_calls, LangOpts.PointerAuthCalls)
+ FEATURE(ptrauth_returns, LangOpts.PointerAuthReturns)
+ FEATURE(ptrauth_vtable_pointer_address_discrimination, LangOpts.PointerAuthVTPtrAddressDiscrimination)
+diff --git a/clang/include/clang/Basic/TokenKinds.def b/clang/include/clang/Basic/TokenKinds.def
+index 880928ae0447..868e851342eb 100644
+--- a/clang/include/clang/Basic/TokenKinds.def
++++ b/clang/include/clang/Basic/TokenKinds.def
+@@ -348,6 +348,7 @@ KEYWORD(_Thread_local               , KEYALL)
+ KEYWORD(__func__                    , KEYALL)
+ KEYWORD(__objc_yes                  , KEYALL)
+ KEYWORD(__objc_no                   , KEYALL)
++KEYWORD(__ptrauth                   , KEYALL)
+ 
+ // C2y
+ UNARY_EXPR_OR_TYPE_TRAIT(_Countof, CountOf, KEYNOCXX)
+diff --git a/clang/include/clang/Parse/Parser.h b/clang/include/clang/Parse/Parser.h
+index 53da6269a3b1..9ebcf144ba59 100644
+--- a/clang/include/clang/Parse/Parser.h
++++ b/clang/include/clang/Parse/Parser.h
+@@ -3169,6 +3169,8 @@ private:
+                                SourceLocation *endLoc = nullptr);
+   ExprResult ParseExtIntegerArgument();
+ 
++  void ParsePtrauthQualifier(ParsedAttributes &Attrs);
++
+   VirtSpecifiers::Specifier isCXX11VirtSpecifier(const Token &Tok) const;
+   VirtSpecifiers::Specifier isCXX11VirtSpecifier() const {
+     return isCXX11VirtSpecifier(Tok);
+diff --git a/clang/include/clang/Sema/Sema.h b/clang/include/clang/Sema/Sema.h
+index 5ab0af8234e2..fe37fd7701ce 100644
+--- a/clang/include/clang/Sema/Sema.h
++++ b/clang/include/clang/Sema/Sema.h
+@@ -3547,6 +3547,17 @@ public:
+ 
+   bool checkConstantPointerAuthKey(Expr *keyExpr, unsigned &key);
+ 
++  enum PointerAuthDiscArgKind {
++    // Address discrimination argument of __ptrauth.
++    PADAK_AddrDiscPtrAuth,
++
++    // Extra discriminator argument of __ptrauth.
++    PADAK_ExtraDiscPtrAuth,
++  };
++
++  bool checkPointerAuthDiscriminatorArg(Expr *Arg, PointerAuthDiscArgKind Kind,
++                                        unsigned &IntVal);
++
+   /// Diagnose function specifiers on a declaration of an identifier that
+   /// does not identify a function.
+   void DiagnoseFunctionSpecifiers(const DeclSpec &DS);
+diff --git a/clang/lib/AST/ASTContext.cpp b/clang/lib/AST/ASTContext.cpp
+index dfae2f5511b4..c6ffe7bbf525 100644
+--- a/clang/lib/AST/ASTContext.cpp
++++ b/clang/lib/AST/ASTContext.cpp
+@@ -11454,6 +11454,7 @@ QualType ASTContext::mergeTypes(QualType LHS, QualType RHS, bool OfBlockPointer,
+     if (LQuals.getCVRQualifiers() != RQuals.getCVRQualifiers() ||
+         LQuals.getAddressSpace() != RQuals.getAddressSpace() ||
+         LQuals.getObjCLifetime() != RQuals.getObjCLifetime() ||
++        !LQuals.getPointerAuth().isEquivalent(RQuals.getPointerAuth()) ||
+         LQuals.hasUnaligned() != RQuals.hasUnaligned())
+       return {};
+ 
+diff --git a/clang/lib/AST/DeclCXX.cpp b/clang/lib/AST/DeclCXX.cpp
+index 36131d19cbcd..4d07efd58f51 100644
+--- a/clang/lib/AST/DeclCXX.cpp
++++ b/clang/lib/AST/DeclCXX.cpp
+@@ -1118,6 +1118,33 @@ void CXXRecordDecl::addedMember(Decl *D) {
+     } else if (!T.isCXX98PODType(Context))
+       data().PlainOldData = false;
+ 
++    // If a class has an address-discriminated signed pointer member, it is a
++    // non-POD type and its copy constructor, move constructor, copy assignment
++    // operator, move assignment operator are non-trivial.
++    if (PointerAuthQualifier Q = T.getPointerAuth()) {
++      if (Q.isAddressDiscriminated()) {
++        struct DefinitionData &Data = data();
++        Data.PlainOldData = false;
++        Data.HasTrivialSpecialMembers &=
++            ~(SMF_CopyConstructor | SMF_MoveConstructor | SMF_CopyAssignment |
++              SMF_MoveAssignment);
++        setArgPassingRestrictions(RecordArgPassingKind::CanNeverPassInRegs);
++
++        // Copy/move constructors/assignment operators of a union are deleted by
++        // default if it has an address-discriminated ptrauth field.
++        if (isUnion()) {
++          data().DefaultedCopyConstructorIsDeleted = true;
++          data().DefaultedMoveConstructorIsDeleted = true;
++          data().DefaultedCopyAssignmentIsDeleted = true;
++          data().DefaultedMoveAssignmentIsDeleted = true;
++          data().NeedOverloadResolutionForCopyConstructor = true;
++          data().NeedOverloadResolutionForMoveConstructor = true;
++          data().NeedOverloadResolutionForCopyAssignment = true;
++          data().NeedOverloadResolutionForMoveAssignment = true;
++        }
++      }
++    }
++
+     if (Field->hasAttr<ExplicitInitAttr>())
+       setHasUninitializedExplicitInitFields(true);
+ 
+diff --git a/clang/lib/AST/ItaniumMangle.cpp b/clang/lib/AST/ItaniumMangle.cpp
+index 140f29b431fc..d0ab60700cb1 100644
+--- a/clang/lib/AST/ItaniumMangle.cpp
++++ b/clang/lib/AST/ItaniumMangle.cpp
+@@ -2895,6 +2895,26 @@ void CXXNameMangler::mangleQualifiers(Qualifiers Quals, const DependentAddressSp
+   if (Quals.hasUnaligned())
+     mangleVendorQualifier("__unaligned");
+ 
++  // __ptrauth.  Note that this is parameterized.
++  if (PointerAuthQualifier PtrAuth = Quals.getPointerAuth()) {
++    mangleVendorQualifier("__ptrauth");
++    // For now, since we only allow non-dependent arguments, we can just
++    // inline the mangling of those arguments as literals.  We treat the
++    // key and extra-discriminator arguments as 'unsigned int' and the
++    // address-discriminated argument as 'bool'.
++    Out << "I"
++           "Lj"
++        << PtrAuth.getKey()
++        << "E"
++           "Lb"
++        << unsigned(PtrAuth.isAddressDiscriminated())
++        << "E"
++           "Lj"
++        << PtrAuth.getExtraDiscriminator()
++        << "E"
++           "E";
++  }
++
+   // Remaining ARC ownership qualifiers.
+   switch (Quals.getObjCLifetime()) {
+   case Qualifiers::OCL_None:
+diff --git a/clang/lib/AST/MicrosoftMangle.cpp b/clang/lib/AST/MicrosoftMangle.cpp
+index a6efd887d4e1..20bfb7f89625 100644
+--- a/clang/lib/AST/MicrosoftMangle.cpp
++++ b/clang/lib/AST/MicrosoftMangle.cpp
+@@ -430,6 +430,7 @@ private:
+   void mangleRefQualifier(RefQualifierKind RefQualifier);
+   void manglePointerCVQualifiers(Qualifiers Quals);
+   void manglePointerExtQualifiers(Qualifiers Quals, QualType PointeeType);
++  void manglePointerAuthQualifier(Qualifiers Quals);
+ 
+   void mangleUnscopedTemplateName(GlobalDecl GD);
+   void
+@@ -2340,6 +2341,17 @@ void MicrosoftCXXNameMangler::manglePointerExtQualifiers(Qualifiers Quals,
+     Out << 'F';
+ }
+ 
++void MicrosoftCXXNameMangler::manglePointerAuthQualifier(Qualifiers Quals) {
++  PointerAuthQualifier PointerAuth = Quals.getPointerAuth();
++  if (!PointerAuth)
++    return;
++
++  Out << "__ptrauth";
++  mangleNumber(PointerAuth.getKey());
++  mangleNumber(PointerAuth.isAddressDiscriminated());
++  mangleNumber(PointerAuth.getExtraDiscriminator());
++}
++
+ void MicrosoftCXXNameMangler::manglePointerCVQualifiers(Qualifiers Quals) {
+   // <pointer-cv-qualifiers> ::= P  # no qualifiers
+   //                         ::= Q  # const
+@@ -3372,6 +3384,7 @@ void MicrosoftCXXNameMangler::mangleType(const PointerType *T, Qualifiers Quals,
+   QualType PointeeType = T->getPointeeType();
+   manglePointerCVQualifiers(Quals);
+   manglePointerExtQualifiers(Quals, PointeeType);
++  manglePointerAuthQualifier(Quals);
+ 
+   // For pointer size address spaces, go down the same type mangling path as
+   // non address space types.
+diff --git a/clang/lib/AST/TypePrinter.cpp b/clang/lib/AST/TypePrinter.cpp
+index cc8c87414016..7b1d1c7ae213 100644
+--- a/clang/lib/AST/TypePrinter.cpp
++++ b/clang/lib/AST/TypePrinter.cpp
+@@ -2016,6 +2016,7 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
+   case attr::Ptr64:
+   case attr::SPtr:
+   case attr::UPtr:
++  case attr::PointerAuth:
+   case attr::AddressSpace:
+   case attr::CmseNSCall:
+   case attr::AnnotateType:
+@@ -2512,6 +2513,33 @@ void clang::printTemplateArgumentList(raw_ostream &OS,
+   printTo(OS, Args, InnerPolicy, TPL, /*isPack*/ false, /*parmIndex*/ 0);
+ }
+ 
++std::string PointerAuthQualifier::getAsString() const {
++  LangOptions LO;
++  return getAsString(PrintingPolicy(LO));
++}
++
++std::string PointerAuthQualifier::getAsString(const PrintingPolicy &P) const {
++  SmallString<64> Buf;
++  llvm::raw_svector_ostream StrOS(Buf);
++  print(StrOS, P);
++  return StrOS.str().str();
++}
++
++bool PointerAuthQualifier::isEmptyWhenPrinted(const PrintingPolicy &P) const {
++  return !isPresent();
++}
++
++void PointerAuthQualifier::print(raw_ostream &OS,
++                                 const PrintingPolicy &P) const {
++  if (!isPresent())
++    return;
++
++  OS << "__ptrauth(";
++  OS << getKey();
++  OS << "," << unsigned(isAddressDiscriminated()) << ","
++     << getExtraDiscriminator() << ")";
++}
++
+ std::string Qualifiers::getAsString() const {
+   LangOptions LO;
+   return getAsString(PrintingPolicy(LO));
+@@ -2541,6 +2569,10 @@ bool Qualifiers::isEmptyWhenPrinted(const PrintingPolicy &Policy) const {
+     if (!(lifetime == Qualifiers::OCL_Strong && Policy.SuppressStrongLifetime))
+       return false;
+ 
++  if (PointerAuthQualifier PointerAuth = getPointerAuth();
++      PointerAuth && !PointerAuth.isEmptyWhenPrinted(Policy))
++    return false;
++
+   return true;
+ }
+ 
+@@ -2651,6 +2683,14 @@ void Qualifiers::print(raw_ostream &OS, const PrintingPolicy& Policy,
+     }
+   }
+ 
++  if (PointerAuthQualifier PointerAuth = getPointerAuth()) {
++    if (addSpace)
++      OS << ' ';
++    addSpace = true;
++
++    PointerAuth.print(OS, Policy);
++  }
++
+   if (appendSpaceIfNonEmpty && addSpace)
+     OS << ' ';
+ }
+diff --git a/clang/lib/CodeGen/CGClass.cpp b/clang/lib/CodeGen/CGClass.cpp
+index 1c73a5bf75f3..7176fe025b38 100644
+--- a/clang/lib/CodeGen/CGClass.cpp
++++ b/clang/lib/CodeGen/CGClass.cpp
+@@ -925,6 +925,9 @@ namespace {
+       Qualifiers Qual = F->getType().getQualifiers();
+       if (Qual.hasVolatile() || Qual.hasObjCLifetime())
+         return false;
++      if (PointerAuthQualifier Q = F->getType().getPointerAuth();
++          Q && Q.isAddressDiscriminated())
++        return false;
+       return true;
+     }
+ 
+diff --git a/clang/lib/CodeGen/CGDebugInfo.cpp b/clang/lib/CodeGen/CGDebugInfo.cpp
+index e63341c18042..f3ec498d4064 100644
+--- a/clang/lib/CodeGen/CGDebugInfo.cpp
++++ b/clang/lib/CodeGen/CGDebugInfo.cpp
+@@ -1059,8 +1059,23 @@ llvm::DIType *CGDebugInfo::CreateQualifiedType(QualType Ty,
+   // additional ones.
+   llvm::dwarf::Tag Tag = getNextQualifier(Qc);
+   if (!Tag) {
+-    assert(Qc.empty() && "Unknown type qualifier for debug info");
+-    return getOrCreateType(QualType(T, 0), Unit);
++    if (Qc.getPointerAuth()) {
++      unsigned Key = Qc.getPointerAuth().getKey();
++      bool IsDiscr = Qc.getPointerAuth().isAddressDiscriminated();
++      unsigned ExtraDiscr = Qc.getPointerAuth().getExtraDiscriminator();
++      bool IsaPointer = Qc.getPointerAuth().isIsaPointer();
++      bool AuthenticatesNullValues =
++          Qc.getPointerAuth().authenticatesNullValues();
++      Qc.removePointerAuth();
++      assert(Qc.empty() && "Unknown type qualifier for debug info");
++      llvm::DIType *FromTy = getOrCreateType(QualType(T, 0), Unit);
++      return DBuilder.createPtrAuthQualifiedType(FromTy, Key, IsDiscr,
++                                                 ExtraDiscr, IsaPointer,
++                                                 AuthenticatesNullValues);
++    } else {
++      assert(Qc.empty() && "Unknown type qualifier for debug info");
++      return getOrCreateType(QualType(T, 0), Unit);
++    }
+   }
+ 
+   auto *FromTy = getOrCreateType(Qc.apply(CGM.getContext(), T), Unit);
+diff --git a/clang/lib/CodeGen/CGDecl.cpp b/clang/lib/CodeGen/CGDecl.cpp
+index db8dbf86eca4..db34e2738b4c 100644
+--- a/clang/lib/CodeGen/CGDecl.cpp
++++ b/clang/lib/CodeGen/CGDecl.cpp
+@@ -776,11 +776,17 @@ void CodeGenFunction::EmitScalarInit(const Expr *init, const ValueDecl *D,
+                                      LValue lvalue, bool capturedByInit) {
+   Qualifiers::ObjCLifetime lifetime = lvalue.getObjCLifetime();
+   if (!lifetime) {
+-    llvm::Value *value = EmitScalarExpr(init);
++    llvm::Value *Value;
++    if (PointerAuthQualifier PtrAuth = lvalue.getQuals().getPointerAuth()) {
++      Value = EmitPointerAuthQualify(PtrAuth, init, lvalue.getAddress());
++      lvalue.getQuals().removePointerAuth();
++    } else {
++      Value = EmitScalarExpr(init);
++    }
+     if (capturedByInit)
+       drillIntoBlockVariable(*this, lvalue, cast<VarDecl>(D));
+-    EmitNullabilityCheck(lvalue, value, init->getExprLoc());
+-    EmitStoreThroughLValue(RValue::get(value), lvalue, true);
++    EmitNullabilityCheck(lvalue, Value, init->getExprLoc());
++    EmitStoreThroughLValue(RValue::get(Value), lvalue, true);
+     return;
+   }
+ 
+diff --git a/clang/lib/CodeGen/CGExpr.cpp b/clang/lib/CodeGen/CGExpr.cpp
+index 3da21cebd9d6..abb88477062f 100644
+--- a/clang/lib/CodeGen/CGExpr.cpp
++++ b/clang/lib/CodeGen/CGExpr.cpp
+@@ -569,7 +569,15 @@ EmitMaterializeTemporaryExpr(const MaterializeTemporaryExpr *M) {
+     // initialized it.
+     if (!Var->hasInitializer()) {
+       Var->setInitializer(CGM.EmitNullConstant(E->getType()));
+-      EmitAnyExprToMem(E, Object, Qualifiers(), /*IsInit*/true);
++      QualType RefType = M->getType().withoutLocalFastQualifiers();
++      if (RefType.getPointerAuth()) {
++        // Use the qualifier of the reference temporary to sign the pointer.
++        LValue LV = MakeRawAddrLValue(Object.getPointer(), RefType,
++                                      Object.getAlignment());
++        EmitScalarInit(E, M->getExtendingDecl(), LV, false);
++      } else {
++        EmitAnyExprToMem(E, Object, Qualifiers(), /*IsInit*/ true);
++      }
+     }
+   } else {
+     switch (M->getStorageDuration()) {
+@@ -1770,16 +1778,16 @@ static ConstantEmissionKind checkVarTypeForConstantEmission(QualType type) {
+ /// for instance if a block or lambda or a member of a local class uses a
+ /// const int variable or constexpr variable from an enclosing function.
+ CodeGenFunction::ConstantEmission
+-CodeGenFunction::tryEmitAsConstant(DeclRefExpr *refExpr) {
+-  ValueDecl *value = refExpr->getDecl();
++CodeGenFunction::tryEmitAsConstant(const DeclRefExpr *RefExpr) {
++  const ValueDecl *Value = RefExpr->getDecl();
+ 
+   // The value needs to be an enum constant or a constant variable.
+   ConstantEmissionKind CEK;
+-  if (isa<ParmVarDecl>(value)) {
++  if (isa<ParmVarDecl>(Value)) {
+     CEK = CEK_None;
+-  } else if (auto *var = dyn_cast<VarDecl>(value)) {
++  } else if (const auto *var = dyn_cast<VarDecl>(Value)) {
+     CEK = checkVarTypeForConstantEmission(var->getType());
+-  } else if (isa<EnumConstantDecl>(value)) {
++  } else if (isa<EnumConstantDecl>(Value)) {
+     CEK = CEK_AsValueOnly;
+   } else {
+     CEK = CEK_None;
+@@ -1792,15 +1800,15 @@ CodeGenFunction::tryEmitAsConstant(DeclRefExpr *refExpr) {
+ 
+   // It's best to evaluate all the way as an r-value if that's permitted.
+   if (CEK != CEK_AsReferenceOnly &&
+-      refExpr->EvaluateAsRValue(result, getContext())) {
++      RefExpr->EvaluateAsRValue(result, getContext())) {
+     resultIsReference = false;
+-    resultType = refExpr->getType();
++    resultType = RefExpr->getType().getUnqualifiedType();
+ 
+   // Otherwise, try to evaluate as an l-value.
+   } else if (CEK != CEK_AsValueOnly &&
+-             refExpr->EvaluateAsLValue(result, getContext())) {
++             RefExpr->EvaluateAsLValue(result, getContext())) {
+     resultIsReference = true;
+-    resultType = value->getType();
++    resultType = Value->getType();
+ 
+   // Failure.
+   } else {
+@@ -1819,7 +1827,7 @@ CodeGenFunction::tryEmitAsConstant(DeclRefExpr *refExpr) {
+   // accessible on device. The DRE of the captured reference variable has to be
+   // loaded from captures.
+   if (CGM.getLangOpts().CUDAIsDevice && result.Val.isLValue() &&
+-      refExpr->refersToEnclosingVariableOrCapture()) {
++      RefExpr->refersToEnclosingVariableOrCapture()) {
+     auto *MD = dyn_cast_or_null<CXXMethodDecl>(CurCodeDecl);
+     if (isLambdaMethod(MD) && MD->getOverloadedOperator() == OO_Call) {
+       const APValue::LValueBase &base = result.Val.getLValueBase();
+@@ -1834,17 +1842,17 @@ CodeGenFunction::tryEmitAsConstant(DeclRefExpr *refExpr) {
+   }
+ 
+   // Emit as a constant.
+-  auto C = ConstantEmitter(*this).emitAbstract(refExpr->getLocation(),
+-                                               result.Val, resultType);
++  llvm::Constant *C = ConstantEmitter(*this).emitAbstract(
++      RefExpr->getLocation(), result.Val, resultType);
+ 
+   // Make sure we emit a debug reference to the global variable.
+   // This should probably fire even for
+-  if (isa<VarDecl>(value)) {
+-    if (!getContext().DeclMustBeEmitted(cast<VarDecl>(value)))
+-      EmitDeclRefExprDbgValue(refExpr, result.Val);
++  if (isa<VarDecl>(Value)) {
++    if (!getContext().DeclMustBeEmitted(cast<VarDecl>(Value)))
++      EmitDeclRefExprDbgValue(RefExpr, result.Val);
+   } else {
+-    assert(isa<EnumConstantDecl>(value));
+-    EmitDeclRefExprDbgValue(refExpr, result.Val);
++    assert(isa<EnumConstantDecl>(Value));
++    EmitDeclRefExprDbgValue(RefExpr, result.Val);
+   }
+ 
+   // If we emitted a reference constant, we need to dereference that.
+@@ -2235,6 +2243,15 @@ RValue CodeGenFunction::EmitLoadOfAnyValue(LValue LV, AggValueSlot Slot,
+ /// method emits the address of the lvalue, then loads the result as an rvalue,
+ /// returning the rvalue.
+ RValue CodeGenFunction::EmitLoadOfLValue(LValue LV, SourceLocation Loc) {
++  // Load from __ptrauth.
++  if (PointerAuthQualifier PtrAuth = LV.getQuals().getPointerAuth()) {
++    LV.getQuals().removePointerAuth();
++    llvm::Value *Value = EmitLoadOfLValue(LV, Loc).getScalarVal();
++    return RValue::get(EmitPointerAuthUnqualify(PtrAuth, Value, LV.getType(),
++                                                LV.getAddress(),
++                                                /*known nonnull*/ false));
++  }
++
+   if (LV.isObjCWeak()) {
+     // load of a __weak object.
+     Address AddrWeakObj = LV.getAddress();
+@@ -2490,6 +2507,13 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
+     return EmitStoreThroughBitfieldLValue(Src, Dst);
+   }
+ 
++  // Handle __ptrauth qualification by re-signing the value.
++  if (PointerAuthQualifier PointerAuth = Dst.getQuals().getPointerAuth()) {
++    Src = RValue::get(EmitPointerAuthQualify(PointerAuth, Src.getScalarVal(),
++                                             Dst.getType(), Dst.getAddress(),
++                                             /*known nonnull*/ false));
++  }
++
+   // There's special magic for assigning into an ARC-qualified l-value.
+   if (Qualifiers::ObjCLifetime Lifetime = Dst.getQuals().getObjCLifetime()) {
+     switch (Lifetime) {
+@@ -5792,6 +5816,28 @@ CGCallee CodeGenFunction::EmitCallee(const Expr *E) {
+       return EmitCallee(ICE->getSubExpr());
+     }
+ 
++    // Try to remember the original __ptrauth qualifier for loads of
++    // function pointers.
++    if (ICE->getCastKind() == CK_LValueToRValue) {
++      const Expr *SubExpr = ICE->getSubExpr();
++      if (const auto *PtrType = SubExpr->getType()->getAs<PointerType>()) {
++        std::pair<llvm::Value *, CGPointerAuthInfo> Result =
++            EmitOrigPointerRValue(E);
++
++        QualType FunctionType = PtrType->getPointeeType();
++        assert(FunctionType->isFunctionType());
++
++        GlobalDecl GD;
++        if (const auto *VD =
++                dyn_cast_or_null<VarDecl>(E->getReferencedDeclOfCallee())) {
++          GD = GlobalDecl(VD);
++        }
++        CGCalleeInfo CalleeInfo(FunctionType->getAs<FunctionProtoType>(), GD);
++        CGCallee Callee(CalleeInfo, Result.first, Result.second);
++        return Callee;
++      }
++    }
++
+   // Resolve direct calls.
+   } else if (auto DRE = dyn_cast<DeclRefExpr>(E)) {
+     if (auto FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+@@ -5854,6 +5900,18 @@ LValue CodeGenFunction::EmitBinaryOperatorLValue(const BinaryOperator *E) {
+ 
+   switch (getEvaluationKind(E->getType())) {
+   case TEK_Scalar: {
++    if (PointerAuthQualifier PtrAuth =
++            E->getLHS()->getType().getPointerAuth()) {
++      LValue LV = EmitCheckedLValue(E->getLHS(), TCK_Store);
++      LValue CopiedLV = LV;
++      CopiedLV.getQuals().removePointerAuth();
++      llvm::Value *RV =
++          EmitPointerAuthQualify(PtrAuth, E->getRHS(), CopiedLV.getAddress());
++      EmitNullabilityCheck(CopiedLV, RV, E->getExprLoc());
++      EmitStoreThroughLValue(RValue::get(RV), CopiedLV);
++      return LV;
++    }
++
+     switch (E->getLHS()->getType().getObjCLifetime()) {
+     case Qualifiers::OCL_Strong:
+       return EmitARCStoreStrong(E, /*ignored*/ false).first;
+diff --git a/clang/lib/CodeGen/CGExprConstant.cpp b/clang/lib/CodeGen/CGExprConstant.cpp
+index b016c6e36d1a..b21ebeee4bed 100644
+--- a/clang/lib/CodeGen/CGExprConstant.cpp
++++ b/clang/lib/CodeGen/CGExprConstant.cpp
+@@ -2049,10 +2049,13 @@ namespace {
+ struct ConstantLValue {
+   llvm::Constant *Value;
+   bool HasOffsetApplied;
++  bool HasDestPointerAuth;
+ 
+   /*implicit*/ ConstantLValue(llvm::Constant *value,
+-                              bool hasOffsetApplied = false)
+-    : Value(value), HasOffsetApplied(hasOffsetApplied) {}
++                              bool hasOffsetApplied = false,
++                              bool hasDestPointerAuth = false)
++      : Value(value), HasOffsetApplied(hasOffsetApplied),
++        HasDestPointerAuth(hasDestPointerAuth) {}
+ 
+   /*implicit*/ ConstantLValue(ConstantAddress address)
+     : ConstantLValue(address.getPointer()) {}
+@@ -2157,6 +2160,14 @@ llvm::Constant *ConstantLValueEmitter::tryEmit() {
+     value = applyOffset(value);
+   }
+ 
++  // Apply pointer-auth signing from the destination type.
++  if (PointerAuthQualifier PointerAuth = DestType.getPointerAuth();
++      PointerAuth && !result.HasDestPointerAuth) {
++    value = Emitter.tryEmitConstantSignedPointer(value, PointerAuth);
++    if (!value)
++      return nullptr;
++  }
++
+   // Convert to the appropriate type; this could be an lvalue for
+   // an integer.  FIXME: performAddrSpaceCast
+   if (isa<llvm::PointerType>(destTy))
+@@ -2200,6 +2211,12 @@ ConstantLValueEmitter::tryEmitBase(const APValue::LValueBase &base) {
+       return CGM.GetWeakRefReference(D).getPointer();
+ 
+     auto PtrAuthSign = [&](llvm::Constant *C) {
++      if (PointerAuthQualifier PointerAuth = DestType.getPointerAuth()) {
++        C = applyOffset(C);
++        C = Emitter.tryEmitConstantSignedPointer(C, PointerAuth);
++        return ConstantLValue(C, /*applied offset*/ true, /*signed*/ true);
++      }
++
+       CGPointerAuthInfo AuthInfo;
+ 
+       if (EnablePtrAuthFunctionTypeDiscrimination)
+@@ -2213,7 +2230,7 @@ ConstantLValueEmitter::tryEmitBase(const APValue::LValueBase &base) {
+         C = CGM.getConstantSignedPointer(
+             C, AuthInfo.getKey(), nullptr,
+             cast_or_null<llvm::ConstantInt>(AuthInfo.getDiscriminator()));
+-        return ConstantLValue(C, /*applied offset*/ true);
++        return ConstantLValue(C, /*applied offset*/ true, /*signed*/ true);
+       }
+ 
+       return ConstantLValue(C);
+diff --git a/clang/lib/CodeGen/CGExprScalar.cpp b/clang/lib/CodeGen/CGExprScalar.cpp
+index e9a7ba509350..8dbbcdaef25d 100644
+--- a/clang/lib/CodeGen/CGExprScalar.cpp
++++ b/clang/lib/CodeGen/CGExprScalar.cpp
+@@ -2261,6 +2261,53 @@ Value *ScalarExprEmitter::VisitInitListExpr(InitListExpr *E) {
+   return V;
+ }
+ 
++static bool isDeclRefKnownNonNull(CodeGenFunction &CGF, const ValueDecl *D) {
++  return !D->isWeak();
++}
++
++static bool isLValueKnownNonNull(CodeGenFunction &CGF, const Expr *E) {
++  E = E->IgnoreParens();
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(E))
++    if (UO->getOpcode() == UO_Deref)
++      return CGF.isPointerKnownNonNull(UO->getSubExpr());
++
++  if (const auto *DRE = dyn_cast<DeclRefExpr>(E))
++    return isDeclRefKnownNonNull(CGF, DRE->getDecl());
++
++  if (const auto *ME = dyn_cast<MemberExpr>(E)) {
++    if (isa<FieldDecl>(ME->getMemberDecl()))
++      return true;
++    return isDeclRefKnownNonNull(CGF, ME->getMemberDecl());
++  }
++
++  // Array subscripts?  Anything else?
++
++  return false;
++}
++
++bool CodeGenFunction::isPointerKnownNonNull(const Expr *E) {
++  assert(E->getType()->isSignableType());
++
++  E = E->IgnoreParens();
++
++  if (isa<CXXThisExpr>(E))
++    return true;
++
++  if (const auto *UO = dyn_cast<UnaryOperator>(E))
++    if (UO->getOpcode() == UO_AddrOf)
++      return isLValueKnownNonNull(*this, UO->getSubExpr());
++
++  if (const auto *CE = dyn_cast<CastExpr>(E))
++    if (CE->getCastKind() == CK_FunctionToPointerDecay ||
++        CE->getCastKind() == CK_ArrayToPointerDecay)
++      return isLValueKnownNonNull(*this, CE->getSubExpr());
++
++  // Maybe honor __nonnull?
++
++  return false;
++}
++
+ bool CodeGenFunction::ShouldNullCheckClassCastValue(const CastExpr *CE) {
+   const Expr *E = CE->getSubExpr();
+ 
+@@ -4985,6 +5032,21 @@ Value *ScalarExprEmitter::VisitBinAssign(const BinaryOperator *E) {
+   Value *RHS;
+   LValue LHS;
+ 
++  if (PointerAuthQualifier PtrAuth = E->getLHS()->getType().getPointerAuth()) {
++    LValue LV = CGF.EmitCheckedLValue(E->getLHS(), CodeGenFunction::TCK_Store);
++    LV.getQuals().removePointerAuth();
++    llvm::Value *RV =
++        CGF.EmitPointerAuthQualify(PtrAuth, E->getRHS(), LV.getAddress());
++    CGF.EmitNullabilityCheck(LV, RV, E->getExprLoc());
++    CGF.EmitStoreThroughLValue(RValue::get(RV), LV);
++
++    if (Ignore)
++      return nullptr;
++    RV = CGF.EmitPointerAuthUnqualify(PtrAuth, RV, LV.getType(),
++                                      LV.getAddress(), /*nonnull*/ false);
++    return RV;
++  }
++
+   switch (E->getLHS()->getType().getObjCLifetime()) {
+   case Qualifiers::OCL_Strong:
+     std::tie(LHS, RHS) = CGF.EmitARCStoreStrong(E, Ignore);
+diff --git a/clang/lib/CodeGen/CGPointerAuth.cpp b/clang/lib/CodeGen/CGPointerAuth.cpp
+index 4b032306ead7..0a183a8524c1 100644
+--- a/clang/lib/CodeGen/CGPointerAuth.cpp
++++ b/clang/lib/CodeGen/CGPointerAuth.cpp
+@@ -125,6 +125,33 @@ CGPointerAuthInfo CodeGenFunction::EmitPointerAuthInfo(
+                            Schema.authenticatesNullValues(), Discriminator);
+ }
+ 
++CGPointerAuthInfo
++CodeGenFunction::EmitPointerAuthInfo(PointerAuthQualifier Qual,
++                                     Address StorageAddress) {
++  assert(Qual && "don't call this if you don't know that the Qual is present");
++  if (Qual.hasKeyNone())
++    return CGPointerAuthInfo();
++
++  llvm::Value *Discriminator = nullptr;
++  if (unsigned Extra = Qual.getExtraDiscriminator())
++    Discriminator = llvm::ConstantInt::get(IntPtrTy, Extra);
++
++  if (Qual.isAddressDiscriminated()) {
++    assert(StorageAddress.isValid() &&
++           "address discrimination without address");
++    llvm::Value *StoragePtr = StorageAddress.emitRawPointer(*this);
++    if (Discriminator)
++      Discriminator =
++          EmitPointerAuthBlendDiscriminator(StoragePtr, Discriminator);
++    else
++      Discriminator = Builder.CreatePtrToInt(StoragePtr, IntPtrTy);
++  }
++
++  return CGPointerAuthInfo(Qual.getKey(), Qual.getAuthenticationMode(),
++                           Qual.isIsaPointer(), Qual.authenticatesNullValues(),
++                           Discriminator);
++}
++
+ /// Return the natural pointer authentication for values of the given
+ /// pointee type.
+ static CGPointerAuthInfo
+@@ -166,6 +193,91 @@ CGPointerAuthInfo CodeGenModule::getPointerAuthInfoForType(QualType T) {
+   return ::getPointerAuthInfoForType(*this, T);
+ }
+ 
++static std::pair<llvm::Value *, CGPointerAuthInfo>
++emitLoadOfOrigPointerRValue(CodeGenFunction &CGF, const LValue &LV,
++                            SourceLocation Loc) {
++  llvm::Value *Value = CGF.EmitLoadOfScalar(LV, Loc);
++  CGPointerAuthInfo AuthInfo;
++  if (PointerAuthQualifier PtrAuth = LV.getQuals().getPointerAuth())
++    AuthInfo = CGF.EmitPointerAuthInfo(PtrAuth, LV.getAddress());
++  else
++    AuthInfo = getPointerAuthInfoForType(CGF.CGM, LV.getType());
++  return {Value, AuthInfo};
++}
++
++/// Retrieve a pointer rvalue and its ptrauth info. When possible, avoid
++/// needlessly resigning the pointer.
++std::pair<llvm::Value *, CGPointerAuthInfo>
++CodeGenFunction::EmitOrigPointerRValue(const Expr *E) {
++  assert(E->getType()->isSignableType());
++
++  E = E->IgnoreParens();
++  if (const auto *Load = dyn_cast<ImplicitCastExpr>(E)) {
++    if (Load->getCastKind() == CK_LValueToRValue) {
++      E = Load->getSubExpr()->IgnoreParens();
++
++      // We're semantically required to not emit loads of certain DREs naively.
++      if (const auto *RefExpr = dyn_cast<DeclRefExpr>(E)) {
++        if (ConstantEmission Result = tryEmitAsConstant(RefExpr)) {
++          // Fold away a use of an intermediate variable.
++          if (!Result.isReference())
++            return {Result.getValue(),
++                    getPointerAuthInfoForType(CGM, RefExpr->getType())};
++
++          // Fold away a use of an intermediate reference.
++          LValue LV = Result.getReferenceLValue(*this, RefExpr);
++          return emitLoadOfOrigPointerRValue(*this, LV, RefExpr->getLocation());
++        }
++      }
++
++      // Otherwise, load and use the pointer
++      LValue LV = EmitCheckedLValue(E, CodeGenFunction::TCK_Load);
++      return emitLoadOfOrigPointerRValue(*this, LV, E->getExprLoc());
++    }
++  }
++
++  // Fallback: just use the normal rules for the type.
++  llvm::Value *Value = EmitScalarExpr(E);
++  return {Value, getPointerAuthInfoForType(CGM, E->getType())};
++}
++
++llvm::Value *
++CodeGenFunction::EmitPointerAuthQualify(PointerAuthQualifier DestQualifier,
++                                        const Expr *E,
++                                        Address DestStorageAddress) {
++  assert(DestQualifier);
++  auto [Value, CurAuthInfo] = EmitOrigPointerRValue(E);
++
++  CGPointerAuthInfo DestAuthInfo =
++      EmitPointerAuthInfo(DestQualifier, DestStorageAddress);
++  return emitPointerAuthResign(Value, E->getType(), CurAuthInfo, DestAuthInfo,
++                               isPointerKnownNonNull(E));
++}
++
++llvm::Value *CodeGenFunction::EmitPointerAuthQualify(
++    PointerAuthQualifier DestQualifier, llvm::Value *Value,
++    QualType PointerType, Address DestStorageAddress, bool IsKnownNonNull) {
++  assert(DestQualifier);
++
++  CGPointerAuthInfo CurAuthInfo = getPointerAuthInfoForType(CGM, PointerType);
++  CGPointerAuthInfo DestAuthInfo =
++      EmitPointerAuthInfo(DestQualifier, DestStorageAddress);
++  return emitPointerAuthResign(Value, PointerType, CurAuthInfo, DestAuthInfo,
++                               IsKnownNonNull);
++}
++
++llvm::Value *CodeGenFunction::EmitPointerAuthUnqualify(
++    PointerAuthQualifier CurQualifier, llvm::Value *Value, QualType PointerType,
++    Address CurStorageAddress, bool IsKnownNonNull) {
++  assert(CurQualifier);
++
++  CGPointerAuthInfo CurAuthInfo =
++      EmitPointerAuthInfo(CurQualifier, CurStorageAddress);
++  CGPointerAuthInfo DestAuthInfo = getPointerAuthInfoForType(CGM, PointerType);
++  return emitPointerAuthResign(Value, PointerType, CurAuthInfo, DestAuthInfo,
++                               IsKnownNonNull);
++}
++
+ static bool isZeroConstant(const llvm::Value *Value) {
+   if (const auto *CI = dyn_cast<llvm::ConstantInt>(Value))
+     return CI->isZero();
+@@ -288,6 +400,23 @@ llvm::Value *CodeGenFunction::emitPointerAuthResign(
+   return Value;
+ }
+ 
++void CodeGenFunction::EmitPointerAuthCopy(PointerAuthQualifier Qual, QualType T,
++                                          Address DestAddress,
++                                          Address SrcAddress) {
++  assert(Qual);
++  llvm::Value *Value = Builder.CreateLoad(SrcAddress);
++
++  // If we're using address-discrimination, we have to re-sign the value.
++  if (Qual.isAddressDiscriminated()) {
++    CGPointerAuthInfo SrcPtrAuth = EmitPointerAuthInfo(Qual, SrcAddress);
++    CGPointerAuthInfo DestPtrAuth = EmitPointerAuthInfo(Qual, DestAddress);
++    Value = emitPointerAuthResign(Value, T, SrcPtrAuth, DestPtrAuth,
++                                  /*IsKnownNonNull=*/false);
++  }
++
++  Builder.CreateStore(Value, DestAddress);
++}
++
+ llvm::Constant *
+ CodeGenModule::getConstantSignedPointer(llvm::Constant *Pointer, unsigned Key,
+                                         llvm::Constant *StorageAddress,
+diff --git a/clang/lib/CodeGen/CodeGenFunction.h b/clang/lib/CodeGen/CodeGenFunction.h
+index aa07e5d6c809..4c5e8a8a4492 100644
+--- a/clang/lib/CodeGen/CodeGenFunction.h
++++ b/clang/lib/CodeGen/CodeGenFunction.h
+@@ -4432,10 +4432,10 @@ public:
+     }
+ 
+     bool isReference() const { return ValueAndIsReference.getInt(); }
+-    LValue getReferenceLValue(CodeGenFunction &CGF, Expr *refExpr) const {
++    LValue getReferenceLValue(CodeGenFunction &CGF, const Expr *RefExpr) const {
+       assert(isReference());
+       return CGF.MakeNaturalAlignAddrLValue(ValueAndIsReference.getPointer(),
+-                                            refExpr->getType());
++                                            RefExpr->getType());
+     }
+ 
+     llvm::Constant *getValue() const {
+@@ -4444,7 +4444,7 @@ public:
+     }
+   };
+ 
+-  ConstantEmission tryEmitAsConstant(DeclRefExpr *refExpr);
++  ConstantEmission tryEmitAsConstant(const DeclRefExpr *RefExpr);
+   ConstantEmission tryEmitAsConstant(const MemberExpr *ME);
+   llvm::Value *emitScalarConstant(const ConstantEmission &Constant, Expr *E);
+ 
+@@ -4588,6 +4588,26 @@ public:
+       const CGPointerAuthInfo &Info,
+       SmallVectorImpl<llvm::OperandBundleDef> &Bundles);
+ 
++  CGPointerAuthInfo EmitPointerAuthInfo(PointerAuthQualifier Qualifier,
++                                        Address StorageAddress);
++  llvm::Value *EmitPointerAuthQualify(PointerAuthQualifier Qualifier,
++                                      llvm::Value *Pointer, QualType ValueType,
++                                      Address StorageAddress,
++                                      bool IsKnownNonNull);
++  llvm::Value *EmitPointerAuthQualify(PointerAuthQualifier Qualifier,
++                                      const Expr *PointerExpr,
++                                      Address StorageAddress);
++  llvm::Value *EmitPointerAuthUnqualify(PointerAuthQualifier Qualifier,
++                                        llvm::Value *Pointer,
++                                        QualType PointerType,
++                                        Address StorageAddress,
++                                        bool IsKnownNonNull);
++  void EmitPointerAuthCopy(PointerAuthQualifier Qualifier, QualType Type,
++                           Address DestField, Address SrcField);
++
++  std::pair<llvm::Value *, CGPointerAuthInfo>
++  EmitOrigPointerRValue(const Expr *E);
++
+   llvm::Value *authPointerToPointerCast(llvm::Value *ResultPtr,
+                                         QualType SourceType, QualType DestType);
+   Address authPointerToPointerCast(Address Ptr, QualType SourceType,
+diff --git a/clang/lib/Parse/ParseDecl.cpp b/clang/lib/Parse/ParseDecl.cpp
+index d77400e0f827..8fa74ecff19a 100644
+--- a/clang/lib/Parse/ParseDecl.cpp
++++ b/clang/lib/Parse/ParseDecl.cpp
+@@ -3400,6 +3400,45 @@ void Parser::DistributeCLateParsedAttrs(Decl *Dcl,
+   }
+ }
+ 
++/// type-qualifier:
++///    ('__ptrauth') '(' constant-expression
++///                   (',' constant-expression)[opt]
++///                   (',' constant-expression)[opt] ')'
++void Parser::ParsePtrauthQualifier(ParsedAttributes &Attrs) {
++  assert(Tok.is(tok::kw___ptrauth));
++
++  IdentifierInfo *KwName = Tok.getIdentifierInfo();
++  SourceLocation KwLoc = ConsumeToken();
++
++  BalancedDelimiterTracker T(*this, tok::l_paren);
++  if (T.expectAndConsume())
++    return;
++
++  ArgsVector ArgExprs;
++  do {
++    ExprResult ER = ParseAssignmentExpression();
++    if (ER.isInvalid()) {
++      T.skipToEnd();
++      return;
++    }
++    ArgExprs.push_back(ER.get());
++  } while (TryConsumeToken(tok::comma));
++
++  T.consumeClose();
++  SourceLocation EndLoc = T.getCloseLocation();
++
++  if (ArgExprs.empty() || ArgExprs.size() > 3) {
++    Diag(KwLoc, diag::err_ptrauth_qualifier_bad_arg_count);
++    return;
++  }
++
++  Attrs.addNew(KwName, SourceRange(KwLoc, EndLoc),
++               /*scope*/ nullptr, SourceLocation(), ArgExprs.data(),
++               ArgExprs.size(),
++               ParsedAttr::Form::Keyword(/*IsAlignAs=*/false,
++                                         /*IsRegularKeywordAttribute=*/false));
++}
++
+ /// Bounds attributes (e.g., counted_by):
+ ///   AttrName '(' expression ')'
+ void Parser::ParseBoundsAttribute(IdentifierInfo &AttrName,
+@@ -4267,6 +4306,11 @@ void Parser::ParseDeclarationSpecifiers(
+                                  getLangOpts());
+       break;
+ 
++    // __ptrauth qualifier.
++    case tok::kw___ptrauth:
++      ParsePtrauthQualifier(DS.getAttributes());
++      continue;
++
+     case tok::kw___sptr:
+     case tok::kw___uptr:
+     case tok::kw___ptr64:
+@@ -5980,6 +6024,7 @@ bool Parser::isTypeSpecifierQualifier() {
+   case tok::kw___ptr32:
+   case tok::kw___pascal:
+   case tok::kw___unaligned:
++  case tok::kw___ptrauth:
+ 
+   case tok::kw__Nonnull:
+   case tok::kw__Nullable:
+@@ -6269,6 +6314,7 @@ bool Parser::isDeclarationSpecifier(
+   case tok::kw___forceinline:
+   case tok::kw___pascal:
+   case tok::kw___unaligned:
++  case tok::kw___ptrauth:
+ 
+   case tok::kw__Nonnull:
+   case tok::kw__Nullable:
+@@ -6533,6 +6579,12 @@ void Parser::ParseTypeQualifierListOpt(
+       ParseHLSLQualifiers(DS.getAttributes());
+       continue;
+ 
++    // __ptrauth qualifier.
++    case tok::kw___ptrauth:
++      ParsePtrauthQualifier(DS.getAttributes());
++      EndLoc = PrevTokLocation;
++      continue;
++
+     case tok::kw___unaligned:
+       isInvalid = DS.SetTypeQual(DeclSpec::TQ_unaligned, Loc, PrevSpec, DiagID,
+                                  getLangOpts());
+diff --git a/clang/lib/Sema/SemaCast.cpp b/clang/lib/Sema/SemaCast.cpp
+index 1591075ff05d..14e16bc39eb3 100644
+--- a/clang/lib/Sema/SemaCast.cpp
++++ b/clang/lib/Sema/SemaCast.cpp
+@@ -72,8 +72,11 @@ namespace {
+       //   Preceding an expression by a parenthesized type name converts the
+       //   value of the expression to the unqualified, non-atomic version of
+       //   the named type.
++      // Don't drop __ptrauth qualifiers. We want to treat casting to a
++      // __ptrauth-qualified type as an error instead of implicitly ignoring
++      // the qualifier.
+       if (!S.Context.getLangOpts().ObjC && !DestType->isRecordType() &&
+-          !DestType->isArrayType()) {
++          !DestType->isArrayType() && !DestType.getPointerAuth()) {
+         DestType = DestType.getAtomicUnqualifiedType();
+       }
+ 
+@@ -168,6 +171,14 @@ namespace {
+       SrcExpr = src;
+     }
+ 
++    void checkQualifiedDestType() {
++      // Destination type may not be qualified with __ptrauth.
++      if (DestType.getPointerAuth()) {
++        Self.Diag(DestRange.getBegin(), diag::err_ptrauth_qualifier_cast)
++            << DestType << DestRange;
++      }
++    }
++
+     /// Check for and handle non-overload placeholder expressions.
+     void checkNonOverloadPlaceholders() {
+       if (!isPlaceholder() || isPlaceholder(BuiltinType::Overload))
+@@ -309,6 +320,8 @@ Sema::BuildCXXNamedCast(SourceLocation OpLoc, tok::TokenKind Kind,
+   Op.OpRange = SourceRange(OpLoc, Parens.getEnd());
+   Op.DestRange = AngleBrackets;
+ 
++  Op.checkQualifiedDestType();
++
+   switch (Kind) {
+   default: llvm_unreachable("Unknown C++ cast!");
+ 
+@@ -3412,6 +3425,8 @@ ExprResult Sema::BuildCStyleCastExpr(SourceLocation LPLoc,
+   // -Wcast-qual
+   DiagnoseCastQual(Op.Self, Op.SrcExpr, Op.DestType);
+ 
++  Op.checkQualifiedDestType();
++
+   return Op.complete(CStyleCastExpr::Create(
+       Context, Op.ResultType, Op.ValueKind, Op.Kind, Op.SrcExpr.get(),
+       &Op.BasePath, CurFPFeatureOverrides(), CastTypeInfo, LPLoc, RPLoc));
+@@ -3431,6 +3446,8 @@ ExprResult Sema::BuildCXXFunctionalCastExpr(TypeSourceInfo *CastTypeInfo,
+   if (Op.SrcExpr.isInvalid())
+     return ExprError();
+ 
++  Op.checkQualifiedDestType();
++
+   auto *SubExpr = Op.SrcExpr.get();
+   if (auto *BindExpr = dyn_cast<CXXBindTemporaryExpr>(SubExpr))
+     SubExpr = BindExpr->getSubExpr();
+diff --git a/clang/lib/Sema/SemaChecking.cpp b/clang/lib/Sema/SemaChecking.cpp
+index d0143d29a4bc..42da9ba97e0d 100644
+--- a/clang/lib/Sema/SemaChecking.cpp
++++ b/clang/lib/Sema/SemaChecking.cpp
+@@ -1550,6 +1550,48 @@ bool Sema::checkConstantPointerAuthKey(Expr *Arg, unsigned &Result) {
+   return false;
+ }
+ 
++bool Sema::checkPointerAuthDiscriminatorArg(Expr *Arg,
++                                            PointerAuthDiscArgKind Kind,
++                                            unsigned &IntVal) {
++  if (!Arg) {
++    IntVal = 0;
++    return true;
++  }
++
++  std::optional<llvm::APSInt> Result = Arg->getIntegerConstantExpr(Context);
++  if (!Result) {
++    Diag(Arg->getExprLoc(), diag::err_ptrauth_arg_not_ice);
++    return false;
++  }
++
++  unsigned Max;
++  bool IsAddrDiscArg = false;
++
++  switch (Kind) {
++  case PADAK_AddrDiscPtrAuth:
++    Max = 1;
++    IsAddrDiscArg = true;
++    break;
++  case PADAK_ExtraDiscPtrAuth:
++    Max = PointerAuthQualifier::MaxDiscriminator;
++    break;
++  };
++
++  if (*Result < 0 || *Result > Max) {
++    if (IsAddrDiscArg)
++      Diag(Arg->getExprLoc(), diag::err_ptrauth_address_discrimination_invalid)
++          << Result->getExtValue();
++    else
++      Diag(Arg->getExprLoc(), diag::err_ptrauth_extra_discriminator_invalid)
++          << Result->getExtValue() << Max;
++
++    return false;
++  };
++
++  IntVal = Result->getZExtValue();
++  return true;
++}
++
+ static std::pair<const ValueDecl *, CharUnits>
+ findConstantBaseAndOffset(Sema &S, Expr *E) {
+   // Must evaluate as a pointer.
+@@ -3957,6 +3999,14 @@ ExprResult Sema::BuildAtomicExpr(SourceRange CallRange, SourceRange ExprRange,
+     ValType = AtomTy;
+   }
+ 
++  PointerAuthQualifier PointerAuth = AtomTy.getPointerAuth();
++  if (PointerAuth && PointerAuth.isAddressDiscriminated()) {
++    Diag(ExprRange.getBegin(),
++         diag::err_atomic_op_needs_non_address_discriminated_pointer)
++        << 0 << Ptr->getType() << Ptr->getSourceRange();
++    return ExprError();
++  }
++
+   // For an arithmetic operation, the implied arithmetic must be well-formed.
+   if (Form == Arithmetic) {
+     // GCC does not enforce these rules for GNU atomics, but we do to help catch
+@@ -4329,6 +4379,13 @@ ExprResult Sema::BuiltinAtomicOverloaded(ExprResult TheCallResult) {
+         << FirstArg->getType() << 0 << FirstArg->getSourceRange();
+     return ExprError();
+   }
++  PointerAuthQualifier PointerAuth = ValType.getPointerAuth();
++  if (PointerAuth && PointerAuth.isAddressDiscriminated()) {
++    Diag(FirstArg->getBeginLoc(),
++         diag::err_atomic_op_needs_non_address_discriminated_pointer)
++        << 1 << ValType << FirstArg->getSourceRange();
++    return ExprError();
++  }
+ 
+   if (ValType.isConstQualified()) {
+     Diag(DRE->getBeginLoc(), diag::err_atomic_builtin_cannot_be_const)
+diff --git a/clang/lib/Sema/SemaDecl.cpp b/clang/lib/Sema/SemaDecl.cpp
+index 240ce5391af8..5f811c824e11 100644
+--- a/clang/lib/Sema/SemaDecl.cpp
++++ b/clang/lib/Sema/SemaDecl.cpp
+@@ -15454,6 +15454,12 @@ ParmVarDecl *Sema::CheckParameter(DeclContext *DC, SourceLocation StartLoc,
+     New->setType(T);
+   }
+ 
++  // __ptrauth is forbidden on parameters.
++  if (T.getPointerAuth()) {
++    Diag(NameLoc, diag::err_ptrauth_qualifier_invalid) << T << 1;
++    New->setInvalidDecl();
++  }
++
+   // ISO/IEC TR 18037 S6.7.3: "The type of an object with automatic storage
+   // duration shall not be qualified by an address-space qualifier."
+   // Since all parameters have automatic store duration, they can not have
+@@ -19456,9 +19462,14 @@ void Sema::ActOnFields(Scope *S, SourceLocation RecLoc, Decl *EnclosingDecl,
+             RecordArgPassingKind::CanNeverPassInRegs)
+           Record->setArgPassingRestrictions(
+               RecordArgPassingKind::CanNeverPassInRegs);
+-      } else if (FT.getQualifiers().getObjCLifetime() == Qualifiers::OCL_Weak)
++      } else if (FT.getQualifiers().getObjCLifetime() == Qualifiers::OCL_Weak) {
+         Record->setArgPassingRestrictions(
+             RecordArgPassingKind::CanNeverPassInRegs);
++      } else if (PointerAuthQualifier Q = FT.getPointerAuth();
++                 Q && Q.isAddressDiscriminated()) {
++        Record->setArgPassingRestrictions(
++            RecordArgPassingKind::CanNeverPassInRegs);
++      }
+     }
+ 
+     if (Record && FD->getType().isVolatileQualified())
+diff --git a/clang/lib/Sema/SemaDeclCXX.cpp b/clang/lib/Sema/SemaDeclCXX.cpp
+index 74f925f18560..2247aded9384 100644
+--- a/clang/lib/Sema/SemaDeclCXX.cpp
++++ b/clang/lib/Sema/SemaDeclCXX.cpp
+@@ -9471,6 +9471,8 @@ struct SpecialMemberDeletionInfo
+ 
+   bool shouldDeleteForVariantObjCPtrMember(FieldDecl *FD, QualType FieldType);
+ 
++  bool shouldDeleteForVariantPtrAuthMember(const FieldDecl *FD);
++
+   bool visitBase(CXXBaseSpecifier *Base) { return shouldDeleteForBase(Base); }
+   bool visitField(FieldDecl *Field) { return shouldDeleteForField(Field); }
+ 
+@@ -9639,6 +9641,30 @@ bool SpecialMemberDeletionInfo::shouldDeleteForVariantObjCPtrMember(
+   return true;
+ }
+ 
++bool SpecialMemberDeletionInfo::shouldDeleteForVariantPtrAuthMember(
++    const FieldDecl *FD) {
++  QualType FieldType = S.Context.getBaseElementType(FD->getType());
++  // Copy/move constructors/assignment operators are deleted if the field has an
++  // address-discriminated ptrauth qualifier.
++  PointerAuthQualifier Q = FieldType.getPointerAuth();
++
++  if (!Q || !Q.isAddressDiscriminated())
++    return false;
++
++  if (CSM == CXXSpecialMemberKind::DefaultConstructor ||
++      CSM == CXXSpecialMemberKind::Destructor)
++    return false;
++
++  if (Diagnose) {
++    auto *ParentClass = cast<CXXRecordDecl>(FD->getParent());
++    S.Diag(FD->getLocation(), diag::note_deleted_special_member_class_subobject)
++        << llvm::to_underlying(getEffectiveCSM()) << ParentClass
++        << /*IsField*/ true << FD << 4 << /*IsDtorCallInCtor*/ false << 2;
++  }
++
++  return true;
++}
++
+ /// Check whether we should delete a special member function due to the class
+ /// having a particular direct or virtual base class.
+ bool SpecialMemberDeletionInfo::shouldDeleteForBase(CXXBaseSpecifier *Base) {
+@@ -9677,6 +9703,9 @@ bool SpecialMemberDeletionInfo::shouldDeleteForField(FieldDecl *FD) {
+   if (inUnion() && shouldDeleteForVariantObjCPtrMember(FD, FieldType))
+     return true;
+ 
++  if (inUnion() && shouldDeleteForVariantPtrAuthMember(FD))
++    return true;
++
+   if (CSM == CXXSpecialMemberKind::DefaultConstructor) {
+     // For a default constructor, all references must be initialized in-class
+     // and, if a union, it must have a non-const member.
+@@ -9740,6 +9769,9 @@ bool SpecialMemberDeletionInfo::shouldDeleteForField(FieldDecl *FD) {
+         if (shouldDeleteForVariantObjCPtrMember(&*UI, UnionFieldType))
+           return true;
+ 
++        if (shouldDeleteForVariantPtrAuthMember(&*UI))
++          return true;
++
+         if (!UnionFieldType.isConstQualified())
+           AllVariantFieldsAreConst = false;
+ 
+@@ -10589,6 +10621,12 @@ void Sema::checkIllFormedTrivialABIStruct(CXXRecordDecl &RD) {
+       return;
+     }
+ 
++    // Ill-formed if the field is an address-discriminated pointer.
++    if (FT.hasAddressDiscriminatedPointerAuth()) {
++      PrintDiagAndRemoveAttr(6);
++      return;
++    }
++
+     if (const auto *RT = FT->getBaseElementTypeUnsafe()->getAs<RecordType>())
+       if (!RT->isDependentType() &&
+           !cast<CXXRecordDecl>(RT->getDecl())->canPassInRegisters()) {
+diff --git a/clang/lib/Sema/SemaExpr.cpp b/clang/lib/Sema/SemaExpr.cpp
+index c25daaa022f4..3ac7d61546ce 100644
+--- a/clang/lib/Sema/SemaExpr.cpp
++++ b/clang/lib/Sema/SemaExpr.cpp
+@@ -8107,6 +8107,13 @@ static QualType checkConditionalPointerCompatibility(Sema &S, ExprResult &LHS,
+   lhQual.removeCVRQualifiers();
+   rhQual.removeCVRQualifiers();
+ 
++  if (!lhQual.getPointerAuth().isEquivalent(rhQual.getPointerAuth())) {
++    S.Diag(Loc, diag::err_typecheck_cond_incompatible_ptrauth)
++        << LHSTy << RHSTy << LHS.get()->getSourceRange()
++        << RHS.get()->getSourceRange();
++    return QualType();
++  }
++
+   // OpenCL v2.0 specification doesn't extend compatibility of type qualifiers
+   // (C99 6.7.3) for address spaces. We assume that the check should behave in
+   // the same manner as it's defined for CVR qualifiers, so for OpenCL two
+@@ -9027,6 +9034,10 @@ checkPointerTypesForAssignment(Sema &S, QualType LHSType, QualType RHSType,
+     else if (lhq.getObjCLifetime() != rhq.getObjCLifetime())
+       ConvTy = Sema::IncompatiblePointerDiscardsQualifiers;
+ 
++    // Treat pointer-auth mismatches as fatal.
++    else if (!lhq.getPointerAuth().isEquivalent(rhq.getPointerAuth()))
++      ConvTy = Sema::IncompatiblePointerDiscardsQualifiers;
++
+     // For GCC/MS compatibility, other qualifier mismatches are treated
+     // as still compatible in C.
+     else ConvTy = Sema::CompatiblePointerDiscardsQualifiers;
+@@ -17025,6 +17036,9 @@ bool Sema::DiagnoseAssignmentResult(AssignConvertType ConvTy,
+     } else if (lhq.getObjCLifetime() != rhq.getObjCLifetime()) {
+       DiagKind = diag::err_typecheck_incompatible_ownership;
+       break;
++    } else if (!lhq.getPointerAuth().isEquivalent(rhq.getPointerAuth())) {
++      DiagKind = diag::err_typecheck_incompatible_ptrauth;
++      break;
+     }
+ 
+     llvm_unreachable("unknown error case for discarding qualifiers!");
+diff --git a/clang/lib/Sema/SemaExprCXX.cpp b/clang/lib/Sema/SemaExprCXX.cpp
+index dfb5824a1c3d..8df590fa624c 100644
+--- a/clang/lib/Sema/SemaExprCXX.cpp
++++ b/clang/lib/Sema/SemaExprCXX.cpp
+@@ -7770,6 +7770,11 @@ QualType Sema::FindCompositePointerType(SourceLocation Loc,
+       else
+         return QualType();
+ 
++      if (Q1.getPointerAuth().isEquivalent(Q2.getPointerAuth()))
++        Quals.setPointerAuth(Q1.getPointerAuth());
++      else
++        return QualType();
++
+       Steps.back().Quals = Quals;
+       if (Q1 != Quals || Q2 != Quals)
+         NeedConstBefore = Steps.size() - 1;
+diff --git a/clang/lib/Sema/SemaObjCProperty.cpp b/clang/lib/Sema/SemaObjCProperty.cpp
+index 6db2c246de79..f37982eddace 100644
+--- a/clang/lib/Sema/SemaObjCProperty.cpp
++++ b/clang/lib/Sema/SemaObjCProperty.cpp
+@@ -180,6 +180,9 @@ Decl *SemaObjC::ActOnProperty(Scope *S, SourceLocation AtLoc,
+                            0);
+   TypeSourceInfo *TSI = SemaRef.GetTypeForDeclarator(FD.D);
+   QualType T = TSI->getType();
++  if (T.getPointerAuth().isPresent()) {
++    Diag(AtLoc, diag::err_ptrauth_qualifier_invalid) << T << 2;
++  }
+   if (!getOwnershipRule(Attributes)) {
+     Attributes |= deducePropertyOwnershipFromType(SemaRef, T);
+   }
+diff --git a/clang/lib/Sema/SemaOverload.cpp b/clang/lib/Sema/SemaOverload.cpp
+index 9c2df0b21d27..55634aa75ae2 100644
+--- a/clang/lib/Sema/SemaOverload.cpp
++++ b/clang/lib/Sema/SemaOverload.cpp
+@@ -3709,6 +3709,10 @@ static bool isQualificationConversionStep(QualType FromType, QualType ToType,
+     ToQuals.removeObjCGCAttr();
+   }
+ 
++  // __ptrauth qualifiers must match exactly.
++  if (FromQuals.getPointerAuth() != ToQuals.getPointerAuth())
++    return false;
++
+   //   -- for every j > 0, if const is in cv 1,j then const is in cv
+   //      2,j, and similarly for volatile.
+   if (!CStyle && !ToQuals.compatiblyIncludes(FromQuals, Ctx))
+@@ -11467,6 +11471,17 @@ static void DiagnoseBadConversion(Sema &S, OverloadCandidate *Cand,
+       return;
+     }
+ 
++    if (!FromQs.getPointerAuth().isEquivalent(ToQs.getPointerAuth())) {
++      S.Diag(Fn->getLocation(), diag::note_ovl_candidate_bad_ptrauth)
++          << (unsigned)FnKindPair.first << (unsigned)FnKindPair.second << FnDesc
++          << FromTy << !!FromQs.getPointerAuth()
++          << FromQs.getPointerAuth().getAsString() << !!ToQs.getPointerAuth()
++          << ToQs.getPointerAuth().getAsString() << I + 1
++          << (FromExpr ? FromExpr->getSourceRange() : SourceRange());
++      MaybeEmitInheritedConstructorNote(S, Cand->FoundDecl);
++      return;
++    }
++
+     unsigned CVR = FromQs.getCVRQualifiers() & ~ToQs.getCVRQualifiers();
+     assert(CVR && "expected qualifiers mismatch");
+ 
+diff --git a/clang/lib/Sema/SemaType.cpp b/clang/lib/Sema/SemaType.cpp
+index 33b1d8ca4dfa..eba7267904fb 100644
+--- a/clang/lib/Sema/SemaType.cpp
++++ b/clang/lib/Sema/SemaType.cpp
+@@ -2552,6 +2552,12 @@ bool Sema::CheckFunctionReturnType(QualType T, SourceLocation Loc) {
+     return true;
+   }
+ 
++  // __ptrauth is illegal on a function return type.
++  if (T.getPointerAuth()) {
++    Diag(Loc, diag::err_ptrauth_qualifier_invalid) << T << 0;
++    return true;
++  }
++
+   if (T.hasNonTrivialToPrimitiveDestructCUnion() ||
+       T.hasNonTrivialToPrimitiveCopyCUnion())
+     checkNonTrivialCUnion(T, Loc, NTCUC_FunctionReturn,
+@@ -2657,6 +2663,10 @@ QualType Sema::BuildFunctionType(QualType T,
+     } else if (ParamType->isWebAssemblyTableType()) {
+       Diag(Loc, diag::err_wasm_table_as_function_parameter);
+       Invalid = true;
++    } else if (ParamType.getPointerAuth()) {
++      // __ptrauth is illegal on a function return type.
++      Diag(Loc, diag::err_ptrauth_qualifier_invalid) << T << 1;
++      Invalid = true;
+     }
+ 
+     // C++2a [dcl.fct]p4:
+@@ -4974,6 +4984,11 @@ static TypeSourceInfo *GetFullTypeForDeclarator(TypeProcessingState &state,
+         }
+       }
+ 
++      // __ptrauth is illegal on a function return type.
++      if (T.getPointerAuth()) {
++        S.Diag(DeclType.Loc, diag::err_ptrauth_qualifier_invalid) << T << 0;
++      }
++
+       if (LangOpts.OpenCL) {
+         // OpenCL v2.0 s6.12.5 - A block cannot be the return value of a
+         // function.
+@@ -8333,6 +8348,65 @@ static void HandleNeonVectorTypeAttr(QualType &CurType, const ParsedAttr &Attr,
+   CurType = S.Context.getVectorType(CurType, numElts, VecKind);
+ }
+ 
++/// Handle the __ptrauth qualifier.
++static void HandlePtrAuthQualifier(ASTContext &Ctx, QualType &T,
++                                   const ParsedAttr &Attr, Sema &S) {
++
++  assert((Attr.getNumArgs() > 0 && Attr.getNumArgs() <= 3) &&
++         "__ptrauth qualifier takes between 1 and 3 arguments");
++  Expr *KeyArg = Attr.getArgAsExpr(0);
++  Expr *IsAddressDiscriminatedArg =
++      Attr.getNumArgs() >= 2 ? Attr.getArgAsExpr(1) : nullptr;
++  Expr *ExtraDiscriminatorArg =
++      Attr.getNumArgs() >= 3 ? Attr.getArgAsExpr(2) : nullptr;
++
++  unsigned Key;
++  if (S.checkConstantPointerAuthKey(KeyArg, Key)) {
++    Attr.setInvalid();
++    return;
++  }
++  assert(Key <= PointerAuthQualifier::MaxKey && "ptrauth key is out of range");
++
++  bool IsInvalid = false;
++  unsigned IsAddressDiscriminated, ExtraDiscriminator;
++  IsInvalid |= !S.checkPointerAuthDiscriminatorArg(IsAddressDiscriminatedArg,
++                                                   Sema::PADAK_AddrDiscPtrAuth,
++                                                   IsAddressDiscriminated);
++  IsInvalid |= !S.checkPointerAuthDiscriminatorArg(
++      ExtraDiscriminatorArg, Sema::PADAK_ExtraDiscPtrAuth, ExtraDiscriminator);
++
++  if (IsInvalid) {
++    Attr.setInvalid();
++    return;
++  }
++
++  if (!T->isSignableType() && !T->isDependentType()) {
++    S.Diag(Attr.getLoc(), diag::err_ptrauth_qualifier_nonpointer) << T;
++    Attr.setInvalid();
++    return;
++  }
++
++  if (T.getPointerAuth()) {
++    S.Diag(Attr.getLoc(), diag::err_ptrauth_qualifier_redundant)
++        << T << Attr.getAttrName()->getName();
++    Attr.setInvalid();
++    return;
++  }
++
++  if (!S.getLangOpts().PointerAuthIntrinsics) {
++    S.Diag(Attr.getLoc(), diag::err_ptrauth_disabled) << Attr.getRange();
++    Attr.setInvalid();
++    return;
++  }
++
++  assert((!IsAddressDiscriminatedArg || IsAddressDiscriminated <= 1) &&
++         "address discriminator arg should be either 0 or 1");
++  PointerAuthQualifier Qual = PointerAuthQualifier::Create(
++      Key, IsAddressDiscriminated, ExtraDiscriminator,
++      PointerAuthenticationMode::SignAndAuth, false, false);
++  T = S.Context.getPointerAuthType(T, Qual);
++}
++
+ /// HandleArmSveVectorBitsTypeAttr - The "arm_sve_vector_bits" attribute is
+ /// used to create fixed-length versions of sizeless SVE types defined by
+ /// the ACLE, such as svint32_t and svbool_t.
+@@ -8788,6 +8862,11 @@ static void processTypeAttrs(TypeProcessingState &state, QualType &type,
+       HandleOpenCLAccessAttr(type, attr, state.getSema());
+       attr.setUsedAsTypeAttr();
+       break;
++    case ParsedAttr::AT_PointerAuth:
++      HandlePtrAuthQualifier(state.getSema().Context, type, attr,
++                             state.getSema());
++      attr.setUsedAsTypeAttr();
++      break;
+     case ParsedAttr::AT_LifetimeBound:
+       if (TAL == TAL_DeclChunk)
+         HandleLifetimeBoundAttr(state, type, attr);
+diff --git a/clang/lib/Sema/TreeTransform.h b/clang/lib/Sema/TreeTransform.h
+index bb58ec49612c..2469991bf2ce 100644
+--- a/clang/lib/Sema/TreeTransform.h
++++ b/clang/lib/Sema/TreeTransform.h
+@@ -5287,6 +5287,17 @@ QualType TreeTransform<Derived>::RebuildQualifiedType(QualType T,
+     return QualType();
+   }
+ 
++  PointerAuthQualifier LocalPointerAuth = Quals.getPointerAuth();
++  if (LocalPointerAuth.isPresent()) {
++    if (T.getPointerAuth().isPresent()) {
++      SemaRef.Diag(Loc, diag::err_ptrauth_qualifier_redundant)
++          << TL.getType() << "__ptrauth";
++      return QualType();
++    } else if (!T->isSignableType() && !T->isDependentType()) {
++      SemaRef.Diag(Loc, diag::err_ptrauth_qualifier_nonpointer) << T;
++      return QualType();
++    }
++  }
+   // C++ [dcl.fct]p7:
+   //   [When] adding cv-qualifications on top of the function type [...] the
+   //   cv-qualifiers are ignored.
+diff --git a/clang/test/AST/ast-dump-ptrauth-json.cpp b/clang/test/AST/ast-dump-ptrauth-json.cpp
+index 125cda0cff53..8526598c491c 100644
+--- a/clang/test/AST/ast-dump-ptrauth-json.cpp
++++ b/clang/test/AST/ast-dump-ptrauth-json.cpp
+@@ -1,5 +1,8 @@
+ // RUN: %clang_cc1 -triple arm64-apple-ios -fptrauth-calls -fptrauth-intrinsics -std=c++11 -ast-dump=json %s | FileCheck %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -std=c++11 -ast-dump=json %s | FileCheck %s
+ 
+ // CHECK: "name": "__builtin_ptrauth_type_discriminator",
++// CHECK: "qualType": "int *__ptrauth(1,1,123)"
+ 
+ int d = __builtin_ptrauth_type_discriminator(int());
++int * __ptrauth(1,1,123) p;
+diff --git a/clang/test/CodeGen/ptrauth-debuginfo.c b/clang/test/CodeGen/ptrauth-debuginfo.c
+new file mode 100644
+index 000000000000..b76baffadd9a
+--- /dev/null
++++ b/clang/test/CodeGen/ptrauth-debuginfo.c
+@@ -0,0 +1,35 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios \
++// RUN:   -fptrauth-calls -fptrauth-intrinsics -emit-llvm -fblocks \
++// RUN:   %s -debug-info-kind=limited -o - | FileCheck %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu \
++// RUN:   -fptrauth-calls -fptrauth-intrinsics -emit-llvm -fblocks \
++// RUN:   %s -debug-info-kind=limited -o - | FileCheck %s
++
++// Constant initializers for data pointers.
++extern int external_int;
++
++int *__ptrauth(1, 0, 1234) g1 = &external_int;
++// CHECK: !DIDerivedType(tag: DW_TAG_LLVM_ptrauth_type,
++// CHECK-SAME:           ptrAuthKey: 1,
++// CHECK-SAME:           ptrAuthIsAddressDiscriminated: false,
++// CHECK-SAME:           ptrAuthExtraDiscriminator: 1234,
++// CHECK-SAME:           ptrAuthIsaPointer: false,
++// CHECK-SAME:           ptrAuthAuthenticatesNullValues: false)
++
++struct A {
++  int value;
++};
++struct A *createA(void);
++
++void f() {
++  __block struct A *__ptrauth(0, 1, 1236) ptr = createA();
++  ^{
++    (void)ptr->value;
++  }();
++}
++// CHECK: !DIDerivedType(tag: DW_TAG_LLVM_ptrauth_type,
++// CHECK-NOT:            ptrAuthKey
++// CHECK-SAME:           ptrAuthIsAddressDiscriminated: true,
++// CHECK-SAME:           ptrAuthExtraDiscriminator: 1236,
++// CHECK-SAME:           ptrAuthIsaPointer: false,
++// CHECK-SAME:           ptrAuthAuthenticatesNullValues: false)
+diff --git a/clang/test/CodeGen/ptrauth-qualifier-const-init.c b/clang/test/CodeGen/ptrauth-qualifier-const-init.c
+new file mode 100644
+index 000000000000..174f328628f1
+--- /dev/null
++++ b/clang/test/CodeGen/ptrauth-qualifier-const-init.c
+@@ -0,0 +1,86 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fptrauth-calls -fptrauth-intrinsics -emit-llvm %s  -o - | FileCheck %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -emit-llvm %s  -o - | FileCheck %s
++
++// Constant initializers for data pointers.
++extern int external_int;
++
++// CHECK: @g1 = global ptr ptrauth (ptr @external_int, i32 1, i64 56)
++int * __ptrauth(1,0,56) g1 = &external_int;
++
++// CHECK: @g2 = global ptr ptrauth (ptr @external_int, i32 1, i64 1272, ptr @g2)
++int * __ptrauth(1,1,1272) g2 = &external_int;
++
++// CHECK: @g3 = global ptr null
++int * __ptrauth(1,1,871) g3 = 0;
++
++// FIXME: should we make a ptrauth constant for this absolute symbol?
++// CHECK: @g4 = global ptr inttoptr (i64 1230 to ptr)
++int * __ptrauth(1,1,1902) g4 = (int*) 1230;
++
++// CHECK: @ga = global [3 x ptr] [
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 712, ptr @ga),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 712, ptr getelementptr inbounds ([3 x ptr], ptr @ga, i32 0, i32 1)),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 712, ptr getelementptr inbounds ([3 x ptr], ptr @ga, i32 0, i32 2))]
++int * __ptrauth(1,1,712) ga[3] = { &external_int, &external_int, &external_int };
++
++struct A {
++  int * __ptrauth(1,0,431) f0;
++  int * __ptrauth(1,0,9182) f1;
++  int * __ptrauth(1,0,783) f2;
++};
++
++// CHECK: @gs1 = global %struct.A {
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 431),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 9182),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 783) }
++struct A gs1 = { &external_int, &external_int, &external_int };
++
++struct B {
++  int * __ptrauth(1,1,1276) f0;
++  int * __ptrauth(1,1,23674) f1;
++  int * __ptrauth(1,1,163) f2;
++};
++
++// CHECK: @gs2 = global %struct.B {
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 1276, ptr @gs2),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 23674, ptr getelementptr inbounds (%struct.B, ptr @gs2, i32 0, i32 1)),
++// CHECK-SAME: ptr ptrauth (ptr @external_int, i32 1, i64 163, ptr getelementptr inbounds (%struct.B, ptr @gs2, i32 0, i32 2)) }
++struct B gs2 = { &external_int, &external_int, &external_int };
++
++// Constant initializers for function pointers.
++extern void external_function(void);
++typedef void (*fpt)(void);
++
++// CHECK: @f1 = global ptr ptrauth (ptr @external_function, i32 1, i64 56)
++fpt __ptrauth(1,0,56) f1 = &external_function;
++
++// CHECK: @f2 = global ptr ptrauth (ptr @external_function, i32 1, i64 1272, ptr @f2)
++fpt __ptrauth(1,1,1272) f2 = &external_function;
++
++// CHECK: @fa = global [3 x ptr] [
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 712, ptr @fa),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 712, ptr getelementptr inbounds ([3 x ptr], ptr @fa, i32 0, i32 1)),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 712, ptr getelementptr inbounds ([3 x ptr], ptr @fa, i32 0, i32 2))]
++fpt __ptrauth(1,1,712) fa[3] = { &external_function, &external_function, &external_function };
++
++struct C {
++  fpt __ptrauth(1,0,431) f0;
++  fpt __ptrauth(1,0,9182) f1;
++  fpt __ptrauth(1,0,783) f2;
++};
++// CHECK: @fs1 = global %struct.C {
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 431),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 9182),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 783) }
++struct C fs1 = { &external_function, &external_function, &external_function };
++
++struct D {
++  fpt __ptrauth(1,1,1276) f0;
++  fpt __ptrauth(1,1,23674) f1;
++  fpt __ptrauth(1,1,163) f2;
++};
++// CHECK: @fs2 = global %struct.D {
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 1276, ptr @fs2),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 23674, ptr getelementptr inbounds (%struct.D, ptr @fs2, i32 0, i32 1)),
++// CHECK-SAME: ptr ptrauth (ptr @external_function, i32 1, i64 163, ptr getelementptr inbounds (%struct.D, ptr @fs2, i32 0, i32 2)) }
++struct D fs2 = { &external_function, &external_function, &external_function };
+diff --git a/clang/test/CodeGen/ptrauth-qualifier-function.c b/clang/test/CodeGen/ptrauth-qualifier-function.c
+new file mode 100644
+index 000000000000..cd25b77a0154
+--- /dev/null
++++ b/clang/test/CodeGen/ptrauth-qualifier-function.c
+@@ -0,0 +1,145 @@
++// RUN: %clang_cc1 %s       -fptrauth-function-pointer-type-discrimination -triple arm64-apple-ios13 -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,TYPE %s
++// RUN: %clang_cc1 %s       -fptrauth-function-pointer-type-discrimination -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,TYPE %s
++// RUN: %clang_cc1 %s       -triple arm64-apple-ios13 -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,ZERO %s
++// RUN: %clang_cc1 %s       -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,ZERO %s
++// RUN: %clang_cc1 -xc++ %s -fptrauth-function-pointer-type-discrimination -triple arm64-apple-ios13 -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,TYPE,CHECK-CXX %s
++// RUN: %clang_cc1 -xc++ %s -fptrauth-function-pointer-type-discrimination -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -disable-llvm-passes -emit-llvm -o- | FileCheck --check-prefixes=CHECK,TYPE,CHECK-CXX %s
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void (*fptr)(void);
++void (* __ptrauth(0, 0, 42) f2ptr_42_discm)(int);
++void f(int);
++void (* const __ptrauth(0, 0, 42) f_const_ptr)(int) = &f;
++
++// CHECK-LABEL: define {{.*}}void @test_assign_to_qualified
++void test_assign_to_qualified() {
++  f2ptr_42_discm = (void (*)(int))fptr;
++
++  // CHECK: [[ENTRY:.*]]:{{$}}
++  // CHECK: [[FPTR:%.*]] = load ptr, ptr @fptr
++  // CHECK-NEXT: [[CMP:%.*]] = icmp ne ptr [[FPTR]], null
++  // TYPE-NEXT: br i1 [[CMP]], label %[[RESIGN1:.*]], label %[[JOIN1:.*]]
++  // ZERO-NEXT: br i1 [[CMP]], label %[[RESIGN2:.*]], label %[[JOIN2:.*]]
++
++  // TYPE: [[RESIGN1]]:
++  // TYPE-NEXT: [[FPTR2:%.*]] = ptrtoint ptr [[FPTR]] to i64
++  // TYPE-NEXT: [[FPTR4:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR2]], i32 0, i64 18983, i32 0, i64 2712)
++  // TYPE-NEXT: [[FPTR5:%.*]] = inttoptr i64 [[FPTR4]] to ptr
++  // TYPE-NEXT: br label %[[JOIN1]]
++
++  // TYPE: [[JOIN1]]:
++  // TYPE-NEXT: [[FPTR6:%.*]] = phi ptr [ null, %[[ENTRY]] ], [ [[FPTR5]], %[[RESIGN1]] ]
++  // TYPE-NEXT: [[CMP:%.*]] = icmp ne ptr [[FPTR6]], null
++  // TYPE-NEXT: br i1 [[CMP]], label %[[RESIGN2:.*]], label %[[JOIN2:.*]]
++
++  // CHECK: [[RESIGN2]]:
++  // TYPE-NEXT: [[FPTR7:%.*]] = ptrtoint ptr [[FPTR6]] to i64
++  // TYPE-NEXT: [[FPTR8:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR7]], i32 0, i64 2712, i32 0, i64 42)
++  // ZERO-NEXT: [[FPTR7:%.*]] = ptrtoint ptr [[FPTR]] to i64
++  // ZERO-NEXT: [[FPTR8:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR7]], i32 0, i64 0, i32 0, i64 42)
++  // CHECK-NEXT: [[FPTR9:%.*]] = inttoptr i64 [[FPTR8]] to ptr
++  // CHECK-NEXT: br label %[[JOIN2]]
++
++  // CHECK: [[JOIN2]]
++  // TYPE-NEXT: [[FPTR10:%.*]] = phi ptr [ null, %[[JOIN1]] ], [ [[FPTR9]], %[[RESIGN2]] ]
++  // ZERO-NEXT: [[FPTR10:%.*]] = phi ptr [ null, %[[ENTRY]] ], [ [[FPTR9]], %[[RESIGN2]] ]
++  // CHECK-NEXT store void (i32)* [[FPTR10]], void (i32)** @f2ptr_42_discm
++}
++
++// CHECK-LABEL: define {{.*}}void @test_assign_from_qualified
++void test_assign_from_qualified() {
++  fptr = (void (*)(void))f2ptr_42_discm;
++
++  // CHECK: [[ENTRY:.*]]:{{$}}
++  // CHECK: [[FPTR:%.*]] = load ptr, ptr @f2ptr_42_discm
++  // CHECK-NEXT: [[CMP:%.*]] = icmp ne ptr [[FPTR]], null
++  // TYPE-NEXT: br i1 [[CMP]], label %[[RESIGN1:.*]], label %[[JOIN1:.*]]
++  // ZERO-NEXT: br i1 [[CMP]], label %[[RESIGN2:.*]], label %[[JOIN2:.*]]
++
++  // TYPE: [[RESIGN1]]:
++  // TYPE-NEXT: [[FPTR1:%.*]] = ptrtoint ptr [[FPTR]] to i64
++  // TYPE-NEXT: [[FPTR2:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR1]], i32 0, i64 42, i32 0, i64 2712)
++  // TYPE-NEXT: [[FPTR3:%.*]] = inttoptr i64 [[FPTR2]] to ptr
++  // TYPE-NEXT: br label %[[JOIN1]]
++
++  // TYPE: [[JOIN1]]:
++  // TYPE-NEXT: [[FPTR4:%.*]] = phi ptr [ null, %[[ENTRY]] ], [ [[FPTR3]], %[[RESIGN1]] ]
++  // TYPE-NEXT: [[CMP:%.*]] = icmp ne ptr [[FPTR4]], null
++  // TYPE-NEXT: br i1 [[CMP]], label %[[RESIGN2:.*]], label %[[JOIN2:.*]]
++
++  // CHECK: [[RESIGN2]]:
++  // TYPE-NEXT: [[FPTR6:%.*]] = ptrtoint ptr [[FPTR4]] to i64
++  // TYPE-NEXT: [[FPTR7:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR6]], i32 0, i64 2712, i32 0, i64 18983)
++  // ZERO-NEXT: [[FPTR6:%.*]] = ptrtoint ptr [[FPTR]] to i64
++  // ZERO-NEXT: [[FPTR7:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[FPTR6]], i32 0, i64 42, i32 0, i64 0)
++  // CHECK-NEXT: [[FPTR8:%.*]] = inttoptr i64 [[FPTR7]] to ptr
++  // CHECK-NEXT: br label %[[JOIN2]]
++
++  // CHECK: [[JOIN2]]
++  // TYPE-NEXT: [[FPTR9:%.*]] = phi ptr [ null, %[[JOIN1]] ], [ [[FPTR8]], %[[RESIGN2]] ]
++  // ZERO-NEXT: [[FPTR9:%.*]] = phi ptr [ null, %[[ENTRY]] ], [ [[FPTR8]], %[[RESIGN2]] ]
++  // CHECK-NEXT store void ()* [[FPTR10]], void ()** @f2ptr_42_discm
++}
++
++// CHECK-LABEL: define {{.*}}void @test_const_ptr_function_call()
++void test_const_ptr_function_call(void) {
++  f_const_ptr(1);
++
++  // TYPE: call void ptrauth (ptr @f, i32 0, i64 2712)(i32 noundef 1) [ "ptrauth"(i32 0, i64 2712) ]
++  // ZERO: call void ptrauth (ptr @f, i32 0)(i32 noundef 1) [ "ptrauth"(i32 0, i64 0) ]
++}
++
++#ifdef __cplusplus
++void (* get_fptr(void))(int);
++void (* __ptrauth(0, 0, 42) f_const_ptr2)(int) = get_fptr();
++void (* const __ptrauth(0, 1, 43) &f_ref)(int) = f_const_ptr2;
++
++// CHECK-CXX-LABEL: define {{.*}}internal void @__cxx_global_var_init()
++// CHECK-CXX: [[ENTRY:.*]]:
++// CHECK-CXX: %[[CALL:.*]] = call ptr @get_fptr()
++// CHECK-CXX: %[[V0:.*]] = icmp ne ptr %[[CALL]], null
++// CHECK-CXX: br i1 %[[V0]], label %[[RESIGN_NONNULL:.*]], label %[[RESIGN_CONT:.*]]
++
++// CHECK-CXX: [[RESIGN_NONNULL]]:
++// CHECK-CXX: %[[V1:.*]] = ptrtoint ptr %[[CALL]] to i64
++// CHECK-CXX: %[[V2:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V1]], i32 0, i64 2712, i32 0, i64 42)
++// CHECK-CXX: %[[V3:.*]] = inttoptr i64 %[[V2]] to ptr
++// CHECK-CXX: br label %[[RESIGN_CONT]]
++
++// CHECK-CXX: [[RESIGN_CONT]]:
++// CHECK-CXX: %[[V4:.*]] = phi ptr [ null, %[[ENTRY]] ], [ %[[V3]], %[[RESIGN_NONNULL]] ]
++// CHECK-CXX: store ptr %[[V4]], ptr @f_const_ptr2, align 8
++
++// CHECK-CXX-LABEL: define {{.*}}internal void @__cxx_global_var_init.1()
++// CHECK-CXX: [[ENTRY:.*]]:
++// CHECK-CXX: %[[V0:.*]] = load ptr, ptr @f_const_ptr2, align 8
++// CHECK-CXX: %[[V1:.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @_ZGR5f_ref_ to i64), i64 43)
++// CHECK-CXX: %[[V2:.*]] = icmp ne ptr %[[V0]], null
++// CHECK-CXX: br i1 %[[V2]], label %[[RESIGN_NONNULL:.*]], label %[[RESIGN_CONT:.*]]
++
++// CHECK-CXX: [[RESIGN_NONNULL]]:
++// CHECK-CXX: %[[V3:.*]] = ptrtoint ptr %[[V0]] to i64
++// CHECK-CXX: %[[V4:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V3]], i32 0, i64 42, i32 0, i64 %[[V1]])
++// CHECK-CXX: %[[V5:.*]] = inttoptr i64 %[[V4]] to ptr
++// CHECK-CXX: br label %[[RESIGN_CONT]]
++
++// CHECK-CXX: [[RESIGN_CONT]]:
++// CHECK-CXX: %[[V6:.*]] = phi ptr [ null, %[[ENTRY]] ], [ %[[V5]], %[[RESIGN_NONNULL]] ]
++// CHECK-CXX: store ptr %[[V6]], ptr @_ZGR5f_ref_, align 8
++// CHECK-CXX: store ptr @_ZGR5f_ref_, ptr @f_ref, align 8
++
++// CHECK-CXX-LABEL: define {{.*}}void @test_const_ptr_ref_function_call()
++void test_const_ptr_ref_function_call(void) {
++  f_ref(1);
++
++  // CHECK-CXX: %[[V0:.*]] = load ptr, ptr @f_ref, align 8
++  // CHECK-CXX: %[[V1:.*]] = load ptr, ptr %[[V0]], align 8
++  // CHECK-CXX: %[[V2:.*]] = ptrtoint ptr %[[V0]] to i64
++  // CHECK-CXX: %[[V3:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V2]], i64 43)
++  // CHECK-CXX: call void %[[V1]](i32 noundef 1) [ "ptrauth"(i32 0, i64 %[[V3]]) ]
++}
++}
++#endif
+diff --git a/clang/test/CodeGen/ptrauth-qualifier-loadstore.c b/clang/test/CodeGen/ptrauth-qualifier-loadstore.c
+new file mode 100644
+index 000000000000..db259ed950fe
+--- /dev/null
++++ b/clang/test/CodeGen/ptrauth-qualifier-loadstore.c
+@@ -0,0 +1,745 @@
++// RUN: %clang_cc1 -fptrauth-function-pointer-type-discrimination -triple arm64-apple-ios -fptrauth-calls -fptrauth-intrinsics -emit-llvm %s  -o - | FileCheck %s
++// RUN: %clang_cc1 -fptrauth-function-pointer-type-discrimination -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -emit-llvm %s  -o - | FileCheck %s
++
++#define IQ __ptrauth(1,0,50)
++#define AQ __ptrauth(1,1,50)
++#define DIFF_IQ __ptrauth(1,0,100)
++#define DIFF_AQ __ptrauth(1,1,100)
++#define ZERO_IQ __ptrauth(1,0,0)
++#define ZERO_AQ __ptrauth(1,1,0)
++
++extern int external_int;
++extern int * global_upi;
++extern int * IQ global_iqpi;
++extern int * AQ global_aqpi;
++extern void use_upi(int *ptr);
++
++typedef void func_t(void);
++extern void external_func(void);
++extern func_t *global_upf;
++extern func_t * IQ global_iqpf;
++extern func_t * AQ global_aqpf;
++extern void use_upf(func_t *ptr);
++
++// Data with address-independent qualifiers.
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_i_constant()
++void test_store_data_i_constant() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.sign(i64 ptrtoint (ptr @external_int to i64), i32 1, i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * IQ iqpi = &external_int;
++// CHECK-NEXT:    [[T0:%.*]] = call i64 @llvm.ptrauth.sign(i64 ptrtoint (ptr @external_int to i64), i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T0]] to ptr
++// CHECK-NEXT:    store ptr [[SIGNED]], ptr [[V]],
++// CHECK-NEXT:    ret void
++  iqpi = &external_int;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_iu()
++void test_store_data_iu() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.sign(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * IQ iqpi = global_upi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.sign(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpi = global_upi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_ia()
++void test_store_data_ia() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * IQ iqpi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[RESULT:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[RESULT]], ptr [[V]],
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[RESULT]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[RESULT]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[RESULT:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upi(ptr noundef [[RESULT]])
++  use_upi(iqpi = global_aqpi);
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_ii_same()
++void test_store_data_ii_same() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    store ptr [[LOAD]], ptr [[V]],
++  int * IQ iqpi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    store ptr [[LOAD]], ptr [[V]],
++  iqpi = global_iqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_ii_different()
++void test_store_data_ii_different() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 100)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * DIFF_IQ iqpi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 100)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpi = global_iqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_ii_zero()
++void test_store_data_ii_zero() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 0)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * ZERO_IQ iqpi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr [[V]]
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 0, i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr @global_iqpi,
++  global_iqpi = iqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_load_data_i()
++void test_load_data_i() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int *upi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  upi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 50)
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upi(ptr noundef [[T0]])
++  use_upi(global_iqpi);
++}
++
++// Data with address-discriminated qualifiers.
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_a_constant()
++void test_store_data_a_constant() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.sign(i64 ptrtoint (ptr @external_int to i64), i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * AQ aqpi = &external_int;
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.sign(i64 ptrtoint (ptr @external_int to i64), i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpi = &external_int;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_au()
++void test_store_data_au() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upi,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.sign(i64 [[T0]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * AQ aqpi = global_upi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upi,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.sign(i64 [[T0]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpi = global_upi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_ai()
++void test_store_data_ai() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * AQ aqpi = global_iqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpi,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpi = global_iqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_aa_same()
++void test_store_data_aa_same() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * AQ aqpi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpi = global_aqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_aa_different()
++void test_store_data_aa_different() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 100)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * DIFF_AQ aqpi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 100)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpi = global_aqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_data_aa_zero()
++void test_store_data_aa_zero() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[NEWDISC:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int * ZERO_AQ aqpi = global_aqpi;
++// CHECK:         [[LOAD:%.*]] = load ptr, ptr [[V]],
++// CHECK-NEXT:    [[OLDDISC:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr @global_aqpi,
++  global_aqpi = aqpi;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_load_data_a()
++void test_load_data_a() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 [[OLDDISC]])
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  int *upi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 [[OLDDISC]])
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  upi = global_aqpi;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpi,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpi to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.auth(i64 [[T0]], i32 1, i64 [[OLDDISC]])
++// CHECK-NEXT:    [[AUTHED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[AUTHED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upi(ptr noundef [[T0]])
++  use_upi(global_aqpi);
++}
++
++// Function with address-independent qualifiers.
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_i_constant()
++void test_store_function_i_constant() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.resign(i64 ptrtoint (ptr ptrauth (ptr @external_func, i32 0, i64 18983) to i64), i32 0, i64 18983, i32 1, i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * IQ iqpf = &external_func;
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.resign(i64 ptrtoint (ptr ptrauth (ptr @external_func, i32 0, i64 18983) to i64), i32 0, i64 18983, i32 1, i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpf = &external_func;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_iu()
++void test_store_function_iu() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 0, i64 18983, i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * IQ iqpf = global_upf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 0, i64 18983, i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpf = global_upf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_ia()
++void test_store_function_ia() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * IQ iqpf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 50)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[RESULT:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[RESULT]], ptr [[V]],
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[RESULT]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[RESULT]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upf(ptr noundef [[T0]])
++  use_upf(iqpf = global_aqpf);
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_ii_same()
++void test_store_function_ii_same() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    store ptr [[LOAD]], ptr [[V]],
++  func_t * IQ iqpf = global_iqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    store ptr [[LOAD]], ptr [[V]],
++  iqpf = global_iqpf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_ii_different()
++void test_store_function_ii_different() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 100)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * DIFF_IQ iqpf = global_iqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 100)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  iqpf = global_iqpf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_load_function_i()
++void test_load_function_i() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t *upf = global_iqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  upf = global_iqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upf(ptr noundef [[T0]])
++  use_upf(global_iqpf);
++}
++
++// Function with address-discriminated qualifiers.
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_a_constant()
++void test_store_function_a_constant() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.resign(i64 ptrtoint (ptr ptrauth (ptr @external_func, i32 0, i64 18983) to i64), i32 0, i64 18983, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * AQ aqpf = &external_func;
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[SIGN:%.*]] = call i64 @llvm.ptrauth.resign(i64 ptrtoint (ptr ptrauth (ptr @external_func, i32 0, i64 18983) to i64), i32 0, i64 18983, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[T0:%.*]] = inttoptr i64 [[SIGN]] to ptr
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpf = &external_func;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_au()
++void test_store_function_au() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upf,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 0, i64 18983, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * AQ aqpf = global_upf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_upf,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 0, i64 18983, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpf = global_upf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_ai()
++void test_store_function_ai() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * AQ aqpf = global_iqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_iqpf,
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 50, i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpf = global_iqpf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_aa_same()
++void test_store_function_aa_same() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * AQ aqpf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpf = global_aqpf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_store_function_aa_different()
++void test_store_function_aa_different() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 100)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t * DIFF_AQ aqpf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = ptrtoint ptr [[V]] to i64
++// CHECK-NEXT:    [[NEWDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 [[T0]], i64 100)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 1, i64 [[NEWDISC]])
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  aqpf = global_aqpf;
++}
++
++// CHECK-LABEL: define {{.*}}void @test_load_function_a()
++void test_load_function_a() {
++// CHECK:         [[V:%.*]] = alloca ptr,
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  func_t *upf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    store ptr [[T0]], ptr [[V]],
++  upf = global_aqpf;
++// CHECK-NEXT:    [[LOAD:%.*]] = load ptr, ptr @global_aqpf,
++// CHECK-NEXT:    [[OLDDISC:%.*]] = call i64 @llvm.ptrauth.blend(i64 ptrtoint (ptr @global_aqpf to i64), i64 50)
++// CHECK-NEXT:    [[T0:%.*]] = icmp ne ptr [[LOAD]], null
++// CHECK-NEXT:    br i1 [[T0]],
++// CHECK:         [[T0:%.*]] = ptrtoint ptr [[LOAD]] to i64
++// CHECK-NEXT:    [[T1:%.*]] = call i64 @llvm.ptrauth.resign(i64 [[T0]], i32 1, i64 [[OLDDISC]], i32 0, i64 18983)
++// CHECK-NEXT:    [[SIGNED:%.*]] = inttoptr i64 [[T1]] to ptr
++// CHECK-NEXT:    br label
++// CHECK:         [[T0:%.*]] = phi ptr [ null, {{.*}} ], [ [[SIGNED]], {{.*}} ]
++// CHECK-NEXT:    call void @use_upf(ptr noundef [[T0]])
++  use_upf(global_aqpf);
++}
+diff --git a/clang/test/CodeGenCXX/mangle-itanium-ptrauth.cpp b/clang/test/CodeGenCXX/mangle-itanium-ptrauth.cpp
+new file mode 100644
+index 000000000000..88d80423c376
+--- /dev/null
++++ b/clang/test/CodeGenCXX/mangle-itanium-ptrauth.cpp
+@@ -0,0 +1,12 @@
++// RUN: %clang_cc1 -std=c++11 -fptrauth-intrinsics -fptrauth-calls -emit-llvm -o - -triple=arm64-apple-ios %s | FileCheck %s
++// RUN: %clang_cc1 -std=c++11 -fptrauth-intrinsics -fptrauth-calls -emit-llvm -o - -triple=aarch64-linux-gnu %s | FileCheck %s
++
++// CHECK: define {{.*}}void @_Z3fooPU9__ptrauthILj3ELb1ELj234EEPi(
++void foo(int * __ptrauth(3, 1, 234) *) {}
++
++template <class T>
++void foo(T t) {}
++
++// CHECK: define weak_odr void @_Z3fooIPU9__ptrauthILj1ELb0ELj64EEPiEvT_(
++template void foo<int * __ptrauth(1, 0, 64) *>(int * __ptrauth(1, 0, 64) *);
++
+diff --git a/clang/test/CodeGenCXX/mangle-ms-ptrauth.cpp b/clang/test/CodeGenCXX/mangle-ms-ptrauth.cpp
+new file mode 100644
+index 000000000000..95e5efa472df
+--- /dev/null
++++ b/clang/test/CodeGenCXX/mangle-ms-ptrauth.cpp
+@@ -0,0 +1,17 @@
++// RUN: %clang_cc1 -std=c++11 -fptrauth-intrinsics -fptrauth-calls -emit-llvm -o - -triple=aarch64-windows-msvc %s | FileCheck %s
++
++template <class T>
++struct S {};
++
++// CHECK: @"?s@@3U?$S@PE__ptrauth1A@ENC@AH@@A" =
++S<int * __ptrauth(2, 0, 1234)> s;
++
++// CHECK: define dso_local void @"?foo@@YAXPEAPE__ptrauth20OK@AH@Z"(
++void foo(int * __ptrauth(3, 1, 234) *) {}
++
++template <class T>
++void foo(T t) {}
++
++// CHECK: define weak_odr dso_local void @"??$foo@PEAPE__ptrauth0A@EA@AH@@YAXPEAPE__ptrauth0A@EA@AH@Z"(
++template void foo<int * __ptrauth(1, 0, 64) *>(int * __ptrauth(1, 0, 64) *);
++
+diff --git a/clang/test/CodeGenCXX/ptrauth-qualifier-struct.cpp b/clang/test/CodeGenCXX/ptrauth-qualifier-struct.cpp
+new file mode 100644
+index 000000000000..7d6de50d926b
+--- /dev/null
++++ b/clang/test/CodeGenCXX/ptrauth-qualifier-struct.cpp
+@@ -0,0 +1,168 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fptrauth-calls -fptrauth-intrinsics -std=c++11 -emit-llvm %s  -o - | FileCheck -check-prefixes=CHECK,IOS %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fptrauth-calls -fptrauth-intrinsics -std=c++11 -emit-llvm %s  -o - | FileCheck %s
++
++#define AQ __ptrauth(1,1,50)
++#define IQ __ptrauth(1,0,50)
++
++// CHECK: %[[STRUCT_SA:.*]] = type { ptr, ptr }
++// CHECK: %[[STRUCT_SI:.*]] = type { ptr }
++
++struct SA {
++  int * AQ m0; // Signed using address discrimination.
++  int * AQ m1; // Signed using address discrimination.
++};
++
++struct SI {
++  int * IQ m; // No address discrimination.
++};
++
++struct __attribute__((trivial_abi)) TrivialSA {
++  int * AQ m0; // Signed using address discrimination.
++  int * AQ m1; // Signed using address discrimination.
++};
++
++// Check that TrivialSA is passed indirectly despite being annotated with
++// 'trivial_abi'.
++
++// CHECK: define {{.*}}void @_Z18testParamTrivialSA9TrivialSA(ptr noundef %{{.*}})
++
++void testParamTrivialSA(TrivialSA a) {
++}
++
++// CHECK: define {{.*}}void @_Z19testCopyConstructor2SA(ptr
++// CHECK: call {{.*}}@_ZN2SAC1ERKS_(
++
++// CHECK: define linkonce_odr {{.*}}@_ZN2SAC1ERKS_(
++// CHECK: call {{.*}}@_ZN2SAC2ERKS_(
++
++void testCopyConstructor(SA a) {
++  SA t = a;
++}
++
++// CHECK: define {{.*}}void @_Z19testMoveConstructor2SA(ptr
++// CHECK: call {{.*}}@_ZN2SAC1EOS_(
++
++// CHECK: define linkonce_odr {{.*}}@_ZN2SAC1EOS_(
++// CHECK: call {{.*}}@_ZN2SAC2EOS_(
++
++void testMoveConstructor(SA a) {
++  SA t = static_cast<SA &&>(a);
++}
++
++// CHECK: define {{.*}}void @_Z18testCopyAssignment2SA(ptr
++// CHECK: call noundef nonnull align 8 dereferenceable(16) ptr @_ZN2SAaSERKS_(
++
++// CHECK: define {{.*}}linkonce_odr noundef nonnull align 8 dereferenceable(16) ptr @_ZN2SAaSERKS_(ptr noundef nonnull align 8 dereferenceable(16) %[[THIS:.*]], ptr noundef nonnull align 8 dereferenceable(16) %0)
++// CHECK: %[[THIS_ADDR:.*]] = alloca ptr, align 8
++// CHECK: %[[_ADDR:.*]] = alloca ptr, align 8
++// CHECK: store ptr %[[THIS]], ptr %[[THIS_ADDR]], align 8
++// CHECK: store ptr %[[V0:.*]], ptr %[[_ADDR]], align 8
++// CHECK: %[[THISI:.*]] = load ptr, ptr %[[THIS_ADDR]], align 8
++// CHECK: %[[M0:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[THISI]], i32 0, i32 0
++// CHECK: %[[V1:.*]] = load ptr, ptr %[[_ADDR]], align 8
++// CHECK: %[[M02:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[V1]], i32 0, i32 0
++// CHECK: %[[V2:.*]] = load ptr, ptr %[[M02]], align 8
++// CHECK: %[[V3:.*]] = ptrtoint ptr %[[M02]] to i64
++// CHECK: %[[V4:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V3]], i64 50)
++// CHECK: %[[V5:.*]] = ptrtoint ptr %[[M0]] to i64
++// CHECK: %[[V6:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V5]], i64 50)
++// CHECK: %[[V8:.*]] = ptrtoint ptr %[[V2]] to i64
++// CHECK: %[[V9:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V8]], i32 1, i64 %[[V4]], i32 1, i64 %[[V6]])
++
++void testCopyAssignment(SA a) {
++  SA t;
++  t = a;
++}
++
++// CHECK: define {{.*}}void @_Z18testMoveAssignment2SA(ptr
++// CHECK: call noundef nonnull align 8 dereferenceable(16) ptr @_ZN2SAaSEOS_(
++
++// CHECK: define {{.*}}linkonce_odr noundef nonnull align 8 dereferenceable(16) ptr @_ZN2SAaSEOS_(ptr noundef nonnull align 8 dereferenceable(16) %[[THIS:.*]], ptr noundef nonnull align 8 dereferenceable(16) %0)
++// CHECK: %[[THIS_ADDR:.*]] = alloca ptr, align 8
++// CHECK: %[[_ADDR:.*]] = alloca ptr, align 8
++// CHECK: store ptr %[[THIS]], ptr %[[THIS_ADDR]], align 8
++// CHECK: store ptr %[[V0:.*]], ptr %[[_ADDR]], align 8
++// CHECK: %[[THISI:.*]] = load ptr, ptr %[[THIS_ADDR]], align 8
++// CHECK: %[[M0:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[THISI]], i32 0, i32 0
++// CHECK: %[[V1:.*]] = load ptr, ptr %[[_ADDR]], align 8
++// CHECK: %[[M02:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[V1]], i32 0, i32 0
++// CHECK: %[[V2:.*]] = load ptr, ptr %[[M02]], align 8
++// CHECK: %[[V3:.*]] = ptrtoint ptr %[[M02]] to i64
++// CHECK: %[[V4:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V3]], i64 50)
++// CHECK: %[[V5:.*]] = ptrtoint ptr %[[M0]] to i64
++// CHECK: %[[V6:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V5]], i64 50)
++// CHECK: %[[V8:.*]] = ptrtoint ptr %[[V2]] to i64
++// CHECK: %[[V9:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V8]], i32 1, i64 %[[V4]], i32 1, i64 %[[V6]])
++
++void testMoveAssignment(SA a) {
++  SA t;
++  t = static_cast<SA &&>(a);
++}
++
++// CHECK: define {{.*}}void @_Z19testCopyConstructor2SI(i
++// CHECK: call void @llvm.memcpy.p0.p0.i64(
++
++void testCopyConstructor(SI a) {
++  SI t = a;
++}
++
++// CHECK: define {{.*}}void @_Z19testMoveConstructor2SI(
++// CHECK: call void @llvm.memcpy.p0.p0.i64(
++
++void testMoveConstructor(SI a) {
++  SI t = static_cast<SI &&>(a);
++}
++
++// CHECK: define {{.*}}void @_Z18testCopyAssignment2SI(
++// CHECK: call void @llvm.memcpy.p0.p0.i64(
++
++void testCopyAssignment(SI a) {
++  SI t;
++  t = a;
++}
++
++// CHECK: define {{.*}}void @_Z18testMoveAssignment2SI(
++// CHECK: call void @llvm.memcpy.p0.p0.i64(
++
++void testMoveAssignment(SI a) {
++  SI t;
++  t = static_cast<SI &&>(a);
++}
++
++// CHECK: define linkonce_odr {{.*}}@_ZN2SAC2ERKS_(ptr noundef nonnull align 8 dereferenceable(16) %[[THIS:.*]], ptr noundef nonnull align 8 dereferenceable(16) %0)
++// IOS: %[[RETVAL:.*]] = alloca ptr, align 8
++// CHECK: %[[THIS_ADDR:.*]] = alloca ptr, align 8
++// CHECK: %[[_ADDR:.*]] = alloca ptr, align 8
++// CHECK: store ptr %[[THIS]], ptr %[[THIS_ADDR]], align 8
++// CHECK: store ptr %[[V0:.*]], ptr %[[_ADDR]], align 8
++// CHECK: %[[THIS1:.*]] = load ptr, ptr %[[THIS_ADDR]], align 8
++// IOS: store ptr %[[THIS1]], ptr %[[RETVAL]], align 8
++// CHECK: %[[M0:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[THIS1]], i32 0, i32 0
++// CHECK: %[[V1:.*]] = load ptr, ptr %[[_ADDR]], align 8
++// CHECK: %[[M02:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[V1]], i32 0, i32 0
++// CHECK: %[[V2:.*]] = load ptr, ptr %[[M02]], align 8
++// CHECK: %[[V3:.*]] = ptrtoint ptr %[[M02]] to i64
++// CHECK: %[[V4:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V3]], i64 50)
++// CHECK: %[[V5:.*]] = ptrtoint ptr %[[M0]] to i64
++// CHECK: %[[V6:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V5]], i64 50)
++// CHECK: %[[V8:.*]] = ptrtoint ptr %[[V2]] to i64
++// CHECK: %[[V9:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V8]], i32 1, i64 %[[V4]], i32 1, i64 %[[V6]])
++
++// CHECK: define linkonce_odr {{.*}}@_ZN2SAC2EOS_(ptr noundef nonnull align 8 dereferenceable(16) %[[THIS:.*]], ptr noundef nonnull align 8 dereferenceable(16) %0)
++// IOS: %[[RETVAL:.*]] = alloca ptr, align 8
++// CHECK: %[[THIS_ADDR:.*]] = alloca ptr, align 8
++// CHECK: %[[_ADDR:.*]] = alloca ptr, align 8
++// CHECK: store ptr %[[THIS]], ptr %[[THIS_ADDR]], align 8
++// CHECK: store ptr %[[V0:.*]], ptr %[[_ADDR]], align 8
++// CHECK: %[[THIS1:.*]] = load ptr, ptr %[[THIS_ADDR]], align 8
++// IOS: store ptr %[[THIS1]], ptr %[[RETVAL]], align 8
++// CHECK: %[[M0:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[THIS1]], i32 0, i32 0
++// CHECK: %[[V1:.*]] = load ptr, ptr %[[_ADDR]], align 8
++// CHECK: %[[M02:.*]] = getelementptr inbounds nuw %[[STRUCT_SA]], ptr %[[V1]], i32 0, i32 0
++// CHECK: %[[V2:.*]] = load ptr, ptr %[[M02]], align 8
++// CHECK: %[[V3:.*]] = ptrtoint ptr %[[M02]] to i64
++// CHECK: %[[V4:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V3]], i64 50)
++// CHECK: %[[V5:.*]] = ptrtoint ptr %[[M0]] to i64
++// CHECK: %[[V6:.*]] = call i64 @llvm.ptrauth.blend(i64 %[[V5]], i64 50)
++// CHECK: %[[V8:.*]] = ptrtoint ptr %[[V2]] to i64
++// CHECK: %[[V9:.*]] = call i64 @llvm.ptrauth.resign(i64 %[[V8]], i32 1, i64 %[[V4]], i32 1, i64 %[[V6]])
+diff --git a/clang/test/CodeGenObjCXX/ptrauth-struct-cxx-abi.mm b/clang/test/CodeGenObjCXX/ptrauth-struct-cxx-abi.mm
+new file mode 100644
+index 000000000000..e5cb71bad47c
+--- /dev/null
++++ b/clang/test/CodeGenObjCXX/ptrauth-struct-cxx-abi.mm
+@@ -0,0 +1,35 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios11 -fptrauth-calls -fptrauth-intrinsics -std=c++11 -fobjc-arc -emit-llvm -o - %s | FileCheck %s
++
++#define AQ __ptrauth(1,1,50)
++
++struct AddrDiscStrong0 {
++  int * AQ f0; // Signed using address discrimination.
++  __strong id f1;
++};
++
++struct AddrDiscStrong1 {
++  AddrDiscStrong1(const AddrDiscStrong1 &);
++  int * AQ f0; // Signed using address discrimination.
++  __strong id f1;
++};
++
++// Check that AddrDiscStrong0 is destructed in the callee.
++
++// CHECK: define void @_Z24testParamAddrDiscStrong015AddrDiscStrong0(ptr noundef %[[A:.*]])
++// CHECK: call noundef ptr @_ZN15AddrDiscStrong0D1Ev(ptr noundef nonnull align {{[0-9]+}} dereferenceable(16) %[[A]])
++// CHECK: ret void
++
++// CHECK: define linkonce_odr noundef ptr @_ZN15AddrDiscStrong0D1Ev(
++
++void testParamAddrDiscStrong0(AddrDiscStrong0 a) {
++}
++
++// Check that AddrDiscStrong1 is not destructed in the callee because it has a
++// non-trivial copy constructor.
++
++// CHECK: define void @_Z24testParamAddrDiscStrong115AddrDiscStrong1(ptr noundef %{{.*}})
++// CHECK-NOT: call
++// CHECK: ret void
++
++void testParamAddrDiscStrong1(AddrDiscStrong1 a) {
++}
+diff --git a/clang/test/Parser/ptrauth-qualifier.c b/clang/test/Parser/ptrauth-qualifier.c
+new file mode 100644
+index 000000000000..2071ac6c2d66
+--- /dev/null
++++ b/clang/test/Parser/ptrauth-qualifier.c
+@@ -0,0 +1,18 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fsyntax-only -verify -fptrauth-intrinsics %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fsyntax-only -verify -fptrauth-intrinsics %s
++
++#if __aarch64__
++#define VALID_DATA_KEY 2
++#else
++#error Provide these constants if you port this test
++#endif
++
++int * __ptrauth(VALID_DATA_KEY) valid0;
++
++typedef int *intp;
++
++int nonConstantGlobal = 5;
++
++__ptrauth int invalid0; // expected-error{{expected '('}}
++__ptrauth() int invalid1; // expected-error{{expected expression}}
++int * __ptrauth(VALID_DATA_KEY, 1, 1000, 12) invalid12; // expected-error{{qualifier must take between 1 and 3 arguments}}
+diff --git a/clang/test/Preprocessor/ptrauth_extension.c b/clang/test/Preprocessor/ptrauth_extension.c
+new file mode 100644
+index 000000000000..d6b79187ba62
+--- /dev/null
++++ b/clang/test/Preprocessor/ptrauth_extension.c
+@@ -0,0 +1,13 @@
++// RUN: %clang_cc1 -E %s -triple=aarch64 -fptrauth-intrinsics | \
++// RUN:   FileCheck %s --check-prefixes=INTRIN
++
++// RUN: %clang_cc1 -E %s -triple=aarch64 -fptrauth-calls | \
++// RUN:   FileCheck %s --check-prefixes=NOINTRIN
++
++#if __has_extension(ptrauth_qualifier)
++// INTRIN: has_ptrauth_qualifier
++void has_ptrauth_qualifier() {}
++#else
++// NOINTRIN: no_ptrauth_qualifier
++void no_ptrauth_qualifier() {}
++#endif
+diff --git a/clang/test/Sema/ptrauth-atomic-ops.c b/clang/test/Sema/ptrauth-atomic-ops.c
+new file mode 100644
+index 000000000000..ccb9a1abcc14
+--- /dev/null
++++ b/clang/test/Sema/ptrauth-atomic-ops.c
+@@ -0,0 +1,118 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fsyntax-only -verify -fptrauth-intrinsics %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fsyntax-only -verify -fptrauth-intrinsics %s
++
++#include <stdatomic.h>
++
++int i;
++int *__ptrauth(2, 1, 100) authenticated_ptr = &i;
++int *__ptrauth(2, 0, 200) non_addr_discriminatedauthenticated_ptr = &i;
++int * wat = &i;
++#define ATOMIZE(p) (__typeof__(p) volatile _Atomic *)(long)(&p)
++
++void f() {
++  static int j = 1;
++  __c11_atomic_init(ATOMIZE(authenticated_ptr), 5);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_store(ATOMIZE(authenticated_ptr), 0, memory_order_relaxed);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_load(ATOMIZE(authenticated_ptr), memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_store(ATOMIZE(authenticated_ptr), 1, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_store_n(ATOMIZE(authenticated_ptr), 4, memory_order_release);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_store(ATOMIZE(authenticated_ptr), j, memory_order_release);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_exchange(ATOMIZE(authenticated_ptr), 1, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_exchange(ATOMIZE(authenticated_ptr), &j, &j, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_fetch_add(ATOMIZE(authenticated_ptr), 1, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_add(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_sub(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_min(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_max(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __c11_atomic_fetch_and(ATOMIZE(authenticated_ptr), 1, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_and(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_or(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++  __atomic_fetch_xor(ATOMIZE(authenticated_ptr), 3, memory_order_seq_cst);
++  // expected-error@-1 {{address argument to atomic operation must be a pointer to a non address discriminated type ('volatile __ptrauth(2,1,100) _Atomic(int *) *' invalid)}}
++
++  __c11_atomic_init(ATOMIZE(non_addr_discriminatedauthenticated_ptr), &j);
++  __c11_atomic_store(ATOMIZE(non_addr_discriminatedauthenticated_ptr), 0, memory_order_relaxed);
++  __c11_atomic_load(ATOMIZE(non_addr_discriminatedauthenticated_ptr), memory_order_seq_cst);
++  __atomic_store(&j, ATOMIZE(non_addr_discriminatedauthenticated_ptr), memory_order_release);
++  // expected-warning@-1 {{incompatible pointer types passing 'volatile __ptrauth(2,0,200) _Atomic(int *) *' to parameter of type 'int *'}}
++  __c11_atomic_exchange(ATOMIZE(j), ATOMIZE(non_addr_discriminatedauthenticated_ptr), memory_order_seq_cst);
++  // expected-error@-1 {{incompatible pointer to integer conversion passing 'volatile __ptrauth(2,0,200) _Atomic(int *) *' to parameter of type 'typeof (j)' (aka 'int')}}
++  __c11_atomic_fetch_add(ATOMIZE(non_addr_discriminatedauthenticated_ptr), ATOMIZE(j), memory_order_seq_cst);
++  // expected-error@-1 {{incompatible pointer to integer conversion passing 'volatile _Atomic(typeof (j)) *' to parameter of type 'long'}}
++  __c11_atomic_fetch_and(ATOMIZE(j), ATOMIZE(non_addr_discriminatedauthenticated_ptr), memory_order_seq_cst);
++  // expected-error@-1 {{incompatible pointer to integer conversion passing 'volatile __ptrauth(2,0,200) _Atomic(int *) *' to parameter of type 'typeof (j)' (aka 'int')}}
++
++
++  __sync_fetch_and_add(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_fetch_and_sub(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_fetch_and_or(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_fetch_and_and(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_fetch_and_xor(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_fetch_and_nand(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++
++  __sync_add_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_sub_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_or_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_and_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_xor_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_nand_and_fetch(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++
++  __sync_bool_compare_and_swap(&authenticated_ptr, 1, 0);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_val_compare_and_swap(&authenticated_ptr, 1, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++
++  __sync_lock_test_and_set(&authenticated_ptr, 1);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++  __sync_lock_release(&authenticated_ptr);
++  // expected-error@-1 {{address argument to __sync operation must be a pointer to a non address discriminated type ('int *__ptrauth(2,1,100)' invalid)}}
++
++
++int i = 0;
++
++  __sync_fetch_and_add(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_fetch_and_sub(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_fetch_and_or(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_fetch_and_and(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_fetch_and_xor(&non_addr_discriminatedauthenticated_ptr, &i);
++
++  __sync_add_and_fetch(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_sub_and_fetch(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_or_and_fetch(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_and_and_fetch(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_xor_and_fetch(&non_addr_discriminatedauthenticated_ptr, &i);
++
++  __sync_bool_compare_and_swap(&non_addr_discriminatedauthenticated_ptr, &i, &i);
++  __sync_val_compare_and_swap(&non_addr_discriminatedauthenticated_ptr, &i, &i);
++
++  __sync_lock_test_and_set(&non_addr_discriminatedauthenticated_ptr, &i);
++  __sync_lock_release(&non_addr_discriminatedauthenticated_ptr);
++}
+diff --git a/clang/test/Sema/ptrauth-qualifier.c b/clang/test/Sema/ptrauth-qualifier.c
+new file mode 100644
+index 000000000000..99d16b062ca6
+--- /dev/null
++++ b/clang/test/Sema/ptrauth-qualifier.c
+@@ -0,0 +1,103 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -std=c23 -fsyntax-only -verify -fptrauth-intrinsics %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -std=c23 -fsyntax-only -verify -fptrauth-intrinsics %s
++
++#if __has_feature(ptrauth_qualifier)
++#warning __ptrauth qualifier enabled!
++// expected-warning@-1 {{__ptrauth qualifier enabled!}}
++#endif
++
++#if __aarch64__
++#define VALID_CODE_KEY 0
++#define VALID_DATA_KEY 2
++#define INVALID_KEY 200
++#else
++#error Provide these constants if you port this test
++#endif
++
++int * __ptrauth(VALID_DATA_KEY) valid0;
++int *ptr0;
++
++typedef int *intp;
++
++int nonConstantGlobal = 5;
++
++__ptrauth(INVALID_KEY) int invalid2; // expected-error{{200 does not identify a valid pointer authentication key for the current target}}
++__ptrauth(VALID_DATA_KEY) int invalid3; // expected-error {{'__ptrauth' qualifier only applies to pointer types; 'int' is invalid}}
++__ptrauth(VALID_DATA_KEY) int *invalid4; // expected-error {{'__ptrauth' qualifier only applies to pointer types; 'int' is invalid}}
++int * (__ptrauth(VALID_DATA_KEY) invalid5); // expected-error{{expected identifier or '('}} expected-error{{expected ')'}} expected-note {{to match this '('}}
++int *__ptrauth(VALID_DATA_KEY) __ptrauth(VALID_DATA_KEY) invalid6; // expected-error{{type 'int *__ptrauth(2,0,0)' is already __ptrauth-qualified}}
++int * __ptrauth(VALID_DATA_KEY, 2) invalid7; // expected-error {{invalid address discrimination flag '2'; '__ptrauth' requires '0' or '1'}}
++int * __ptrauth(VALID_DATA_KEY, -1) invalid8; // expected-error {{invalid address discrimination flag '-1'; '__ptrauth' requires '0' or '1'}}
++int * __ptrauth(VALID_DATA_KEY, 1, -1) invalid9; // expected-error {{invalid extra discriminator flag '-1'; '__ptrauth' requires a value between '0' and '65535'}}
++int * __ptrauth(VALID_DATA_KEY, 1, 100000) invalid10; // expected-error {{invalid extra discriminator flag '100000'; '__ptrauth' requires a value between '0' and '65535'}}
++int * __ptrauth(VALID_DATA_KEY, 1, nonConstantGlobal) invalid12; // expected-error {{argument to '__ptrauth' must be an integer constant expression}}
++int * __ptrauth(VALID_DATA_KEY, nonConstantGlobal, 1000) invalid13; // expected-error {{argument to '__ptrauth' must be an integer constant expression}}
++int * __ptrauth(nonConstantGlobal, 1, 1000) invalid14; // expected-error{{expression is not an integer constant expression}}
++
++int * __ptrauth(VALID_DATA_KEY) valid0;
++int * __ptrauth(VALID_DATA_KEY) *valid1;
++__ptrauth(VALID_DATA_KEY) intp valid2;
++__ptrauth(VALID_DATA_KEY) intp *valid3;
++intp __ptrauth(VALID_DATA_KEY) valid4;
++intp __ptrauth(VALID_DATA_KEY) *valid5;
++int * __ptrauth(VALID_DATA_KEY, 0) valid6;
++int * __ptrauth(VALID_DATA_KEY, 1) valid7;
++int * __ptrauth(VALID_DATA_KEY, (_Bool) 1) valid8;
++int * __ptrauth(VALID_DATA_KEY, 1, 0) valid9;
++int * __ptrauth(VALID_DATA_KEY, 1, 65535) valid10;
++
++int * __ptrauth(VALID_DATA_KEY) array0[10];
++int (* __ptrauth(VALID_DATA_KEY) array1)[10];
++
++extern intp redeclaration0; // expected-note {{previous declaration}}
++extern intp __ptrauth(VALID_DATA_KEY) redeclaration0; // expected-error{{redeclaration of 'redeclaration0' with a different type: '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)') vs 'intp' (aka 'int *')}}
++
++extern intp redeclaration1; // expected-note {{previous declaration}}
++extern intp __ptrauth(VALID_DATA_KEY) redeclaration1; // expected-error{{redeclaration of 'redeclaration1' with a different type: '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)') vs 'intp' (aka 'int *')}}
++
++intp __ptrauth(VALID_DATA_KEY) redeclaration2; // expected-note {{previous definition}}
++intp redeclaration2 = 0;                       // expected-error{{redefinition of 'redeclaration2' with a different type: 'intp' (aka 'int *') vs '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')}}
++
++intp __ptrauth(VALID_DATA_KEY) redeclaration3; // expected-note {{previous definition}}
++intp redeclaration3 = 0;                       // expected-error{{redefinition of 'redeclaration3' with a different type: 'intp' (aka 'int *') vs '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')}}
++
++void illegal0(intp __ptrauth(VALID_DATA_KEY)); // expected-error {{parameter type may not be qualified with '__ptrauth'; type is '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')}}
++intp __ptrauth(VALID_DATA_KEY) illegal1(void); // expected-error {{return type may not be qualified with '__ptrauth'; type is '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')}}
++
++static_assert(_Generic(typeof(valid0), int * __ptrauth(VALID_DATA_KEY) : 1, int * : 0, default : 0));
++static_assert(_Generic(typeof(valid0), int * __ptrauth(VALID_CODE_KEY) : 0, default : 1));
++static_assert(_Generic(typeof_unqual(valid0), int * __ptrauth(VALID_DATA_KEY) : 0, int * : 1, default : 0));
++static_assert(_Generic(valid0, int * __ptrauth(VALID_DATA_KEY) : 0, int * : 1, default : 0)); // expected-warning {{association of type 'int *__ptrauth(2,0,0)' will never be selected}}
++
++static_assert(_Generic(array0, int * __ptrauth(VALID_DATA_KEY) * : 1, default : 0));
++static_assert(_Generic(*array1, int * : 1, default : 0));
++
++void test_code(intp p) {
++  p = (intp __ptrauth(VALID_DATA_KEY)) 0; // expected-error {{cannot cast to '__ptrauth'-qualified type '__ptrauth(2,0,0) intp' (aka 'int *__ptrauth(2,0,0)')}}
++
++  __ptrauth(VALID_DATA_KEY) intp pSpecial = p;
++  pSpecial = p;
++  intp pNormal = pSpecial;
++  pNormal = pSpecial;
++
++  intp __ptrauth(VALID_DATA_KEY) *ppSpecial0 = &pSpecial;
++  intp __ptrauth(VALID_DATA_KEY) *ppSpecial1 = &pNormal; // expected-error {{initializing '__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') with an expression of type 'intp *' (aka 'int **') changes pointer authentication of pointee type}}
++  intp *ppNormal0 = &pSpecial; // expected-error {{initializing 'intp *' (aka 'int **') with an expression of type '__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') changes pointer authentication of pointee type}}
++  intp *ppNormal1 = &pNormal;
++
++  intp *pp5 = (p ? &pSpecial : &pNormal); // expected-error {{'__ptrauth' qualification mismatch ('__ptrauth(2,0,0) intp *' (aka 'int *__ptrauth(2,0,0) *') and 'intp *' (aka 'int **'))}}
++}
++
++void test_array(void) {
++  intp __ptrauth(VALID_DATA_KEY) pSpecialArray[10];
++  intp __ptrauth(VALID_DATA_KEY) *ppSpecial0 = pSpecialArray;
++  intp __ptrauth(VALID_DATA_KEY) *ppSpecial1 = &pSpecialArray[0];
++}
++
++__attribute__((overloadable)) int overload_func(int **);
++__attribute__((overloadable)) float overload_func(int * __ptrauth(VALID_DATA_KEY) *);
++
++static_assert(_Generic(typeof(overload_func(&ptr0)), int : 1, default : 0));
++static_assert(_Generic(typeof(overload_func(&valid0)), float : 1, default : 0));
++
++void func(int array[__ptrauth(VALID_DATA_KEY) 10]); // expected-error {{'__ptrauth' qualifier only applies to pointer types; 'int[10]' is invalid}}
+diff --git a/clang/test/SemaCXX/ptrauth-qualifier.cpp b/clang/test/SemaCXX/ptrauth-qualifier.cpp
+new file mode 100644
+index 000000000000..a7dc6ae2ffe8
+--- /dev/null
++++ b/clang/test/SemaCXX/ptrauth-qualifier.cpp
+@@ -0,0 +1,213 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -std=c++20  -fptrauth-calls -fptrauth-intrinsics -verify -fsyntax-only %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -std=c++20  -fptrauth-calls -fptrauth-intrinsics -verify -fsyntax-only %s
++
++#define AQ __ptrauth(1,1,50)
++#define AQ2 __ptrauth(1,1,51)
++#define IQ __ptrauth(1,0,50)
++
++struct __attribute__((trivial_abi)) AddrDisc { // expected-warning {{'trivial_abi' cannot be applied to 'AddrDisc'}} expected-note {{'trivial_abi' is disallowed on 'AddrDisc' because it has an address-discriminated '__ptrauth' field}}
++  int * AQ m0;
++};
++
++struct __attribute__((trivial_abi)) NoAddrDisc {
++  int * IQ m0;
++};
++
++namespace test_union {
++
++  union U0 {
++    int * AQ f0; // expected-note 4 {{'U0' is implicitly deleted because variant field 'f0' has an address-discriminated '__ptrauth' qualifier}}
++
++    // ptrauth fields that don't have an address-discriminated qualifier don't
++    // delete the special functions.
++    int * IQ f1;
++  };
++
++  union U1 {
++    int * AQ f0; // expected-note 8 {{'U1' is implicitly deleted because variant field 'f0' has an address-discriminated '__ptrauth' qualifier}}
++    U1() = default;
++    ~U1() = default;
++    U1(const U1 &) = default; // expected-warning {{explicitly defaulted copy constructor is implicitly deleted}} expected-note 2 {{explicitly defaulted function was implicitly deleted here}} expected-note{{replace 'default'}}
++    U1(U1 &&) = default; // expected-warning {{explicitly defaulted move constructor is implicitly deleted}} expected-note{{replace 'default'}}
++    U1 & operator=(const U1 &) = default; // expected-warning {{explicitly defaulted copy assignment operator is implicitly deleted}} expected-note 2 {{explicitly defaulted function was implicitly deleted here}} expected-note{{replace 'default'}}
++    U1 & operator=(U1 &&) = default; // expected-warning {{explicitly defaulted move assignment operator is implicitly deleted}} expected-note{{replace 'default'}}
++  };
++
++  // It's fine if the user has explicitly defined the special functions.
++  union U2 {
++    int * AQ f0;
++    U2() = default;
++    ~U2() = default;
++    U2(const U2 &);
++    U2(U2 &&);
++    U2 & operator=(const U2 &);
++    U2 & operator=(U2 &&);
++  };
++
++  // Address-discriminated ptrauth fields in anonymous union fields delete the
++  // defaulted copy/move constructors/assignment operators of the containing
++  // class.
++  struct S0 {
++    union {
++      int * AQ f0; // expected-note 4 {{' is implicitly deleted because variant field 'f0' has an address-discriminated '__ptrauth' qualifier}}
++      char f1;
++    };
++  };
++
++  struct S1 {
++    union {
++      union {
++        int * AQ f0; // expected-note 4 {{implicitly deleted because variant field 'f0' has an address-discriminated '__ptrauth' qualifier}}
++        char f1;
++      } u; // expected-note 4 {{'S1' is implicitly deleted because field 'u' has a deleted}}
++      int f2;
++    };
++  };
++
++  U0 *x0;
++  U1 *x1;
++  U2 *x2;
++  S0 *x3;
++  S1 *x4;
++
++  // No diagnostics since constructors/destructors of the unions aren't deleted by default.
++  void testDefaultConstructor() {
++    U0 u0;
++    U1 u1;
++    U2 u2;
++    S0 s0;
++    S1 s1;
++  }
++
++  // No diagnostics since destructors of the unions aren't deleted by default.
++  void testDestructor(U0 *u0, U1 *u1, U2 *u2, S0 *s0, S1 *s1) {
++    delete u0;
++    delete u1;
++    delete u2;
++    delete s0;
++    delete s1;
++  }
++
++  void testCopyConstructor(U0 *u0, U1 *u1, U2 *u2, S0 *s0, S1 *s1) {
++    U0 t0(*u0); // expected-error {{call to implicitly-deleted copy constructor}}
++    U1 t1(*u1); // expected-error {{call to implicitly-deleted copy constructor}}
++    U2 t2(*u2);
++    S0 t3(*s0); // expected-error {{call to implicitly-deleted copy constructor}}
++    S1 t4(*s1); // expected-error {{call to implicitly-deleted copy constructor}}
++  }
++
++  void testCopyAssignment(U0 *u0, U1 *u1, U2 *u2, S0 *s0, S1 *s1) {
++    *x0 = *u0; // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x1 = *u1; // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x2 = *u2;
++    *x3 = *s0; // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x4 = *s1; // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++  }
++
++  void testMoveConstructor(U0 *u0, U1 *u1, U2 *u2, S0 *s0, S1 *s1) {
++    U0 t0(static_cast<U0 &&>(*u0)); // expected-error {{call to implicitly-deleted copy constructor}}
++    U1 t1(static_cast<U1 &&>(*u1)); // expected-error {{call to implicitly-deleted copy constructor}}
++    U2 t2(static_cast<U2 &&>(*u2));
++    S0 t3(static_cast<S0 &&>(*s0)); // expected-error {{call to implicitly-deleted copy constructor}}
++    S1 t4(static_cast<S1 &&>(*s1)); // expected-error {{call to implicitly-deleted copy constructor}}
++  }
++
++  void testMoveAssignment(U0 *u0, U1 *u1, U2 *u2, S0 *s0, S1 *s1) {
++    *x0 = static_cast<U0 &&>(*u0); // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x1 = static_cast<U1 &&>(*u1); // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x2 = static_cast<U2 &&>(*u2);
++    *x3 = static_cast<S0 &&>(*s0); // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++    *x4 = static_cast<S1 &&>(*s1); // expected-error {{cannot be assigned because its copy assignment operator is implicitly deleted}}
++  }
++}
++
++bool test_composite_type0(bool c, int * AQ * a0, int * AQ * a1) {
++  auto t = c ? a0 : a1;
++  return a0 == a1;
++}
++
++bool test_composite_type1(bool c, int * AQ * a0, int * AQ2 * a1) {
++  auto t = c ? a0 : a1; // expected-error {{incompatible operand types ('int *__ptrauth(1,1,50) *' and 'int *__ptrauth(1,1,51) *')}}
++  return a0 == a1;      // expected-error {{comparison of distinct pointer types ('int *__ptrauth(1,1,50) *' and 'int *__ptrauth(1,1,51) *')}}
++}
++
++void test_bad_call_diag(void *AQ *ptr); // expected-note{{candidate function not viable: 1st argument ('void *__ptrauth(1,1,51) *') has __ptrauth(1,1,51) qualifier, but parameter has __ptrauth(1,1,50) qualifier}} expected-note {{candidate function not viable: 1st argument ('void **') has no '__ptrauth' qualifier, but parameter has __ptrauth(1,1,50) qualifier}}
++void test_bad_call_diag2(void **ptr); // expected-note {{candidate function not viable: 1st argument ('void *__ptrauth(1,1,50) *') has __ptrauth(1,1,50) qualifier, but parameter has no '__ptrauth' qualifier}}
++
++int test_call_diag() {
++  void *AQ ptr1, *AQ2 ptr2, *ptr3;
++  test_bad_call_diag(&ptr2); // expected-error {{no matching function for call to 'test_bad_call_diag'}}
++  test_bad_call_diag(&ptr3); // expected-error {{no matching function for call to 'test_bad_call_diag'}}
++  test_bad_call_diag2(&ptr1); // expected-error {{no matching function for call to 'test_bad_call_diag2'}}
++}
++
++namespace test_constexpr {
++  constexpr int i = 100;
++  constexpr const int * AQ p = &i;
++  constexpr const int * const AQ *pp = &p;
++  constexpr int i1 = **((const int * const AQ *)pp);
++  constexpr int i2 = **((const int * const AQ2 *)pp);
++  // expected-error@-1 {{constexpr variable 'i2' must be initialized by a constant expression}}
++  // expected-note@-2 {{cast that performs the conversions of a reinterpret_cast is not allowed in a constant expression}}
++}
++
++namespace test_lambda {
++  void test() {
++    int * AQ v0;
++    int * AQ *v1;
++
++    [v0, v1]() {
++      static_assert(__is_same(decltype(v0), int * AQ));
++      static_assert(__is_same(decltype(v1), int * AQ *));
++    }();
++
++    [v2 = v0, v3 = v1]() {
++      static_assert(__is_same(decltype(v2), int *));
++      static_assert(__is_same(decltype(v3), int * AQ *));
++    }();
++  }
++}
++
++namespace test_concept {
++  template <typename T> struct is_qualified {
++    static constexpr bool value = false;
++  };
++
++  template <typename T> struct is_qualified<T * AQ> {
++    static constexpr bool value = true;
++  };
++
++  template <typename T>
++  concept Ptrauthable = is_qualified<T>::value;
++  // expected-note@-1 2 {{because 'is_qualified<int *>::value' evaluated to false}}
++  // expected-note@-2 2 {{because 'is_qualified<int *__ptrauth(1,1,51)>::value' evaluated to false}}
++
++  template <typename T>
++    requires(Ptrauthable<T>)
++  struct S {};
++  // expected-note@-2 {{because 'int *' does not satisfy 'Ptrauthable'}}
++  // expected-note@-3 {{because 'int *__ptrauth(1,1,51)' does not satisfy 'Ptrauthable'}}
++
++  S<int * AQ> s0;
++  S<int *> s1;
++  // expected-error@-1 {{constraints not satisfied for class template 'S' [with T = int *]}}
++  S<int * AQ2> s1;
++  // expected-error@-1 {{constraints not satisfied for class template 'S' [with T = int *__ptrauth(1,1,51)]}}
++
++  template <typename T>
++    requires(Ptrauthable<T>)
++  void func(T *);
++  // expected-note@-1 {{candidate template ignored: constraints not satisfied [with T = int *]}}
++  // expected-note@-3 {{because 'int *' does not satisfy 'Ptrauthable'}}
++  // expected-note@-3 {{candidate template ignored: constraints not satisfied [with T = int *__ptrauth(1,1,51)]}}
++  // expected-note@-5 {{because 'int *__ptrauth(1,1,51)' does not satisfy 'Ptrauthable'}}
++
++  void test() {
++    int * AQ p0;
++    int *p1;
++    int * AQ2 p2;
++    func(&p0);
++    func(&p1); // expected-error {{no matching function for call to 'func'}}
++    func(&p2); // expected-error {{no matching function for call to 'func'}}
++  }
++}
+diff --git a/clang/test/SemaCXX/ptrauth-template-parameters.cpp b/clang/test/SemaCXX/ptrauth-template-parameters.cpp
+new file mode 100644
+index 000000000000..ee23d3f2ec45
+--- /dev/null
++++ b/clang/test/SemaCXX/ptrauth-template-parameters.cpp
+@@ -0,0 +1,29 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fsyntax-only -verify -fptrauth-intrinsics -std=c++11 %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fsyntax-only -verify -fptrauth-intrinsics -std=c++11 %s
++
++template <typename T> struct G {
++  T __ptrauth(0,0,1234) test;
++  // expected-error@-1 2 {{type '__ptrauth(0,0,1234) T' is already __ptrauth-qualified}}
++};
++
++template <typename T> struct Indirect {
++  G<T> layers;
++  // expected-note@-1{{in instantiation of template class 'G<void *__ptrauth(0,0,1235)>' requested here}}
++  // expected-note@-2{{in instantiation of template class 'G<void *__ptrauth(0,0,1234)>' requested here}}
++};
++
++template <int K, int A, int D>
++struct TemplateParameters {
++  void * __ptrauth(K, 0, 100) m1; // expected-error {{expression is not an integer constant expression}}
++  void * __ptrauth(0, A, 100) m2; // expected-error {{argument to '__ptrauth' must be an integer constant expression}}
++  void * __ptrauth(0, 0, D) m3; // expected-error {{argument to '__ptrauth' must be an integer constant expression}}
++};
++
++void f3() {
++  // FIXME: consider loosening the restrictions so that the first two cases are accepted.
++  Indirect<void* __ptrauth(0,0,1234)> one;
++  // expected-note@-1{{in instantiation of template class 'Indirect<void *__ptrauth(0,0,1234)>' requested here}}
++  Indirect<void* __ptrauth(0,0,1235)> two;
++  // expected-note@-1{{in instantiation of template class 'Indirect<void *__ptrauth(0,0,1235)>' requested here}}
++  Indirect<void*> three;
++}
+diff --git a/clang/test/SemaObjC/ptrauth-qualifier.m b/clang/test/SemaObjC/ptrauth-qualifier.m
+new file mode 100644
+index 000000000000..4836a653dd02
+--- /dev/null
++++ b/clang/test/SemaObjC/ptrauth-qualifier.m
+@@ -0,0 +1,56 @@
++// RUN: %clang_cc1 -triple arm64-apple-ios -fsyntax-only -verify -fptrauth-intrinsics %s
++// RUN: %clang_cc1 -triple aarch64-linux-gnu -fsyntax-only -verify -fptrauth-intrinsics %s
++
++#if __has_feature(ptrauth_qualifier)
++#warning __ptrauth qualifier enabled!
++// expected-warning@-1 {{__ptrauth qualifier enabled!}}
++#endif
++
++@interface Foo
++// expected-warning@-1 {{class 'Foo' defined without specifying a base class}}
++// expected-note@-2 {{add a super class to fix this problem}}
++
++@property void *__ptrauth(1, 1, 1) invalid1;
++// expected-error@-1 {{property may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,1,1)'}}
++
++@property void *__ptrauth(1, 0, 1) invalid2;
++// expected-error@-1 {{property may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,0,1)'}}
++
++- (void *__ptrauth(1, 1, 1))invalid5;
++// expected-error@-1 {{return type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,1,1)'}}
++
++- (void *__ptrauth(1, 0, 1))invalid6;
++// expected-error@-1 {{return type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,0,1)'}}
++
++- (void)invalid9:(void *__ptrauth(1, 1, 1))a;
++// expected-error@-1 {{parameter type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,1,1)'}}
++// expected-note@-2 {{method 'invalid9:' declared here}}
++
++- (void)invalid10:(void *__ptrauth(1, 0, 1))a;
++// expected-error@-1 {{parameter type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,0,1)'}}
++// expected-note@-2 {{method 'invalid10:' declared here}}
++
++@end
++
++@implementation Foo
++// expected-warning@-1 2{{method definition for}}
++
++- (void *__ptrauth(1, 1, 1))invalid13 {
++// expected-error@-1 {{return type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,1,1)'}}
++  return 0;
++}
++
++- (void *__ptrauth(1, 0, 1))invalid14 {
++// expected-error@-1 {{return type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,0,1)'}}
++  return 0;
++}
++
++- (void)invalid17:(void *__ptrauth(1, 1, 1))a {
++// expected-error@-1 {{parameter type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,1,1)'}}
++}
++
++- (void)invalid18:(void *__ptrauth(1, 0, 1))a {
++// expected-error@-1 {{parameter type may not be qualified with '__ptrauth'; type is 'void *__ptrauth(1,0,1)'}}
++}
++
++@end
+diff --git a/libcxxabi/test/test_demangle.pass.cpp b/libcxxabi/test/test_demangle.pass.cpp
+index abaa787f5432..53da1bf6765e 100644
+--- a/libcxxabi/test/test_demangle.pass.cpp
++++ b/libcxxabi/test/test_demangle.pass.cpp
+@@ -30243,6 +30243,9 @@ const char* cases[][2] = {
+     {"_Z1fDSDRm", "f(_Sat unsigned long _Fract)"},
+ 
+     {"_Z11bfloat16addDF16bDF16b", "bfloat16add(std::bfloat16_t, std::bfloat16_t)"},
++
++    {"_Z3fooPU9__ptrauthILj3ELb1ELj234EEPi", "foo(int* __ptrauth<3u, true, 234u>*)"},
++    {"_Z3fooIPU9__ptrauthILj1ELb0ELj64EEPiEvT_", "void foo<int* __ptrauth<1u, false, 64u>*>(int* __ptrauth<1u, false, 64u>*)"},
+     // clang-format on
+ };
+ 
+diff --git a/llvm/include/llvm/Demangle/MicrosoftDemangle.h b/llvm/include/llvm/Demangle/MicrosoftDemangle.h
+index 276efa760369..b9a25e361eec 100644
+--- a/llvm/include/llvm/Demangle/MicrosoftDemangle.h
++++ b/llvm/include/llvm/Demangle/MicrosoftDemangle.h
+@@ -173,6 +173,14 @@ private:
+ 
+   Qualifiers demanglePointerExtQualifiers(std::string_view &MangledName);
+ 
++  bool isMemberPointer(std::string_view MangledName, bool &Error);
++
++  std::optional<PointerAuthQualifierNode::ArgArray>
++  demanglePointerAuthQualifier(std::string_view &MangledName);
++
++  PointerAuthQualifierNode *
++  createPointerAuthQualifier(std::string_view &MangledName);
++
+   // Parser functions. This is a recursive-descent parser.
+   TypeNode *demangleType(std::string_view &MangledName,
+                          QualifierMangleMode QMM);
+diff --git a/llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h b/llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h
+index 09b9d947464a..d72fb47cd9b0 100644
+--- a/llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h
++++ b/llvm/include/llvm/Demangle/MicrosoftDemangleNodes.h
+@@ -253,7 +253,8 @@ enum class NodeKind {
+   LocalStaticGuardVariable,
+   FunctionSymbol,
+   VariableSymbol,
+-  SpecialTableSymbol
++  SpecialTableSymbol,
++  PointerAuthQualifier,
+ };
+ 
+ struct Node {
+@@ -295,6 +296,7 @@ struct SymbolNode;
+ struct FunctionSymbolNode;
+ struct VariableSymbolNode;
+ struct SpecialTableSymbolNode;
++struct PointerAuthQualifierNode;
+ 
+ struct TypeNode : public Node {
+   explicit TypeNode(NodeKind K) : Node(K) {}
+@@ -467,6 +469,8 @@ struct PointerTypeNode : public TypeNode {
+   // If this is a member pointer, this is the class that the member is in.
+   QualifiedNameNode *ClassParent = nullptr;
+ 
++  PointerAuthQualifierNode *PointerAuthQualifier = nullptr;
++
+   // Represents a type X in "a pointer to X", "a reference to X", or
+   // "rvalue-reference to X"
+   TypeNode *Pointee = nullptr;
+@@ -625,6 +629,22 @@ struct FunctionSymbolNode : public SymbolNode {
+   FunctionSignatureNode *Signature = nullptr;
+ };
+ 
++struct PointerAuthQualifierNode : public Node {
++  PointerAuthQualifierNode() : Node(NodeKind::PointerAuthQualifier) {}
++
++  // __ptrauth takes three arguments:
++  //  - key
++  //  - isAddressDiscriminated
++  //  - extra discriminator
++  static constexpr unsigned NumArgs = 3;
++  typedef std::array<uint64_t, NumArgs> ArgArray;
++
++  void output(OutputBuffer &OB, OutputFlags Flags) const override;
++
++  // List of arguments.
++  NodeArrayNode *Components = nullptr;
++};
++
+ } // namespace ms_demangle
+ } // namespace llvm
+ 
+diff --git a/llvm/lib/Demangle/MicrosoftDemangle.cpp b/llvm/lib/Demangle/MicrosoftDemangle.cpp
+index 8d5f6b21e2e7..b22928be3be5 100644
+--- a/llvm/lib/Demangle/MicrosoftDemangle.cpp
++++ b/llvm/lib/Demangle/MicrosoftDemangle.cpp
+@@ -66,7 +66,7 @@ static bool startsWith(std::string_view S, std::string_view PrefixA,
+   return llvm::itanium_demangle::starts_with(S, Prefix);
+ }
+ 
+-static bool isMemberPointer(std::string_view MangledName, bool &Error) {
++bool Demangler::isMemberPointer(std::string_view MangledName, bool &Error) {
+   Error = false;
+   const char F = MangledName.front();
+   MangledName.remove_prefix(1);
+@@ -107,6 +107,7 @@ static bool isMemberPointer(std::string_view MangledName, bool &Error) {
+   consumeFront(MangledName, 'E'); // 64-bit
+   consumeFront(MangledName, 'I'); // restrict
+   consumeFront(MangledName, 'F'); // unaligned
++  demanglePointerAuthQualifier(MangledName);
+ 
+   if (MangledName.empty()) {
+     Error = true;
+@@ -2099,6 +2100,8 @@ PointerTypeNode *Demangler::demanglePointerType(std::string_view &MangledName) {
+   Qualifiers ExtQuals = demanglePointerExtQualifiers(MangledName);
+   Pointer->Quals = Qualifiers(Pointer->Quals | ExtQuals);
+ 
++  Pointer->PointerAuthQualifier = createPointerAuthQualifier(MangledName);
++
+   Pointer->Pointee = demangleType(MangledName, QualifierMangleMode::Mangle);
+   return Pointer;
+ }
+@@ -2147,6 +2150,49 @@ Demangler::demanglePointerExtQualifiers(std::string_view &MangledName) {
+   return Quals;
+ }
+ 
++std::optional<PointerAuthQualifierNode::ArgArray>
++Demangler::demanglePointerAuthQualifier(std::string_view &MangledName) {
++  if (!consumeFront(MangledName, "__ptrauth"))
++    return std::nullopt;
++
++  constexpr unsigned NumArgs = PointerAuthQualifierNode::NumArgs;
++  PointerAuthQualifierNode::ArgArray Array;
++
++  for (unsigned I = 0; I < NumArgs; ++I) {
++    bool IsNegative = false;
++    uint64_t Value = 0;
++    std::tie(Value, IsNegative) = demangleNumber(MangledName);
++    if (IsNegative)
++      return std::nullopt;
++
++    Array[I] = Value;
++  }
++
++  return Array;
++}
++
++PointerAuthQualifierNode *
++Demangler::createPointerAuthQualifier(std::string_view &MangledName) {
++  constexpr unsigned NumArgs = PointerAuthQualifierNode::NumArgs;
++  std::optional<PointerAuthQualifierNode::ArgArray> Vals =
++      demanglePointerAuthQualifier(MangledName);
++
++  if (!Vals)
++    return nullptr;
++
++  PointerAuthQualifierNode *PtrAuthQual =
++      Arena.alloc<PointerAuthQualifierNode>();
++  NodeArrayNode *Array = Arena.alloc<NodeArrayNode>();
++  PtrAuthQual->Components = Array;
++  Array->Count = NumArgs;
++  Array->Nodes = Arena.allocArray<Node *>(NumArgs);
++
++  for (unsigned I = 0; I < NumArgs; ++I)
++    Array->Nodes[I] = Arena.alloc<IntegerLiteralNode>((*Vals)[I], false);
++
++  return PtrAuthQual;
++}
++
+ ArrayTypeNode *Demangler::demangleArrayType(std::string_view &MangledName) {
+   assert(MangledName.front() == 'Y');
+   MangledName.remove_prefix(1);
+diff --git a/llvm/lib/Demangle/MicrosoftDemangleNodes.cpp b/llvm/lib/Demangle/MicrosoftDemangleNodes.cpp
+index ec6e67058c68..61e4961c714b 100644
+--- a/llvm/lib/Demangle/MicrosoftDemangleNodes.cpp
++++ b/llvm/lib/Demangle/MicrosoftDemangleNodes.cpp
+@@ -521,6 +521,9 @@ void PointerTypeNode::outputPre(OutputBuffer &OB, OutputFlags Flags) const {
+     assert(false);
+   }
+   outputQualifiers(OB, Quals, false, false);
++
++  if (PointerAuthQualifier)
++    PointerAuthQualifier->output(OB, Flags);
+ }
+ 
+ void PointerTypeNode::outputPost(OutputBuffer &OB, OutputFlags Flags) const {
+@@ -591,6 +594,13 @@ void FunctionSymbolNode::output(OutputBuffer &OB, OutputFlags Flags) const {
+   Signature->outputPost(OB, Flags);
+ }
+ 
++void PointerAuthQualifierNode::output(OutputBuffer &OB,
++                                      OutputFlags Flags) const {
++  OB << "__ptrauth(";
++  Components->output(OB, Flags);
++  OB << ")";
++}
++
+ void VariableSymbolNode::output(OutputBuffer &OB, OutputFlags Flags) const {
+   const char *AccessSpec = nullptr;
+   bool IsStatic = true;
+diff --git a/llvm/test/Demangle/ms-ptrauth.test b/llvm/test/Demangle/ms-ptrauth.test
+new file mode 100644
+index 000000000000..18a9f37bec67
+--- /dev/null
++++ b/llvm/test/Demangle/ms-ptrauth.test
+@@ -0,0 +1,12 @@
++; RUN: llvm-undname < %s | FileCheck %s
++
++; CHECK-NOT: Invalid mangled name
++
++?s@@3U?$S@PE__ptrauth1A@ENC@AH@@A
++; CHECK: struct S<int *__ptrauth(2, 0, 1234)> s
++
++?foo@@YAXPEAPE__ptrauth20OK@AH@Z
++; CHECK: void __cdecl foo(int *__ptrauth(3, 1, 234)*)
++
++??$foo@PEAPE__ptrauth0A@EA@AH@@YAXPEAPE__ptrauth0A@EA@AH@Z
++; CHECK: void __cdecl foo<int *__ptrauth(1, 0, 64)*>(int *__ptrauth(1, 0, 64)*)

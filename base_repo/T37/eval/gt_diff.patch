@@ -1,0 +1,2062 @@
+diff --git a/src/java.base/share/classes/jdk/internal/javac/PreviewFeature.java b/src/java.base/share/classes/jdk/internal/javac/PreviewFeature.java
+index cfccff7dd93..43dcf25c263 100644
+--- a/src/java.base/share/classes/jdk/internal/javac/PreviewFeature.java
++++ b/src/java.base/share/classes/jdk/internal/javac/PreviewFeature.java
+@@ -81,6 +81,8 @@ public @interface PreviewFeature {
+         CLASSFILE_API,
+         @JEP(number=473, title="Stream Gatherers", status="Second Preview")
+         STREAM_GATHERERS,
++        @JEP(number=476, title="Module Import Declarations", status="Preview")
++        MODULE_IMPORTS,
+         LANGUAGE_MODEL,
+         /**
+          * A key for testing.
+diff --git a/src/jdk.compiler/share/classes/com/sun/source/tree/ImportTree.java b/src/jdk.compiler/share/classes/com/sun/source/tree/ImportTree.java
+index de8e895e68d..83a6c3eb87b 100644
+--- a/src/jdk.compiler/share/classes/com/sun/source/tree/ImportTree.java
++++ b/src/jdk.compiler/share/classes/com/sun/source/tree/ImportTree.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2005, 2017, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2005, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -25,6 +25,8 @@
+ 
+ package com.sun.source.tree;
+ 
++import jdk.internal.javac.PreviewFeature;
++
+ /**
+  * A tree node for an import declaration.
+  *
+@@ -47,6 +49,12 @@ public interface ImportTree extends Tree {
+      * @return true if this is a static import
+      */
+     boolean isStatic();
++    /**
++     * {@return true if this is an module import declaration.}
++     * @since 23
++     */
++    @PreviewFeature(feature=PreviewFeature.Feature.MODULE_IMPORTS, reflective=true)
++    boolean isModule();
+ 
+     /**
+      * Returns the qualified identifier for the declaration(s)
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Preview.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Preview.java
+index 1572973179b..6af766effa5 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Preview.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Preview.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -210,6 +210,7 @@ public class Preview {
+             case IMPLICIT_CLASSES -> true;
+             case SUPER_INIT -> true;
+             case PRIMITIVE_PATTERNS -> true;
++            case MODULE_IMPORTS -> true;
+             //Note: this is a backdoor which allows to optionally treat all features as 'preview' (for testing).
+             //When real preview features will be added, this method can be implemented to return 'true'
+             //for those selected features, and 'false' for all the others.
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Source.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Source.java
+index 479e6891d8f..f1cc1e89272 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Source.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/code/Source.java
+@@ -255,6 +255,7 @@ public enum Source {
+         UNNAMED_VARIABLES(JDK22, Fragments.FeatureUnnamedVariables, DiagKind.PLURAL),
+         PRIMITIVE_PATTERNS(JDK23, Fragments.FeaturePrimitivePatterns, DiagKind.PLURAL),
+         SUPER_INIT(JDK22, Fragments.FeatureSuperInit, DiagKind.NORMAL),
++        MODULE_IMPORTS(JDK23, Fragments.FeatureModuleImports, DiagKind.PLURAL),
+         ;
+ 
+         enum DiagKind {
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java
+index e909afc0bdf..d98aad1e9d8 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/Check.java
+@@ -4396,7 +4396,9 @@ public class Check {
+     }
+ 
+     public void checkImportsResolvable(final JCCompilationUnit toplevel) {
+-        for (final JCImport imp : toplevel.getImports()) {
++        for (final JCImportBase impBase : toplevel.getImports()) {
++            if (!(impBase instanceof JCImport imp))
++                continue;
+             if (!imp.staticImport || !imp.qualid.hasTag(SELECT))
+                 continue;
+             final JCFieldAccess select = imp.qualid;
+@@ -4420,8 +4422,9 @@ public class Check {
+ 
+     // Check that packages imported are in scope (JLS 7.4.3, 6.3, 6.5.3.1, 6.5.3.2)
+     public void checkImportedPackagesObservable(final JCCompilationUnit toplevel) {
+-        OUTER: for (JCImport imp : toplevel.getImports()) {
+-            if (!imp.staticImport && TreeInfo.name(imp.qualid) == names.asterisk) {
++        OUTER: for (JCImportBase impBase : toplevel.getImports()) {
++            if (impBase instanceof JCImport imp && !imp.staticImport &&
++                TreeInfo.name(imp.qualid) == names.asterisk) {
+                 TypeSymbol tsym = imp.qualid.selected.type.tsym;
+                 if (tsym.kind == PCK && tsym.members().isEmpty() &&
+                     !(Feature.IMPORT_ON_DEMAND_OBSERVABLE_PACKAGES.allowedInSource(source) && tsym.exists())) {
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TreeDiffer.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TreeDiffer.java
+index 4bcc7937aa9..df14b1859e3 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TreeDiffer.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TreeDiffer.java
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (c) 2018, Google LLC. All rights reserved.
+- * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -67,6 +67,7 @@ import com.sun.tools.javac.tree.JCTree.JCMethodDecl;
+ import com.sun.tools.javac.tree.JCTree.JCMethodInvocation;
+ import com.sun.tools.javac.tree.JCTree.JCModifiers;
+ import com.sun.tools.javac.tree.JCTree.JCModuleDecl;
++import com.sun.tools.javac.tree.JCTree.JCModuleImport;
+ import com.sun.tools.javac.tree.JCTree.JCNewArray;
+ import com.sun.tools.javac.tree.JCTree.JCNewClass;
+ import com.sun.tools.javac.tree.JCTree.JCOpens;
+@@ -410,6 +411,12 @@ public class TreeDiffer extends TreeScanner {
+         result = tree.staticImport == that.staticImport && scan(tree.qualid, that.qualid);
+     }
+ 
++    @Override
++    public void visitModuleImport(JCModuleImport tree) {
++        JCModuleImport that = (JCModuleImport) parameter;
++        result = scan(tree.module, that.module);
++    }
++
+     @Override
+     public void visitIndexed(JCArrayAccess tree) {
+         JCArrayAccess that = (JCArrayAccess) parameter;
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TypeEnter.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TypeEnter.java
+index 9366e802b16..f36f425283a 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TypeEnter.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/comp/TypeEnter.java
+@@ -32,16 +32,15 @@ import java.util.function.BiConsumer;
+ import javax.tools.JavaFileObject;
+ 
+ import com.sun.tools.javac.code.*;
++import com.sun.tools.javac.code.Directive.ExportsDirective;
++import com.sun.tools.javac.code.Directive.RequiresDirective;
+ import com.sun.tools.javac.code.Lint.LintCategory;
+ import com.sun.tools.javac.code.Scope.ImportFilter;
+-import com.sun.tools.javac.code.Scope.ImportScope;
+ import com.sun.tools.javac.code.Scope.NamedImportScope;
+ import com.sun.tools.javac.code.Scope.StarImportScope;
+ import com.sun.tools.javac.code.Scope.WriteableScope;
+ import com.sun.tools.javac.code.Source.Feature;
+ import com.sun.tools.javac.comp.Annotate.AnnotationTypeMetadata;
+-import com.sun.tools.javac.parser.Parser;
+-import com.sun.tools.javac.parser.ParserFactory;
+ import com.sun.tools.javac.tree.*;
+ import com.sun.tools.javac.util.*;
+ import com.sun.tools.javac.util.DefinedBy.Api;
+@@ -57,7 +56,6 @@ import static com.sun.tools.javac.code.Scope.LookupKind.NON_RECURSIVE;
+ import static com.sun.tools.javac.code.Kinds.Kind.*;
+ import static com.sun.tools.javac.code.TypeTag.CLASS;
+ import static com.sun.tools.javac.code.TypeTag.ERROR;
+-import com.sun.tools.javac.resources.CompilerProperties.Fragments;
+ 
+ import static com.sun.tools.javac.code.TypeTag.*;
+ import static com.sun.tools.javac.tree.JCTree.Tag.*;
+@@ -114,8 +112,6 @@ public class TypeEnter implements Completer {
+     private final Lint lint;
+     private final TypeEnvs typeEnvs;
+     private final Dependencies dependencies;
+-    private final ParserFactory parserFactory;
+-    private final Preview preview;
+ 
+     public static TypeEnter instance(Context context) {
+         TypeEnter instance = context.get(typeEnterKey);
+@@ -143,8 +139,6 @@ public class TypeEnter implements Completer {
+         lint = Lint.instance(context);
+         typeEnvs = TypeEnvs.instance(context);
+         dependencies = Dependencies.instance(context);
+-        parserFactory = ParserFactory.instance(context);
+-        preview = Preview.instance(context);
+         Source source = Source.instance(context);
+         allowDeprecationOnImport = Feature.DEPRECATION_ON_IMPORT.allowedInSource(source);
+     }
+@@ -370,9 +364,7 @@ public class TypeEnter implements Completer {
+                 if (tree.getPackage() != null && decl == null)
+                     checkClassPackageClash(tree.getPackage());
+ 
+-                for (JCImport imp : tree.getImports()) {
+-                    doImport(imp);
+-                }
++                handleImports(tree.getImports());
+ 
+                 if (decl != null) {
+                     DiagnosticPosition prevCheckDeprecatedLintPos = deferredLintHandler.setPos(decl.pos());
+@@ -394,6 +386,16 @@ public class TypeEnter implements Completer {
+             }
+         }
+ 
++        private void handleImports(List<JCImportBase> imports) {
++            for (JCImportBase imp : imports) {
++                if (imp instanceof JCModuleImport mimp) {
++                    doModuleImport(mimp);
++                } else {
++                    doImport((JCImport) imp);
++                }
++            }
++        }
++
+         private void checkClassPackageClash(JCPackageDecl tree) {
+             // check that no class exists with same fully qualified name as
+             // toplevel package
+@@ -445,6 +447,57 @@ public class TypeEnter implements Completer {
+             }
+         }
+ 
++        private void doModuleImport(JCModuleImport tree) {
++            Name moduleName = TreeInfo.fullName(tree.module);
++            ModuleSymbol module = syms.getModule(moduleName);
++
++            if (module != null) {
++                if (!env.toplevel.modle.readModules.contains(module)) {
++                    if (env.toplevel.modle.isUnnamed()) {
++                        log.error(tree.pos, Errors.ImportModuleDoesNotReadUnnamed(module));
++                    } else {
++                        log.error(tree.pos, Errors.ImportModuleDoesNotRead(env.toplevel.modle,
++                                                                           module));
++                    }
++                    //error recovery, make sure the module is completed:
++                    module.getDirectives();
++                }
++
++                List<ModuleSymbol> todo = List.of(module);
++                Set<ModuleSymbol> seenModules = new HashSet<>();
++
++                while (!todo.isEmpty()) {
++                    ModuleSymbol currentModule = todo.head;
++
++                    todo = todo.tail;
++
++                    if (!seenModules.add(currentModule)) {
++                        continue;
++                    }
++
++                    for (ExportsDirective export : currentModule.exports) {
++                        if (export.modules != null && !export.modules.contains(env.toplevel.packge.modle)) {
++                            continue;
++                        }
++
++                        PackageSymbol pkg = export.getPackage();
++                        JCImport nestedImport = make.at(tree.pos)
++                                .Import(make.Select(make.QualIdent(pkg), names.asterisk), false);
++
++                        doImport(nestedImport);
++                    }
++
++                    for (RequiresDirective requires : currentModule.requires) {
++                        if (requires.isTransitive()) {
++                            todo = todo.prepend(requires.module);
++                        }
++                    }
++                }
++            } else {
++                log.error(tree.pos, Errors.ImportModuleNotFound(moduleName));
++            }
++        }
++
+         Type attribImportType(JCTree tree, Env<AttrContext> env) {
+             Assert.check(completionEnabled);
+             Lint prevLint = chk.setLint(allowDeprecationOnImport ?
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
+index 4eb7aa7c17d..4278b902fb3 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/parser/JavacParser.java
+@@ -4252,6 +4252,13 @@ public class JavacParser implements Parser {
+         if (token.kind == STATIC) {
+             importStatic = true;
+             nextToken();
++        } else if (token.kind == IDENTIFIER && token.name() == names.module &&
++                   peekToken(TokenKind.IDENTIFIER)) {
++            checkSourceLevel(Feature.MODULE_IMPORTS);
++            nextToken();
++            JCExpression moduleName = qualident(false);
++            accept(SEMI);
++            return toP(F.at(pos).ModuleImport(moduleName));
+         }
+         JCExpression pid = toP(F.at(token.pos).Ident(ident()));
+         do {
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties b/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
+index 26c16ebdc2c..a37d9041f43 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/resources/compiler.properties
+@@ -3218,6 +3218,9 @@ compiler.misc.feature.implicit.classes=\
+ compiler.misc.feature.super.init=\
+     statements before super()
+ 
++compiler.misc.feature.module.imports=\
++    module imports
++
+ compiler.warn.underscore.as.identifier=\
+     as of release 9, ''_'' is a keyword, and may not be used as an identifier
+ 
+@@ -3528,6 +3531,18 @@ compiler.err.module.not.found=\
+ compiler.warn.module.not.found=\
+     module not found: {0}
+ 
++# 0: name
++compiler.err.import.module.not.found=\
++    imported module not found: {0}
++
++# 0: symbol
++compiler.err.import.module.does.not.read.unnamed=\
++    unnamed module does not read: {0}
++
++# 0: symbol, 1: symbol
++compiler.err.import.module.does.not.read=\
++    module {0} does not read: {1}
++
+ compiler.err.too.many.modules=\
+     too many module declarations found
+ 
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
+index 56daece2b2f..5af482516b4 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/JCTree.java
+@@ -105,6 +105,10 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+          */
+         IMPORT,
+ 
++        /** Module import clauses.
++         */
++        MODULEIMPORT,
++
+         /** Class definitions, of type ClassDef.
+          */
+         CLASSDEF,
+@@ -585,11 +589,11 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+         }
+ 
+         @DefinedBy(Api.COMPILER_TREE)
+-        public List<JCImport> getImports() {
+-            ListBuffer<JCImport> imports = new ListBuffer<>();
++        public List<JCImportBase> getImports() {
++            ListBuffer<JCImportBase> imports = new ListBuffer<>();
+             for (JCTree tree : defs) {
+-                if (tree.hasTag(IMPORT))
+-                    imports.append((JCImport)tree);
++                if (tree instanceof JCImportBase imp)
++                    imports.append(imp);
+                 else if (!tree.hasTag(PACKAGEDEF) && !tree.hasTag(SKIP))
+                     break;
+             }
+@@ -608,7 +612,9 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+             List<JCTree> typeDefs;
+             for (typeDefs = defs; !typeDefs.isEmpty(); typeDefs = typeDefs.tail) {
+                 if (!typeDefs.head.hasTag(MODULEDEF)
+-                        && !typeDefs.head.hasTag(PACKAGEDEF) && !typeDefs.head.hasTag(IMPORT)) {
++                        && !typeDefs.head.hasTag(PACKAGEDEF)
++                        && !typeDefs.head.hasTag(IMPORT)
++                        && !typeDefs.head.hasTag(MODULEIMPORT)) {
+                     break;
+                 }
+             }
+@@ -661,10 +667,22 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+         }
+     }
+ 
++    public static abstract class JCImportBase extends JCTree implements ImportTree {
++
++        @DefinedBy(Api.COMPILER_TREE)
++        public Kind getKind() { return Kind.IMPORT; }
++        @Override @DefinedBy(Api.COMPILER_TREE)
++        public <R,D> R accept(TreeVisitor<R,D> v, D d) {
++            return v.visitImport(this, d);
++        }
++
++        public abstract JCTree getQualifiedIdentifier();
++    }
++
+     /**
+      * An import clause.
+      */
+-    public static class JCImport extends JCTree implements ImportTree {
++    public static class JCImport extends JCImportBase {
+         public boolean staticImport;
+         /** The imported class(es). */
+         public JCFieldAccess qualid;
+@@ -679,8 +697,35 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+         @DefinedBy(Api.COMPILER_TREE)
+         public boolean isStatic() { return staticImport; }
+         @DefinedBy(Api.COMPILER_TREE)
++        public boolean isModule() { return false; }
++        @DefinedBy(Api.COMPILER_TREE)
+         public JCFieldAccess getQualifiedIdentifier() { return qualid; }
+ 
++        @Override
++        public Tag getTag() {
++            return IMPORT;
++        }
++    }
++
++    /**
++     * A module import clause.
++     */
++    public static class JCModuleImport extends JCImportBase {
++        /** The module name. */
++        public JCExpression module;
++        protected JCModuleImport(JCExpression module) {
++            this.module = module;
++        }
++        @Override
++        public void accept(Visitor v) { v.visitModuleImport(this); }
++
++        @DefinedBy(Api.COMPILER_TREE)
++        public boolean isStatic() { return false; }
++        @DefinedBy(Api.COMPILER_TREE)
++        public boolean isModule() { return true; }
++        @DefinedBy(Api.COMPILER_TREE)
++        public JCExpression getQualifiedIdentifier() { return module; }
++
+         @DefinedBy(Api.COMPILER_TREE)
+         public Kind getKind() { return Kind.IMPORT; }
+         @Override @DefinedBy(Api.COMPILER_TREE)
+@@ -690,7 +735,7 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+ 
+         @Override
+         public Tag getTag() {
+-            return IMPORT;
++            return MODULEIMPORT;
+         }
+     }
+ 
+@@ -3480,6 +3525,7 @@ public abstract class JCTree implements Tree, Cloneable, DiagnosticPosition {
+         public void visitTopLevel(JCCompilationUnit that)    { visitTree(that); }
+         public void visitPackageDef(JCPackageDecl that)      { visitTree(that); }
+         public void visitImport(JCImport that)               { visitTree(that); }
++        public void visitModuleImport(JCModuleImport that)   { visitTree(that); }
+         public void visitClassDef(JCClassDecl that)          { visitTree(that); }
+         public void visitMethodDef(JCMethodDecl that)        { visitTree(that); }
+         public void visitVarDef(JCVariableDecl that)         { visitTree(that); }
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/Pretty.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/Pretty.java
+index 9cc0f6e3b6d..e97d07b1d2b 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/Pretty.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/Pretty.java
+@@ -380,12 +380,12 @@ public class Pretty extends JCTree.Visitor {
+                  (cdef == null ||
+                   l.head.hasTag(IMPORT) || l.head.hasTag(PACKAGEDEF));
+              l = l.tail) {
+-            if (l.head.hasTag(IMPORT)) {
+-                JCImport imp = (JCImport)l.head;
+-                Name name = TreeInfo.name(imp.qualid);
++            if (l.head instanceof JCImportBase imp) {
++                Name name = TreeInfo.name(imp.getQualifiedIdentifier());
+                 if (name == name.table.names.asterisk ||
+                         cdef == null ||
+-                        isUsed(TreeInfo.symbol(imp.qualid), cdef)) {
++                        imp instanceof JCModuleImport ||
++                        isUsed(TreeInfo.symbol(imp.getQualifiedIdentifier()), cdef)) {
+                     if (firstImport) {
+                         firstImport = false;
+                         println();
+@@ -547,6 +547,17 @@ public class Pretty extends JCTree.Visitor {
+         }
+     }
+ 
++    public void visitModuleImport(JCModuleImport tree) {
++        try {
++            print("import module ");
++            printExpr(tree.module);
++            print(';');
++            println();
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
+     public void visitClassDef(JCClassDecl tree) {
+         try {
+             println(); align();
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+index 7c2ef075ccb..9c3ed3bbcd2 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeCopier.java
+@@ -257,9 +257,14 @@ public class TreeCopier<P> implements TreeVisitor<JCTree,P> {
+ 
+     @DefinedBy(Api.COMPILER_TREE)
+     public JCTree visitImport(ImportTree node, P p) {
+-        JCImport t = (JCImport) node;
+-        JCFieldAccess qualid = copy(t.qualid, p);
+-        return M.at(t.pos).Import(qualid, t.staticImport);
++        if (node instanceof JCModuleImport mimp) {
++            JCExpression module = copy(mimp.module, p);
++            return M.at(mimp.pos).ModuleImport(module);
++        } else {
++            JCImport t = (JCImport) node;
++            JCFieldAccess qualid = copy(t.qualid, p);
++            return M.at(t.pos).Import(qualid, t.staticImport);
++        }
+     }
+ 
+     @DefinedBy(Api.COMPILER_TREE)
+diff --git a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeMaker.java b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+index fe6ca849f31..b4c6f804a2f 100644
+--- a/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeMaker.java
++++ b/src/jdk.compiler/share/classes/com/sun/tools/javac/tree/TreeMaker.java
+@@ -129,6 +129,7 @@ public class TreeMaker implements JCTree.Factory {
+             Assert.check(node instanceof JCClassDecl
+                 || node instanceof JCPackageDecl
+                 || node instanceof JCImport
++                || node instanceof JCModuleImport
+                 || node instanceof JCModuleDecl
+                 || node instanceof JCSkip
+                 || node instanceof JCErroneous
+@@ -151,8 +152,14 @@ public class TreeMaker implements JCTree.Factory {
+         return tree;
+     }
+ 
+-    public JCImport Import(JCFieldAccess qualid, boolean importStatic) {
+-        JCImport tree = new JCImport(qualid, importStatic);
++    public JCImport Import(JCFieldAccess qualid, boolean staticImport) {
++        JCImport tree = new JCImport(qualid, staticImport);
++        tree.pos = pos;
++        return tree;
++    }
++
++    public JCModuleImport ModuleImport(JCExpression moduleName) {
++        JCModuleImport tree = new JCModuleImport(moduleName);
+         tree.pos = pos;
+         return tree;
+     }
+diff --git a/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/JShellTool.java b/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/JShellTool.java
+index 0ff0c75efd4..0e9b3bf8bfb 100644
+--- a/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/JShellTool.java
++++ b/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/JShellTool.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2014, 2022, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -338,6 +338,10 @@ public class JShellTool implements MessageHandler {
+             return selectOptions(e -> e.getKey().showOption);
+         }
+ 
++        boolean hasOption(OptionKind kind) {
++            return optMap.containsKey(kind);
++        }
++
+         void addAll(OptionKind kind, Collection<String> vals) {
+             optMap.computeIfAbsent(kind, k -> new ArrayList<>())
+                     .addAll(vals);
+@@ -470,7 +474,7 @@ public class JShellTool implements MessageHandler {
+                     .map(mp -> mp.contains("=") ? mp : mp + "=ALL-UNNAMED")
+                     .toList()
+             );
+-            if (options.has(argEnablePreview)) {
++            if (previewEnabled(options)) {
+                 opts.addAll(OptionKind.ENABLE_PREVIEW, List.of(
+                         OptionKind.ENABLE_PREVIEW.optionFlag));
+                 opts.addAll(OptionKind.SOURCE_RELEASE, List.of(
+@@ -490,6 +494,10 @@ public class JShellTool implements MessageHandler {
+             }
+         }
+ 
++        boolean previewEnabled(OptionSet options) {
++            return options.has(argEnablePreview);
++        }
++
+         void addOptions(OptionKind kind, Collection<String> vals) {
+             if (!vals.isEmpty()) {
+                 if (kind.onlyOne && vals.size() > 1) {
+@@ -627,7 +635,8 @@ public class JShellTool implements MessageHandler {
+                 initialStartup = Startup.noStartup();
+             } else {
+                 String packedStartup = prefs.get(STARTUP_KEY);
+-                initialStartup = Startup.unpack(packedStartup, new InitMessageHandler());
++                boolean preview = previewEnabled(options);
++                initialStartup = Startup.unpack(packedStartup, preview, new InitMessageHandler());
+             }
+             if (options.has(argExecution)) {
+                 executionControlSpec = options.valueOf(argExecution);
+@@ -2285,7 +2294,8 @@ public class JShellTool implements MessageHandler {
+                 return false;
+             }
+         } else if (defaultOption) {
+-            startup = Startup.defaultStartup(this);
++            boolean preview = options.hasOption(OptionKind.ENABLE_PREVIEW);
++            startup = Startup.defaultStartup(preview, this);
+         } else if (noneOption) {
+             startup = Startup.noStartup();
+         }
+@@ -2302,7 +2312,8 @@ public class JShellTool implements MessageHandler {
+         StringBuilder sb = new StringBuilder();
+         String retained = prefs.get(STARTUP_KEY);
+         if (retained != null) {
+-            Startup retainedStart = Startup.unpack(retained, this);
++            boolean preview = options.hasOption(OptionKind.ENABLE_PREVIEW);
++            Startup retainedStart = Startup.unpack(retained, preview, this);
+             boolean currentDifferent = !startup.equals(retainedStart);
+             sb.append(retainedStart.show(true));
+             if (currentDifferent) {
+diff --git a/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/Startup.java b/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/Startup.java
+index 372faf9f08a..53c31c3568d 100644
+--- a/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/Startup.java
++++ b/src/jdk.jshell/share/classes/jdk/internal/jshell/tool/Startup.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2016, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2016, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -118,9 +118,13 @@ class Startup {
+     }
+ 
+     private static final String DEFAULT_STARTUP_NAME = "DEFAULT";
++    private static final String PREVIEW_DEFAULT_STARTUP_NAME = "PREVIEW_DEFAULT";
+ 
+     // cached DEFAULT start-up
+-    private static Startup defaultStartup = null;
++    private static Startup[] defaultStartup = new Startup[] {
++        null, //standard startup
++        null  //preview  startup
++    };
+ 
+     // the list of entries
+     private List<StartupEntry> entries;
+@@ -166,7 +170,8 @@ class Startup {
+     boolean isDefault() {
+         if (entries.size() == 1) {
+             StartupEntry sue = entries.get(0);
+-            if (sue.isBuiltIn && sue.name.equals(DEFAULT_STARTUP_NAME)) {
++            if (sue.isBuiltIn && (sue.name.equals(DEFAULT_STARTUP_NAME) ||
++                                  sue.name.equals(PREVIEW_DEFAULT_STARTUP_NAME))) {
+                 return true;
+             }
+         }
+@@ -217,7 +222,7 @@ class Startup {
+      * @param mh handler for error messages
+      * @return Startup, or default startup when error (message has been printed)
+      */
+-    static Startup unpack(String storedForm, MessageHandler mh) {
++    static Startup unpack(String storedForm, boolean preview, MessageHandler mh) {
+         if (storedForm != null) {
+             if (storedForm.isEmpty()) {
+                 return noStartup();
+@@ -255,7 +260,7 @@ class Startup {
+                 mh.errormsg("jshell.err.corrupted.stored.startup", ex.getMessage());
+             }
+         }
+-        return defaultStartup(mh);
++        return defaultStartup(preview, mh);
+     }
+ 
+     /**
+@@ -324,22 +329,26 @@ class Startup {
+      * @param mh handler for error messages
+      * @return The default Startup, or empty startup when error (message has been printed)
+      */
+-    static Startup defaultStartup(MessageHandler mh) {
+-        if (defaultStartup != null) {
+-            return defaultStartup;
++    static Startup defaultStartup(boolean preview, MessageHandler mh) {
++        int idx = preview ? 1 : 0;
++
++        if (defaultStartup[idx] != null) {
++            return defaultStartup[idx];
+         }
++        String resourceName = preview ? PREVIEW_DEFAULT_STARTUP_NAME
++                                      : DEFAULT_STARTUP_NAME;
+         try {
+-            String content = readResource(DEFAULT_STARTUP_NAME);
+-            return defaultStartup = new Startup(
+-                    new StartupEntry(true, DEFAULT_STARTUP_NAME, content));
++            String content = readResource(resourceName);
++            return defaultStartup[idx] = new Startup(
++                    new StartupEntry(true, resourceName, content));
+         } catch (AccessDeniedException e) {
+-            mh.errormsg("jshell.err.file.not.accessible", "jshell", DEFAULT_STARTUP_NAME, e.getMessage());
++            mh.errormsg("jshell.err.file.not.accessible", "jshell", resourceName, e.getMessage());
+         } catch (NoSuchFileException e) {
+-            mh.errormsg("jshell.err.file.not.found", "jshell", DEFAULT_STARTUP_NAME);
++            mh.errormsg("jshell.err.file.not.found", "jshell", resourceName);
+         } catch (Exception e) {
+-            mh.errormsg("jshell.err.file.exception", "jshell", DEFAULT_STARTUP_NAME, e);
++            mh.errormsg("jshell.err.file.exception", "jshell", resourceName, e);
+         }
+-        return defaultStartup = noStartup();
++        return defaultStartup[idx] = noStartup();
+     }
+ 
+ }
+diff --git a/src/jdk.jshell/share/classes/jdk/jshell/Eval.java b/src/jdk.jshell/share/classes/jdk/jshell/Eval.java
+index 3c45fbdbd14..0ee6a926b41 100644
+--- a/src/jdk.jshell/share/classes/jdk/jshell/Eval.java
++++ b/src/jdk.jshell/share/classes/jdk/jshell/Eval.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2014, 2021, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -83,6 +83,7 @@ import static jdk.jshell.Snippet.Status.VALID;
+ import static jdk.jshell.Util.DOIT_METHOD_NAME;
+ import static jdk.jshell.Util.PREFIX_PATTERN;
+ import static jdk.jshell.Util.expunge;
++import static jdk.jshell.Snippet.SubKind.MODULE_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.SINGLE_TYPE_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.SINGLE_STATIC_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.TYPE_IMPORT_ON_DEMAND_SUBKIND;
+@@ -96,7 +97,7 @@ import static jdk.jshell.Snippet.SubKind.STATIC_IMPORT_ON_DEMAND_SUBKIND;
+  */
+ class Eval {
+ 
+-    private static final Pattern IMPORT_PATTERN = Pattern.compile("import\\p{javaWhitespace}+(?<static>static\\p{javaWhitespace}+)?(?<fullname>[\\p{L}\\p{N}_\\$\\.]+\\.(?<name>[\\p{L}\\p{N}_\\$]+|\\*))");
++    private static final Pattern IMPORT_PATTERN = Pattern.compile("import\\p{javaWhitespace}+(?<module>module\\p{javaWhitespace}+)?(?<static>static\\p{javaWhitespace}+)?(?<fullname>[\\p{L}\\p{N}_\\$\\.]+\\.(?<name>[\\p{L}\\p{N}_\\$]+|\\*))");
+     private static final Pattern DEFAULT_PREFIX = Pattern.compile("\\p{javaWhitespace}*(default)\\p{javaWhitespace}+");
+ 
+     // for uses that should not change state -- non-evaluations
+@@ -244,13 +245,20 @@ class Eval {
+         Matcher mat = IMPORT_PATTERN.matcher(compileSource);
+         String fullname;
+         String name;
++        boolean isModule;
+         boolean isStatic;
+         if (mat.find()) {
++            isModule = mat.group("module") != null;
+             isStatic = mat.group("static") != null;
+-            name = mat.group("name");
+             fullname = mat.group("fullname");
++            if (isModule) {
++                name = fullname;
++            } else {
++                name = mat.group("name");
++            }
+         } else {
+             // bad import -- fake it
++            isModule = compileSource.contains(" module ");
+             isStatic = compileSource.contains("static");
+             name = fullname = compileSource;
+         }
+@@ -259,9 +267,14 @@ class Eval {
+         String keyName = isStar
+                 ? fullname
+                 : name;
+-        SubKind snippetKind = isStar
+-                ? (isStatic ? STATIC_IMPORT_ON_DEMAND_SUBKIND : TYPE_IMPORT_ON_DEMAND_SUBKIND)
+-                : (isStatic ? SINGLE_STATIC_IMPORT_SUBKIND : SINGLE_TYPE_IMPORT_SUBKIND);
++        SubKind snippetKind;
++        if (isModule) {
++            snippetKind = MODULE_IMPORT_SUBKIND;
++        } else if (isStar) {
++            snippetKind = isStatic ? STATIC_IMPORT_ON_DEMAND_SUBKIND : TYPE_IMPORT_ON_DEMAND_SUBKIND;
++        } else {
++            snippetKind = isStatic ? SINGLE_STATIC_IMPORT_SUBKIND : SINGLE_TYPE_IMPORT_SUBKIND;
++        }
+         Snippet snip = new ImportSnippet(state.keyMap.keyForImport(keyName, snippetKind),
+                 userSource, guts, fullname, name, snippetKind, fullkey, isStatic, isStar);
+         return singletonList(snip);
+diff --git a/src/jdk.jshell/share/classes/jdk/jshell/Snippet.java b/src/jdk.jshell/share/classes/jdk/jshell/Snippet.java
+index 2b4d817a588..a86ea2a863d 100644
+--- a/src/jdk.jshell/share/classes/jdk/jshell/Snippet.java
++++ b/src/jdk.jshell/share/classes/jdk/jshell/Snippet.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2015, 2022, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -28,6 +28,7 @@ package jdk.jshell;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.List;
++import jdk.internal.javac.PreviewFeature;
+ 
+ /**
+  * A Snippet represents a snippet of Java source code as passed to
+@@ -214,6 +215,15 @@ public abstract class Snippet {
+          */
+         STATIC_IMPORT_ON_DEMAND_SUBKIND(Kind.IMPORT),
+ 
++        /**
++         * Import Module Declaration.
++         * An import declaration of a module.
++         * @jls 7.5.5 Import Module Declarations
++         * @since 23
++         */
++        @PreviewFeature(feature=PreviewFeature.Feature.MODULE_IMPORTS, reflective=true)
++        MODULE_IMPORT_SUBKIND(Kind.IMPORT),
++
+         /**
+          * A class declaration.
+          * A {@code SubKind} of {@link Kind#TYPE_DECL}.
+diff --git a/src/jdk.jshell/share/classes/jdk/jshell/tool/resources/PREVIEW_DEFAULT.jsh b/src/jdk.jshell/share/classes/jdk/jshell/tool/resources/PREVIEW_DEFAULT.jsh
+new file mode 100644
+index 00000000000..4644ac86386
+--- /dev/null
++++ b/src/jdk.jshell/share/classes/jdk/jshell/tool/resources/PREVIEW_DEFAULT.jsh
+@@ -0,0 +1 @@
++import module java.base;
+diff --git a/test/langtools/jdk/jshell/ImportTest.java b/test/langtools/jdk/jshell/ImportTest.java
+index e09490052cf..b8f3f1ee5d0 100644
+--- a/test/langtools/jdk/jshell/ImportTest.java
++++ b/test/langtools/jdk/jshell/ImportTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2015, 2016, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -33,16 +33,20 @@
+  * @run testng ImportTest
+  */
+ 
++import java.lang.reflect.Method;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
++import java.util.function.Consumer;
+ 
+ import javax.tools.Diagnostic;
++import jdk.jshell.JShell;
+ 
+ import jdk.jshell.Snippet;
+ import org.testng.annotations.Test;
+ 
+ import static jdk.jshell.Snippet.Status.VALID;
+ import static jdk.jshell.Snippet.Status.OVERWRITTEN;
++import static jdk.jshell.Snippet.SubKind.MODULE_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.SINGLE_TYPE_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.SINGLE_STATIC_IMPORT_SUBKIND;
+ import static jdk.jshell.Snippet.SubKind.TYPE_IMPORT_ON_DEMAND_SUBKIND;
+@@ -168,4 +172,20 @@ public class ImportTest extends KullaTesting {
+         assertImportKeyMatch("import java.util.List;//comment", "List", SINGLE_TYPE_IMPORT_SUBKIND, added(VALID));
+         assertEval("List l = null;");
+     }
++
++    public void testImportModule() {
++        assertImportKeyMatch("import module java.base;", "java.base", MODULE_IMPORT_SUBKIND, added(VALID));
++        assertEval("MethodHandle m;");
++    }
++
++    @org.testng.annotations.BeforeMethod
++    public void setUp(Method m) {
++        switch (m.getName()) {
++            case "testImportModule" ->
++                super.setUp(bc -> bc.compilerOptions("--source", System.getProperty("java.specification.version"), "--enable-preview").remoteVMOptions("--enable-preview"));
++            default ->
++                super.setUp(bc -> {});
++        }
++    }
++
+ }
+diff --git a/test/langtools/jdk/jshell/KullaTesting.java b/test/langtools/jdk/jshell/KullaTesting.java
+index d74f3484f4b..e3eb6ef2823 100644
+--- a/test/langtools/jdk/jshell/KullaTesting.java
++++ b/test/langtools/jdk/jshell/KullaTesting.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2014, 2015, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -268,6 +268,7 @@ public class KullaTesting {
+         SubKind expectedSubKind = key.subKind();
+         Kind expectedKind;
+         switch (expectedSubKind) {
++            case MODULE_IMPORT_SUBKIND:
+             case SINGLE_TYPE_IMPORT_SUBKIND:
+             case SINGLE_STATIC_IMPORT_SUBKIND:
+             case TYPE_IMPORT_ON_DEMAND_SUBKIND:
+diff --git a/test/langtools/jdk/jshell/StartOptionTest.java b/test/langtools/jdk/jshell/StartOptionTest.java
+index aa8d9be03a9..60926e69843 100644
+--- a/test/langtools/jdk/jshell/StartOptionTest.java
++++ b/test/langtools/jdk/jshell/StartOptionTest.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
++ * Copyright (c) 2015, 2024, Oracle and/or its affiliates. All rights reserved.
+  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+  *
+  * This code is free software; you can redistribute it and/or modify it
+@@ -126,6 +126,13 @@ public class StartOptionTest {
+         check(usererr, null, "usererr");
+     }
+ 
++    protected void startCheckUserOutput(Consumer<String> checkUserOutput,
++            String... args) {
++        runShell(args);
++        check(userout, checkUserOutput, "userout");
++        check(usererr, null, "usererr");
++    }
++
+     // Start with an exit code and command error check
+     protected void startExCe(int eec, Consumer<String> checkError, String... args) {
+         StartOptionTest.this.startExCoUoCeCn(
+@@ -358,6 +365,17 @@ public class StartOptionTest {
+                 "--show-version");
+     }
+ 
++    public void testPreviewEnabled() {
++        String fn = writeToFile("System.out.println(\"prefix\");\n" +
++                "System.out.println(MethodHandle.class.getName());\n" +
++                "System.out.println(\"suffix\");\n" +
++                "/exit\n");
++        startCheckUserOutput(s -> assertEquals(s, "prefix\nsuffix\n"),
++                             fn);
++        startCheckUserOutput(s -> assertEquals(s, "prefix\njava.lang.invoke.MethodHandle\nsuffix\n"),
++                             "--enable-preview", fn);
++    }
++
+     @AfterMethod
+     public void tearDown() {
+         cmdout = null;
+diff --git a/test/langtools/jdk/jshell/ToolProviderTest.java b/test/langtools/jdk/jshell/ToolProviderTest.java
+index be8ba23f7c4..e27ed410d52 100644
+--- a/test/langtools/jdk/jshell/ToolProviderTest.java
++++ b/test/langtools/jdk/jshell/ToolProviderTest.java
+@@ -22,6 +22,7 @@
+  */
+ 
+ import java.util.ServiceLoader;
++import java.util.function.Consumer;
+ import javax.tools.Tool;
+ import org.testng.annotations.Test;
+ import static org.testng.Assert.assertTrue;
+@@ -58,6 +59,13 @@ public class ToolProviderTest extends StartOptionTest {
+                 null, expectedError, null, args);
+     }
+ 
++    @Override
++    protected void startCheckUserOutput(Consumer<String> checkUserOutput, String... args) {
++        runShell(args);
++        check(cmdout, checkUserOutput, "userout");
++        check(usererr, null, "usererr");
++    }
++
+     @Override
+     protected int runShell(String... args) {
+         ServiceLoader<Tool> sl = ServiceLoader.load(Tool.class);
+diff --git a/test/langtools/tools/javac/ImportModule.java b/test/langtools/tools/javac/ImportModule.java
+new file mode 100644
+index 00000000000..767288d4d2f
+--- /dev/null
++++ b/test/langtools/tools/javac/ImportModule.java
+@@ -0,0 +1,722 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/**
++ * @test
++ * @bug 8328481
++ * @summary Check behavior of module imports.
++ * @library /tools/lib
++ * @modules java.logging
++ *          java.sql
++ *          jdk.compiler/com.sun.tools.javac.api
++ *          jdk.compiler/com.sun.tools.javac.main
++ *          jdk.compiler/com.sun.tools.javac.util
++ * @build toolbox.ToolBox toolbox.JavacTask
++ * @run main ImportModule
++*/
++
++import com.sun.source.tree.Tree;
++import com.sun.source.util.TaskEvent;
++import com.sun.source.util.TaskEvent.Kind;
++import com.sun.source.util.TaskListener;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++
++import toolbox.TestRunner;
++import toolbox.JavacTask;
++import toolbox.JavaTask;
++import toolbox.Task;
++import toolbox.ToolBox;
++
++public class ImportModule extends TestRunner {
++
++    private static final String SOURCE_VERSION = System.getProperty("java.specification.version");
++    private ToolBox tb;
++
++    public static void main(String... args) throws Exception {
++        new ImportModule().runTests();
++    }
++
++    ImportModule() {
++        super(System.err);
++        tb = new ToolBox();
++    }
++
++    public void runTests() throws Exception {
++        runTests(m -> new Object[] { Paths.get(m.getName()) });
++    }
++
++    @Test
++    public void testImportJavaBase(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          public class Test {
++                              public static void main(String... args) {
++                                  List<String> l = new ArrayList<>();
++                                  System.out.println(l.getClass().getName());
++                              }
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++
++        {//with --release:
++            new JavacTask(tb)
++                .options("--enable-preview", "--release", SOURCE_VERSION)
++                .outdir(classes)
++                .files(tb.findJavaFiles(src))
++                .run(Task.Expect.SUCCESS)
++                .writeAll();
++
++            var out = new JavaTask(tb)
++                    .classpath(classes.toString())
++                    .className("test.Test")
++                    .vmOptions("--enable-preview")
++                    .run()
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.STDOUT);
++
++            var expectedOut = List.of("java.util.ArrayList");
++
++            if (!Objects.equals(expectedOut, out)) {
++                throw new AssertionError("Incorrect Output, expected: " + expectedOut +
++                                          ", actual: " + out);
++
++            }
++        }
++
++        {//with --source:
++            new JavacTask(tb)
++                .options("--enable-preview", "--source", SOURCE_VERSION)
++                .outdir(classes)
++                .files(tb.findJavaFiles(src))
++                .run(Task.Expect.SUCCESS)
++                .writeAll();
++
++            var out = new JavaTask(tb)
++                    .classpath(classes.toString())
++                    .className("test.Test")
++                    .vmOptions("--enable-preview")
++                    .run()
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.STDOUT);
++
++            var expectedOut = List.of("java.util.ArrayList");
++
++            if (!Objects.equals(expectedOut, out)) {
++                throw new AssertionError("Incorrect Output, expected: " + expectedOut +
++                                          ", actual: " + out);
++
++            }
++        }
++    }
++
++    @Test
++    public void testVerifySourceLevelCheck(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          public class Test {
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++
++        List<String> actualErrors;
++        List<String> expectedErrors;
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--release", "21", "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:2:8: compiler.err.preview.feature.disabled.plural: (compiler.misc.feature.module.imports)",
++                "1 error"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++        actualErrors =
++                new JavacTask(tb)
++                    .options("-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:2:8: compiler.err.preview.feature.disabled.plural: (compiler.misc.feature.module.imports)",
++                "1 error"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++    }
++
++    @Test
++    public void testConflicts(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.logging;
++                          import java.lang.System.*;
++                          public class Test {
++                              Logger l;
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++
++        List<String> actualErrors;
++        List<String> expectedErrors;
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:5:5: compiler.err.ref.ambiguous: Logger, kindname.interface, java.lang.System.Logger, java.lang.System, kindname.class, java.util.logging.Logger, java.util.logging",
++                "- compiler.note.preview.filename: Test.java, DEFAULT",
++                "- compiler.note.preview.recompile",
++                "1 error"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.logging;
++                          import java.lang.System.*;
++                          import java.lang.System.Logger;
++                          public class Test {
++                              Logger l;
++                          }
++                          """);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .run()
++            .writeAll();
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.logging;
++                          import java.lang.System.*;
++                          import java.util.logging.Logger;
++                          public class Test {
++                              Logger l;
++                          }
++                          """);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .run()
++            .writeAll();
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.logging;
++                          import java.lang.System.*;
++                          public class Test {
++                          }
++                          """);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .run()
++            .writeAll();
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          import module java.sql;
++                          public class Test {
++                              Date d;
++                          }
++                          """);
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:5:5: compiler.err.ref.ambiguous: Date, kindname.class, java.sql.Date, java.sql, kindname.class, java.util.Date, java.util",
++                "- compiler.note.preview.filename: Test.java, DEFAULT",
++                "- compiler.note.preview.recompile",
++                "1 error"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          import module java.sql;
++                          import java.util.Date;
++                          public class Test {
++                              Date d;
++                          }
++                          """);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .run()
++            .writeAll();
++    }
++
++    @Test
++    public void testNoQualifiedExports(Path base) throws Exception {
++        Path current = base.resolve(".");
++
++        Path lib = current.resolve("lib");
++        Path libSrc = lib.resolve("src");
++        Path libClasses = lib.resolve("classes");
++        tb.writeJavaFiles(libSrc,
++                          """
++                          module lib {
++                              exports api;
++                              exports impl to use;
++                          }
++                          """,
++                          """
++                          package api;
++                          public class Api {
++                          }
++                          """,
++                          """
++                          package impl;
++                          public class Impl {
++                          }
++                          """);
++
++        Files.createDirectories(libClasses);
++
++        new JavacTask(tb)
++            .outdir(libClasses)
++            .files(tb.findJavaFiles(libSrc))
++            .run()
++            .writeAll();
++
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module lib;
++                          public class Test {
++                              public static void main(String... args) {
++                                  Api a;
++                                  Impl i;
++                              }
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++
++        List<String> actualErrors;
++        List<String> expectedErrors;
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "-p", libClasses.toString(),
++                             "--add-modules", "lib",
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:6:9: compiler.err.cant.resolve.location: kindname.class, Impl, , , (compiler.misc.location: kindname.class, test.Test, null)",
++                "- compiler.note.preview.filename: Test.java, DEFAULT",
++                "- compiler.note.preview.recompile",
++                "1 error"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "-p", libClasses.toString(),
++                             "-XDdev",
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:2:1: compiler.err.import.module.does.not.read.unnamed: lib",
++                "Test.java:6:9: compiler.err.cant.resolve.location: kindname.class, Impl, , , (compiler.misc.location: kindname.class, test.Test, null)",
++                "- compiler.note.preview.filename: Test.java, DEFAULT",
++                "- compiler.note.preview.recompile",
++                "2 errors"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++
++        tb.writeJavaFiles(src,
++                          """
++                          module test.module {
++                          }
++                          """);
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "-p", libClasses.toString(),
++                             "-XDdev",
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test.java:2:1: compiler.err.import.module.does.not.read: test.module, lib",
++                "Test.java:6:9: compiler.err.cant.resolve.location: kindname.class, Impl, , , (compiler.misc.location: kindname.class, test.Test, null)",
++                "- compiler.note.preview.filename: Test.java, DEFAULT",
++                "- compiler.note.preview.recompile",
++                "2 errors"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++    }
++
++    @Test
++    public void testTransitiveDependencies(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path lib = current.resolve("lib");
++        Path libSrc = lib.resolve("src");
++        Path libM1 = libSrc.resolve("m1");
++        tb.writeJavaFiles(libM1,
++                          """
++                          module m1 {
++                              requires transitive m2;
++                              exports api1;
++                              exports api2 to test;
++                              exports api3 to m3;
++                          }
++                          """,
++                          """
++                          package api1;
++                          public class Api1 {
++                          }
++                          """,
++                          """
++                          package api2;
++                          public class Api2 {
++                          }
++                          """,
++                          """
++                          package api3;
++                          public class Api3 {
++                          }
++                          """,
++                          """
++                          package impl1;
++                          public class Impl1 {
++                          }
++                          """);
++
++        Path libM2 = libSrc.resolve("m2");
++        tb.writeJavaFiles(libM2,
++                          """
++                          module m2 {
++                              exports api4;
++                              exports api5 to test;
++                              exports api6 to m3;
++                          }
++                          """,
++                          """
++                          package api4;
++                          public class Api4 {
++                          }
++                          """,
++                          """
++                          package api5;
++                          public class Api5 {
++                          }
++                          """,
++                          """
++                          package api6;
++                          public class Api6 {
++                          }
++                          """,
++                          """
++                          package impl2;
++                          public class Impl2 {
++                          }
++                          """);
++
++        Path libClasses = lib.resolve("classes");
++        Files.createDirectories(libClasses);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION,
++                     "--module-source-path", libSrc.toString(),
++                     "-XDrawDiagnostics")
++            .outdir(libClasses)
++            .files(tb.findJavaFiles(libSrc))
++            .run()
++            .writeAll();
++
++        Path src = current.resolve("src");
++        tb.writeJavaFiles(src,
++                          """
++                          module test {
++                              requires m1;
++                          }
++                          """,
++                          """
++                          package test;
++                          import module m1;
++                          public class Test1 {
++                              Api1 a1;
++                              Api2 a2;
++                              Api3 a3;
++                              Impl1 i1;
++                              Api4 a4;
++                              Api5 a5;
++                              Api6 a6;
++                              Impl2 i2;
++                          }
++                          """,
++                          """
++                          package test;
++                          import module m2;
++                          public class Test2 {
++                              Api1 a1;
++                              Api2 a2;
++                              Api3 a3;
++                              Impl1 i1;
++                              Api4 a4;
++                              Api5 a5;
++                              Api6 a6;
++                              Impl2 i2;
++                          }
++                          """);
++
++        Path classes = current.resolve("classes");
++        Files.createDirectories(classes);
++
++        List<String> actualErrors;
++        List<String> expectedErrors;
++
++        actualErrors =
++                new JavacTask(tb)
++                    .options("--enable-preview", "--release", SOURCE_VERSION,
++                             "--module-path", libClasses.toString(),
++                             "-XDrawDiagnostics")
++                    .outdir(classes)
++                    .files(tb.findJavaFiles(src))
++                    .run(Task.Expect.FAIL)
++                    .writeAll()
++                    .getOutputLines(Task.OutputKind.DIRECT);
++
++        expectedErrors = List.of(
++                "Test1.java:6:5: compiler.err.cant.resolve.location: kindname.class, Api3, , , (compiler.misc.location: kindname.class, test.Test1, null)",
++                "Test1.java:7:5: compiler.err.cant.resolve.location: kindname.class, Impl1, , , (compiler.misc.location: kindname.class, test.Test1, null)",
++                "Test1.java:10:5: compiler.err.cant.resolve.location: kindname.class, Api6, , , (compiler.misc.location: kindname.class, test.Test1, null)",
++                "Test1.java:11:5: compiler.err.cant.resolve.location: kindname.class, Impl2, , , (compiler.misc.location: kindname.class, test.Test1, null)",
++                "Test2.java:4:5: compiler.err.cant.resolve.location: kindname.class, Api1, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "Test2.java:5:5: compiler.err.cant.resolve.location: kindname.class, Api2, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "Test2.java:6:5: compiler.err.cant.resolve.location: kindname.class, Api3, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "Test2.java:7:5: compiler.err.cant.resolve.location: kindname.class, Impl1, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "Test2.java:10:5: compiler.err.cant.resolve.location: kindname.class, Api6, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "Test2.java:11:5: compiler.err.cant.resolve.location: kindname.class, Impl2, , , (compiler.misc.location: kindname.class, test.Test2, null)",
++                "- compiler.note.preview.plural: DEFAULT",
++                "- compiler.note.preview.recompile",
++                "10 errors"
++        );
++
++        if (!Objects.equals(expectedErrors, actualErrors)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedErrors +
++                                      ", actual: " + out);
++
++        }
++    }
++
++    @Test
++    public void testModel(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          public class Test {
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++        List<String> kinds = new ArrayList<>();
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .callback(task -> {
++                task.addTaskListener(new TaskListener() {
++                    @Override
++                    public void finished(TaskEvent e) {
++                        if (e.getKind() == Kind.ANALYZE) {
++                            for (Tree t : e.getCompilationUnit().getTypeDecls()) {
++                                kinds.add(t.getKind().name());
++                            }
++                        }
++                    }
++                });
++            })
++            .files(tb.findJavaFiles(src))
++            .run(Task.Expect.SUCCESS)
++            .writeAll();
++
++        List<String> expectedKinds = List.of(
++            "CLASS"
++        );
++
++        if (!Objects.equals(expectedKinds, kinds)) {
++            throw new AssertionError("Incorrect Output, expected: " + expectedKinds +
++                                      ", actual: " + kinds);
++
++        }
++    }
++
++    @Test
++    public void testModelDisambiguation(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module.*;
++                          import module.ModuleClass;
++                          import module.module.*;
++                          import module.module.ModuleModuleClass;
++                          public class Test {
++                          }
++                          """,
++                          """
++                          package module;
++                          public class ModuleClass{
++                          }
++                          """,
++                          """
++                          package module.module;
++                          public class ModuleModuleClass {
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++        List<String> kinds = new ArrayList<>();
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .run(Task.Expect.SUCCESS)
++            .writeAll();
++    }
++
++}
+diff --git a/test/langtools/tools/javac/diags/examples/ImportModule.java b/test/langtools/tools/javac/diags/examples/ImportModule.java
+new file mode 100644
+index 00000000000..2a0a39f5fad
+--- /dev/null
++++ b/test/langtools/tools/javac/diags/examples/ImportModule.java
+@@ -0,0 +1,31 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++ // key: compiler.misc.feature.module.imports
++ // key: compiler.warn.preview.feature.use.plural
++ // options: --release ${jdk.version} --enable-preview -Xlint:preview
++
++import module java.base;
++
++public class ImportModule {
++}
+diff --git a/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/module-info.java b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/module-info.java
+new file mode 100644
+index 00000000000..e8f9c952fbc
+--- /dev/null
++++ b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/module-info.java
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++// key: compiler.err.import.module.does.not.read
++// key: compiler.note.preview.filename
++// key: compiler.note.preview.recompile
++// options: --release ${jdk.version} --enable-preview
++module m {}
+diff --git a/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/test/Test.java b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/test/Test.java
+new file mode 100644
+index 00000000000..a23fe670401
+--- /dev/null
++++ b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotRead/test/Test.java
+@@ -0,0 +1,26 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++import module java.compiler;
++
++public class Test {}
+diff --git a/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotReadUnnamed.java b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotReadUnnamed.java
+new file mode 100644
+index 00000000000..37ae9673cc8
+--- /dev/null
++++ b/test/langtools/tools/javac/diags/examples/ImportModuleDoesNotReadUnnamed.java
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++// key: compiler.err.import.module.does.not.read.unnamed
++// key: compiler.note.preview.filename
++// key: compiler.note.preview.recompile
++// options: --release ${jdk.version} --enable-preview --limit-modules java.base
++
++import module java.compiler;
++
++public class ImportModuleDoesNotReadUnnamed {
++}
+diff --git a/test/langtools/tools/javac/diags/examples/ImportModuleNotFound.java b/test/langtools/tools/javac/diags/examples/ImportModuleNotFound.java
+new file mode 100644
+index 00000000000..8a12fc0bd03
+--- /dev/null
++++ b/test/langtools/tools/javac/diags/examples/ImportModuleNotFound.java
+@@ -0,0 +1,32 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++ // key: compiler.err.import.module.not.found
++ // key: compiler.note.preview.filename
++ // key: compiler.note.preview.recompile
++ // options: --release ${jdk.version} --enable-preview
++
++import module unknown;
++
++public class ImportModuleNotFound {
++}
+diff --git a/test/langtools/tools/javac/tree/Imports.java b/test/langtools/tools/javac/tree/Imports.java
+new file mode 100644
+index 00000000000..8ab59d280f6
+--- /dev/null
++++ b/test/langtools/tools/javac/tree/Imports.java
+@@ -0,0 +1,137 @@
++/*
++ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ */
++
++/*
++ * @test
++ * @bug 8328481
++ * @summary Verify the Trees model for module imports
++ * @library /tools/lib
++ * @modules java.logging
++ *          java.sql
++ *          jdk.compiler/com.sun.tools.javac.api
++ *          jdk.compiler/com.sun.tools.javac.main
++ *          jdk.compiler/com.sun.tools.javac.util
++ * @build toolbox.ToolBox toolbox.JavacTask
++ * @run main Imports
++*/
++
++import com.sun.source.tree.ImportTree;
++import com.sun.source.util.TaskEvent;
++import com.sun.source.util.TaskEvent.Kind;
++import com.sun.source.util.TaskListener;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import toolbox.TestRunner;
++import toolbox.JavacTask;
++import toolbox.Task;
++import toolbox.ToolBox;
++
++public class Imports extends TestRunner {
++
++    private static final String SOURCE_VERSION = System.getProperty("java.specification.version");
++    private ToolBox tb;
++
++    public static void main(String... args) throws Exception {
++        new Imports().runTests();
++    }
++
++    Imports() {
++        super(System.err);
++        tb = new ToolBox();
++    }
++
++    public void runTests() throws Exception {
++        runTests(m -> new Object[] { Paths.get(m.getName()) });
++    }
++
++    @Test
++    public void testModuleImport(Path base) throws Exception {
++        Path current = base.resolve(".");
++        Path src = current.resolve("src");
++        Path classes = current.resolve("classes");
++        tb.writeJavaFiles(src,
++                          """
++                          package test;
++                          import module java.base;
++                          public class Test {
++                          }
++                          """);
++
++        Files.createDirectories(classes);
++
++        AtomicInteger seenImports = new AtomicInteger(-1);
++
++        new JavacTask(tb)
++            .options("--enable-preview", "--release", SOURCE_VERSION)
++            .outdir(classes)
++            .files(tb.findJavaFiles(src))
++            .callback(task -> {
++                task.addTaskListener(new TaskListener() {
++                    @Override
++                    public void finished(TaskEvent e) {
++                        if (e.getKind() != Kind.PARSE) {
++                            return ;
++                        }
++
++                        var imports = e.getCompilationUnit().getImports();
++
++                        seenImports.set(imports.size());
++
++                        if (imports.size() != 1) {
++                            throw new AssertionError("Exception 1 import, " +
++                                                     "but got: " + imports.size());
++                        }
++
++                        ImportTree it = imports.get(0);
++
++                        if (!it.isModule()) {
++                            throw new AssertionError("Expected module import, but got ordinary one.");
++                        }
++
++                        if (!"java.base".equals(it.getQualifiedIdentifier().toString())) {
++                            throw new AssertionError("Expected module import for java.base, " +
++                                                     "but got: " + it.getQualifiedIdentifier());
++                        }
++
++                        String expectedImportToString = "import module java.base;\n";
++                        String actualImportToString = it.toString()
++                                                        .replaceAll("\\R", "\n");
++
++                        if (!expectedImportToString.equals(actualImportToString)) {
++                            throw new AssertionError("Expected '" + expectedImportToString + "', " +
++                                                     "but got: '" + it + "'");
++                        }
++                    }
++                });
++            })
++            .run(Task.Expect.SUCCESS);
++
++        if (seenImports.get() == (-1)) {
++            throw new AssertionError("Did not verify any imports!");
++        }
++    }
++
++}
+diff --git a/test/langtools/tools/jdeps/listdeps/ListModuleDeps.java b/test/langtools/tools/jdeps/listdeps/ListModuleDeps.java
+index aa30682e1bc..63814220c03 100644
+--- a/test/langtools/tools/jdeps/listdeps/ListModuleDeps.java
++++ b/test/langtools/tools/jdeps/listdeps/ListModuleDeps.java
+@@ -92,6 +92,7 @@ public class ListModuleDeps {
+     public Object[][] jdkModules() {
+         return new Object[][]{
+             {"jdk.compiler", new String[]{
++                                "java.base/jdk.internal.javac",
+                                 "java.base/jdk.internal.jmod",
+                                 "java.base/jdk.internal.misc",
+                                 "java.base/jdk.internal.module",
+diff --git a/test/langtools/tools/lib/toolbox/ToolBox.java b/test/langtools/tools/lib/toolbox/ToolBox.java
+index 89dd7229016..8f1f8d3ce4a 100644
+--- a/test/langtools/tools/lib/toolbox/ToolBox.java
++++ b/test/langtools/tools/lib/toolbox/ToolBox.java
+@@ -747,6 +747,8 @@ public class ToolBox {
+ 
+         private final static Pattern commentPattern =
+                 Pattern.compile("(?s)(\\s+//.*?\n|/\\*.*?\\*/)");
++        private final static Pattern importModulePattern =
++                Pattern.compile("import\\s+module\\s+(((?:\\w+\\.)*)\\w+);");
+         private final static Pattern modulePattern =
+                 Pattern.compile("module\\s+((?:\\w+\\.)*)");
+         private final static Pattern packagePattern =
+@@ -761,15 +763,10 @@ public class ToolBox {
+          * declarations from which the name is derived.
+          */
+         static String getJavaFileNameFromSource(String source) {
+-            StringBuilder sb = new StringBuilder();
+-            Matcher matcher = commentPattern.matcher(source);
+-            int start = 0;
+-            while (matcher.find()) {
+-                sb.append(source, start, matcher.start());
+-                start = matcher.end();
+-            }
+-            sb.append(source.substring(start));
+-            source = sb.toString();
++            source = removeMatchingSpans(source, commentPattern);
++            source = removeMatchingSpans(source, importModulePattern);
++
++            Matcher matcher;
+ 
+             String packageName = null;
+ 
+@@ -795,6 +792,20 @@ public class ToolBox {
+                         "name from the provided source");
+             }
+         }
++
++        static String removeMatchingSpans(String source, Pattern toRemove) {
++            StringBuilder sb = new StringBuilder();
++            Matcher matcher = toRemove.matcher(source);
++            int start = 0;
++
++            while (matcher.find()) {
++                sb.append(source, start, matcher.start());
++                start = matcher.end();
++            }
++
++            sb.append(source.substring(start));
++            return sb.toString();
++        }
+     }
+ 
+     /**

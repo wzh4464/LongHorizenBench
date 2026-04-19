@@ -1,0 +1,17 @@
+Doc/data/stable_abi.dat
+Include/ceval.h
+Include/cpython/frameobject.h
+Include/cpython/pyframe.h
+Include/internal/pycore_frame.h
+Lib/test/test_frame.py
+Lib/test/test_listcomps.py
+Lib/test/test_peepholer.py
+Lib/test/test_sys.py
+Misc/NEWS.d/next/Core and Builtins/2024-04-27-21-44-40.gh-issue-74929.C2nESp.rst
+Misc/stable_abi.toml
+Objects/frameobject.c
+Objects/object.c
+Python/ceval.c
+Python/intrinsics.c
+Python/sysmodule.c
+Tools/c-analyzer/cpython/globals-to-fix.tsv

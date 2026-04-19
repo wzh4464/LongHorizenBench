@@ -1,0 +1,4 @@
+src/norm/add_layer_norm/op_kernel/add_layer_norm_base.h
+src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_single_read.h
+src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_transpose.h
+src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_workspace.h

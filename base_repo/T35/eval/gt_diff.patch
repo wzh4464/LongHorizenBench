@@ -1,0 +1,3405 @@
+diff --git a/BUILD.gn b/BUILD.gn
+index fdd722ea68..6fb16d7bd6 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -224,11 +224,21 @@ webpack_build("electron_utility_bundle") {
+   out_file = "$target_gen_dir/js2c/utility_init.js"
+ }
+ 
++webpack_build("electron_preload_realm_bundle") {
++  deps = [ ":build_electron_definitions" ]
++
++  inputs = auto_filenames.preload_realm_bundle_deps
++
++  config_file = "//electron/build/webpack/webpack.config.preload_realm.js"
++  out_file = "$target_gen_dir/js2c/preload_realm_bundle.js"
++}
++
+ action("electron_js2c") {
+   deps = [
+     ":electron_browser_bundle",
+     ":electron_isolated_renderer_bundle",
+     ":electron_node_bundle",
++    ":electron_preload_realm_bundle",
+     ":electron_renderer_bundle",
+     ":electron_sandboxed_renderer_bundle",
+     ":electron_utility_bundle",
+@@ -240,6 +250,7 @@ action("electron_js2c") {
+     "$target_gen_dir/js2c/browser_init.js",
+     "$target_gen_dir/js2c/isolated_bundle.js",
+     "$target_gen_dir/js2c/node_init.js",
++    "$target_gen_dir/js2c/preload_realm_bundle.js",
+     "$target_gen_dir/js2c/renderer_init.js",
+     "$target_gen_dir/js2c/sandbox_bundle.js",
+     "$target_gen_dir/js2c/utility_init.js",
+diff --git a/build/webpack/webpack.config.preload_realm.js b/build/webpack/webpack.config.preload_realm.js
+new file mode 100644
+index 0000000000..1a776e540d
+--- /dev/null
++++ b/build/webpack/webpack.config.preload_realm.js
+@@ -0,0 +1,6 @@
++module.exports = require('./webpack.config.base')({
++  target: 'preload_realm',
++  alwaysHasNode: false,
++  wrapInitWithProfilingTimeout: true,
++  wrapInitWithTryCatch: true
++});
+diff --git a/docs/api/ipc-main-service-worker.md b/docs/api/ipc-main-service-worker.md
+new file mode 100644
+index 0000000000..8995d66ba7
+--- /dev/null
++++ b/docs/api/ipc-main-service-worker.md
+@@ -0,0 +1,75 @@
++## Class: IpcMainServiceWorker
++
++> Communicate asynchronously from the main process to service workers.
++
++Process: [Main](../glossary.md#main-process)
++
++> [!NOTE]
++> This API is a subtle variation of [`IpcMain`](ipc-main.md)—targeted for
++> communicating with service workers. For communicating with web frames,
++> consult the `IpcMain` documentation.
++
++<!-- TODO(samuelmaddock): refactor doc gen to allow generics to reduce duplication -->
++
++### Instance Methods
++
++#### `ipcMainServiceWorker.on(channel, listener)`
++
++* `channel` string
++* `listener` Function
++  * `event` [IpcMainServiceWorkerEvent][ipc-main-service-worker-event]
++  * `...args` any[]
++
++Listens to `channel`, when a new message arrives `listener` would be called with
++`listener(event, args...)`.
++
++#### `ipcMainServiceWorker.once(channel, listener)`
++
++* `channel` string
++* `listener` Function
++  * `event` [IpcMainServiceWorkerEvent][ipc-main-service-worker-event]
++  * `...args` any[]
++
++Adds a one time `listener` function for the event. This `listener` is invoked
++only the next time a message is sent to `channel`, after which it is removed.
++
++#### `ipcMainServiceWorker.removeListener(channel, listener)`
++
++* `channel` string
++* `listener` Function
++  * `...args` any[]
++
++Removes the specified `listener` from the listener array for the specified
++`channel`.
++
++#### `ipcMainServiceWorker.removeAllListeners([channel])`
++
++* `channel` string (optional)
++
++Removes listeners of the specified `channel`.
++
++#### `ipcMainServiceWorker.handle(channel, listener)`
++
++* `channel` string
++* `listener` Function\<Promise\<any\> | any\>
++  * `event` [IpcMainServiceWorkerInvokeEvent][ipc-main-service-worker-invoke-event]
++  * `...args` any[]
++
++#### `ipcMainServiceWorker.handleOnce(channel, listener)`
++
++* `channel` string
++* `listener` Function\<Promise\<any\> | any\>
++  * `event` [IpcMainServiceWorkerInvokeEvent][ipc-main-service-worker-invoke-event]
++  * `...args` any[]
++
++Handles a single `invoke`able IPC message, then removes the listener. See
++`ipcMainServiceWorker.handle(channel, listener)`.
++
++#### `ipcMainServiceWorker.removeHandler(channel)`
++
++* `channel` string
++
++Removes any handler for `channel`, if present.
++
++[ipc-main-service-worker-event]:../api/structures/ipc-main-service-worker-event.md
++[ipc-main-service-worker-invoke-event]:../api/structures/ipc-main-service-worker-invoke-event.md
+diff --git a/docs/api/process.md b/docs/api/process.md
+index bcf339233f..03a606de9a 100644
+--- a/docs/api/process.md
++++ b/docs/api/process.md
+@@ -114,6 +114,7 @@ A `string` representing the current process's type, can be:
+ 
+ * `browser` - The main process
+ * `renderer` - A renderer process
++* `service-worker` - In a service worker
+ * `worker` - In a web worker
+ * `utility` - In a node process launched as a service
+ 
+diff --git a/docs/api/service-worker-main.md b/docs/api/service-worker-main.md
+index a1c3889661..fb30fd889d 100644
+--- a/docs/api/service-worker-main.md
++++ b/docs/api/service-worker-main.md
+@@ -15,6 +15,19 @@ _This class is not exported from the `'electron'` module. It is only available a
+ 
+ Returns `boolean` - Whether the service worker has been destroyed.
+ 
++#### `serviceWorker.send(channel, ...args)` _Experimental_
++
++- `channel` string
++- `...args` any[]
++
++Send an asynchronous message to the service worker process via `channel`, along with
++arguments. Arguments will be serialized with the [Structured Clone Algorithm][SCA],
++just like [`postMessage`][], so prototype chains will not be included.
++Sending Functions, Promises, Symbols, WeakMaps, or WeakSets will throw an exception.
++
++The service worker process can handle the message by listening to `channel` with the
++[`ipcRenderer`](ipc-renderer.md) module.
++
+ #### `serviceWorker.startTask()` _Experimental_
+ 
+ Returns `Object`:
+@@ -25,6 +38,10 @@ Initiate a task to keep the service worker alive until ended.
+ 
+ ### Instance Properties
+ 
++#### `serviceWorker.ipc` _Readonly_ _Experimental_
++
++An [`IpcMainServiceWorker`](ipc-main-service-worker.md) instance scoped to the service worker.
++
+ #### `serviceWorker.scope` _Readonly_ _Experimental_
+ 
+ A `string` representing the scope URL of the service worker.
+@@ -32,3 +49,6 @@ A `string` representing the scope URL of the service worker.
+ #### `serviceWorker.versionId` _Readonly_ _Experimental_
+ 
+ A `number` representing the ID of the specific version of the service worker script in its scope.
++
++[SCA]: https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm
++[`postMessage`]: https://developer.mozilla.org/en-US/docs/Web/API/Window/postMessage
+diff --git a/docs/api/service-workers.md b/docs/api/service-workers.md
+index 0d3796a936..e8a843cca6 100644
+--- a/docs/api/service-workers.md
++++ b/docs/api/service-workers.md
+@@ -107,8 +107,6 @@ Returns `Promise<ServiceWorkerMain>` - Resolves with the service worker when it'
+ 
+ Starts the service worker or does nothing if already running.
+ 
+-<!-- TODO(samuelmaddock): extend example to send IPC after starting worker -->
+-
+ ```js
+ const { app, session } = require('electron')
+ const { serviceWorkers } = session.defaultSession
+@@ -120,7 +118,8 @@ app.on('browser-window-created', async (event, window) => {
+   for (const scope of workerScopes) {
+     try {
+       // Ensure worker is started
+-      await serviceWorkers.startWorkerForScope(scope)
++      const serviceWorker = await serviceWorkers.startWorkerForScope(scope)
++      serviceWorker.send('window-created', { windowId: window.id })
+     } catch (error) {
+       console.error(`Failed to start service worker for ${scope}`)
+       console.error(error)
+diff --git a/docs/api/structures/ipc-main-event.md b/docs/api/structures/ipc-main-event.md
+index 2bf1e84aff..dd9fea6777 100644
+--- a/docs/api/structures/ipc-main-event.md
++++ b/docs/api/structures/ipc-main-event.md
+@@ -1,5 +1,6 @@
+ # IpcMainEvent Object extends `Event`
+ 
++* `type` String - Possible values include `frame`
+ * `processId` Integer - The internal ID of the renderer process that sent this message
+ * `frameId` Integer - The ID of the renderer frame that sent this message
+ * `returnValue` any - Set this to the value to be returned in a synchronous message
+diff --git a/docs/api/structures/ipc-main-invoke-event.md b/docs/api/structures/ipc-main-invoke-event.md
+index b5c9e20438..b9cbbfb4fb 100644
+--- a/docs/api/structures/ipc-main-invoke-event.md
++++ b/docs/api/structures/ipc-main-invoke-event.md
+@@ -1,5 +1,6 @@
+ # IpcMainInvokeEvent Object extends `Event`
+ 
++* `type` String - Possible values include `frame`
+ * `processId` Integer - The internal ID of the renderer process that sent this message
+ * `frameId` Integer - The ID of the renderer frame that sent this message
+ * `sender` [WebContents](../web-contents.md) - Returns the `webContents` that sent the message
+diff --git a/docs/api/structures/ipc-main-service-worker-event.md b/docs/api/structures/ipc-main-service-worker-event.md
+new file mode 100644
+index 0000000000..00d4ec5f3a
+--- /dev/null
++++ b/docs/api/structures/ipc-main-service-worker-event.md
+@@ -0,0 +1,11 @@
++# IpcMainServiceWorkerEvent Object extends `Event`
++
++* `type` String - Possible values include `service-worker`.
++* `serviceWorker` [ServiceWorkerMain](../service-worker-main.md) _Readonly_ - The service worker that sent this message
++* `versionId` Number - The service worker version ID.
++* `session` Session - The [`Session`](../session.md) instance with which the event is associated.
++* `returnValue` any - Set this to the value to be returned in a synchronous message
++* `ports` [MessagePortMain](../message-port-main.md)[] - A list of MessagePorts that were transferred with this message
++* `reply` Function - A function that will send an IPC message to the renderer frame that sent the original message that you are currently handling.  You should use this method to "reply" to the sent message in order to guarantee the reply will go to the correct process and frame.
++  * `channel` string
++  * `...args` any[]
+diff --git a/docs/api/structures/ipc-main-service-worker-invoke-event.md b/docs/api/structures/ipc-main-service-worker-invoke-event.md
+new file mode 100644
+index 0000000000..9e548dccb2
+--- /dev/null
++++ b/docs/api/structures/ipc-main-service-worker-invoke-event.md
+@@ -0,0 +1,6 @@
++# IpcMainServiceWorkerInvokeEvent Object extends `Event`
++
++* `type` String - Possible values include `service-worker`.
++* `serviceWorker` [ServiceWorkerMain](../service-worker-main.md) _Readonly_ - The service worker that sent this message
++* `versionId` Number - The service worker version ID.
++* `session` Session - The [`Session`](../session.md) instance with which the event is associated.
+diff --git a/docs/api/structures/preload-script-registration.md b/docs/api/structures/preload-script-registration.md
+index 011d034f08..efb5be49ee 100644
+--- a/docs/api/structures/preload-script-registration.md
++++ b/docs/api/structures/preload-script-registration.md
+@@ -1,6 +1,6 @@
+ # PreloadScriptRegistration Object
+ 
+ * `type` string - Context type where the preload script will be executed.
+-  Possible values include `frame`.
++  Possible values include `frame` or `service-worker`.
+ * `id` string (optional) - Unique ID of preload script. Defaults to a random UUID.
+ * `filePath` string - Path of the script file. Must be an absolute path.
+diff --git a/docs/api/structures/preload-script.md b/docs/api/structures/preload-script.md
+index c75ead5217..e29812e046 100644
+--- a/docs/api/structures/preload-script.md
++++ b/docs/api/structures/preload-script.md
+@@ -1,6 +1,6 @@
+ # PreloadScript Object
+ 
+ * `type` string - Context type where the preload script will be executed.
+-  Possible values include `frame`.
++  Possible values include `frame` or `service-worker`.
+ * `id` string - Unique ID of preload script.
+ * `filePath` string - Path of the script file. Must be an absolute path.
+diff --git a/filenames.auto.gni b/filenames.auto.gni
+index 388e3b3db8..165f94e5c9 100644
+--- a/filenames.auto.gni
++++ b/filenames.auto.gni
+@@ -25,6 +25,7 @@ auto_filenames = {
+     "docs/api/global-shortcut.md",
+     "docs/api/in-app-purchase.md",
+     "docs/api/incoming-message.md",
++    "docs/api/ipc-main-service-worker.md",
+     "docs/api/ipc-main.md",
+     "docs/api/ipc-renderer.md",
+     "docs/api/menu-item.md",
+@@ -95,6 +96,8 @@ auto_filenames = {
+     "docs/api/structures/input-event.md",
+     "docs/api/structures/ipc-main-event.md",
+     "docs/api/structures/ipc-main-invoke-event.md",
++    "docs/api/structures/ipc-main-service-worker-event.md",
++    "docs/api/structures/ipc-main-service-worker-invoke-event.md",
+     "docs/api/structures/ipc-renderer-event.md",
+     "docs/api/structures/jump-list-category.md",
+     "docs/api/structures/jump-list-item.md",
+@@ -172,6 +175,8 @@ auto_filenames = {
+     "lib/renderer/api/web-utils.ts",
+     "lib/renderer/common-init.ts",
+     "lib/renderer/inspector.ts",
++    "lib/renderer/ipc-native-setup.ts",
++    "lib/renderer/ipc-renderer-bindings.ts",
+     "lib/renderer/ipc-renderer-internal-utils.ts",
+     "lib/renderer/ipc-renderer-internal.ts",
+     "lib/renderer/security-warnings.ts",
+@@ -261,6 +266,7 @@ auto_filenames = {
+     "lib/browser/guest-view-manager.ts",
+     "lib/browser/guest-window-manager.ts",
+     "lib/browser/init.ts",
++    "lib/browser/ipc-dispatch.ts",
+     "lib/browser/ipc-main-impl.ts",
+     "lib/browser/ipc-main-internal-utils.ts",
+     "lib/browser/ipc-main-internal.ts",
+@@ -305,6 +311,8 @@ auto_filenames = {
+     "lib/renderer/common-init.ts",
+     "lib/renderer/init.ts",
+     "lib/renderer/inspector.ts",
++    "lib/renderer/ipc-native-setup.ts",
++    "lib/renderer/ipc-renderer-bindings.ts",
+     "lib/renderer/ipc-renderer-internal-utils.ts",
+     "lib/renderer/ipc-renderer-internal.ts",
+     "lib/renderer/security-warnings.ts",
+@@ -339,6 +347,7 @@ auto_filenames = {
+     "lib/renderer/api/module-list.ts",
+     "lib/renderer/api/web-frame.ts",
+     "lib/renderer/api/web-utils.ts",
++    "lib/renderer/ipc-renderer-bindings.ts",
+     "lib/renderer/ipc-renderer-internal-utils.ts",
+     "lib/renderer/ipc-renderer-internal.ts",
+     "lib/worker/init.ts",
+@@ -379,4 +388,27 @@ auto_filenames = {
+     "typings/internal-ambient.d.ts",
+     "typings/internal-electron.d.ts",
+   ]
++
++  preload_realm_bundle_deps = [
++    "lib/common/api/native-image.ts",
++    "lib/common/define-properties.ts",
++    "lib/common/ipc-messages.ts",
++    "lib/common/webpack-globals-provider.ts",
++    "lib/preload_realm/api/exports/electron.ts",
++    "lib/preload_realm/api/module-list.ts",
++    "lib/preload_realm/init.ts",
++    "lib/renderer/api/context-bridge.ts",
++    "lib/renderer/api/ipc-renderer.ts",
++    "lib/renderer/ipc-native-setup.ts",
++    "lib/renderer/ipc-renderer-bindings.ts",
++    "lib/renderer/ipc-renderer-internal-utils.ts",
++    "lib/renderer/ipc-renderer-internal.ts",
++    "lib/sandboxed_renderer/pre-init.ts",
++    "lib/sandboxed_renderer/preload.ts",
++    "package.json",
++    "tsconfig.electron.json",
++    "tsconfig.json",
++    "typings/internal-ambient.d.ts",
++    "typings/internal-electron.d.ts",
++  ]
+ }
+diff --git a/filenames.gni b/filenames.gni
+index b2a13956fd..10e5a707a9 100644
+--- a/filenames.gni
++++ b/filenames.gni
+@@ -324,6 +324,7 @@ filenames = {
+     "shell/browser/api/gpu_info_enumerator.h",
+     "shell/browser/api/gpuinfo_manager.cc",
+     "shell/browser/api/gpuinfo_manager.h",
++    "shell/browser/api/ipc_dispatcher.h",
+     "shell/browser/api/message_port.cc",
+     "shell/browser/api/message_port.h",
+     "shell/browser/api/process_metric.cc",
+@@ -355,6 +356,8 @@ filenames = {
+     "shell/browser/draggable_region_provider.h",
+     "shell/browser/electron_api_ipc_handler_impl.cc",
+     "shell/browser/electron_api_ipc_handler_impl.h",
++    "shell/browser/electron_api_sw_ipc_handler_impl.cc",
++    "shell/browser/electron_api_sw_ipc_handler_impl.h",
+     "shell/browser/electron_autofill_driver.cc",
+     "shell/browser/electron_autofill_driver.h",
+     "shell/browser/electron_autofill_driver_factory.cc",
+@@ -658,6 +661,8 @@ filenames = {
+     "shell/common/gin_helper/pinnable.h",
+     "shell/common/gin_helper/promise.cc",
+     "shell/common/gin_helper/promise.h",
++    "shell/common/gin_helper/reply_channel.cc",
++    "shell/common/gin_helper/reply_channel.h",
+     "shell/common/gin_helper/trackable_object.cc",
+     "shell/common/gin_helper/trackable_object.h",
+     "shell/common/gin_helper/wrappable.cc",
+@@ -707,14 +712,22 @@ filenames = {
+     "shell/renderer/electron_api_service_impl.h",
+     "shell/renderer/electron_autofill_agent.cc",
+     "shell/renderer/electron_autofill_agent.h",
++    "shell/renderer/electron_ipc_native.cc",
++    "shell/renderer/electron_ipc_native.h",
+     "shell/renderer/electron_render_frame_observer.cc",
+     "shell/renderer/electron_render_frame_observer.h",
+     "shell/renderer/electron_renderer_client.cc",
+     "shell/renderer/electron_renderer_client.h",
+     "shell/renderer/electron_sandboxed_renderer_client.cc",
+     "shell/renderer/electron_sandboxed_renderer_client.h",
++    "shell/renderer/preload_realm_context.cc",
++    "shell/renderer/preload_realm_context.h",
++    "shell/renderer/preload_utils.cc",
++    "shell/renderer/preload_utils.h",
+     "shell/renderer/renderer_client_base.cc",
+     "shell/renderer/renderer_client_base.h",
++    "shell/renderer/service_worker_data.cc",
++    "shell/renderer/service_worker_data.h",
+     "shell/renderer/web_worker_observer.cc",
+     "shell/renderer/web_worker_observer.h",
+     "shell/services/node/node_service.cc",
+diff --git a/lib/browser/api/service-worker-main.ts b/lib/browser/api/service-worker-main.ts
+index 60d2f1e7d7..a9ca65c908 100644
+--- a/lib/browser/api/service-worker-main.ts
++++ b/lib/browser/api/service-worker-main.ts
+@@ -1,5 +1,27 @@
++import { IpcMainImpl } from '@electron/internal/browser/ipc-main-impl';
++
+ const { ServiceWorkerMain } = process._linkedBinding('electron_browser_service_worker_main');
+ 
++Object.defineProperty(ServiceWorkerMain.prototype, 'ipc', {
++  get () {
++    const ipc = new IpcMainImpl();
++    Object.defineProperty(this, 'ipc', { value: ipc });
++    return ipc;
++  }
++});
++
++ServiceWorkerMain.prototype.send = function (channel, ...args) {
++  if (typeof channel !== 'string') {
++    throw new TypeError('Missing required channel argument');
++  }
++
++  try {
++    return this._send(false /* internal */, channel, args);
++  } catch (e) {
++    console.error('Error sending from ServiceWorkerMain: ', e);
++  }
++};
++
+ ServiceWorkerMain.prototype.startTask = function () {
+   // TODO(samuelmaddock): maybe make timeout configurable in the future
+   const hasTimeout = false;
+diff --git a/lib/browser/api/session.ts b/lib/browser/api/session.ts
+index 0daf56291a..7aecefbd23 100644
+--- a/lib/browser/api/session.ts
++++ b/lib/browser/api/session.ts
+@@ -1,4 +1,5 @@
+ import { fetchWithSession } from '@electron/internal/browser/api/net-fetch';
++import { addIpcDispatchListeners } from '@electron/internal/browser/ipc-dispatch';
+ import * as deprecate from '@electron/internal/common/deprecate';
+ 
+ import { net } from 'electron/main';
+@@ -21,6 +22,10 @@ Object.defineProperty(systemPickerVideoSource, 'id', {
+ systemPickerVideoSource.name = '';
+ Object.freeze(systemPickerVideoSource);
+ 
++Session.prototype._init = function () {
++  addIpcDispatchListeners(this, this.serviceWorkers);
++};
++
+ Session.prototype.fetch = function (input: RequestInfo, init?: RequestInit) {
+   return fetchWithSession(input, init, this, net.request);
+ };
+diff --git a/lib/browser/devtools.ts b/lib/browser/devtools.ts
+index f9cd52077a..c41ef2ca60 100644
+--- a/lib/browser/devtools.ts
++++ b/lib/browser/devtools.ts
+@@ -69,6 +69,7 @@ const assertChromeDevTools = function (contents: Electron.WebContents, api: stri
+ 
+ ipcMainInternal.handle(IPC_MESSAGES.INSPECTOR_CONTEXT_MENU, function (event, items: ContextMenuItem[], isEditMenu: boolean) {
+   return new Promise<number | void>(resolve => {
++    if (event.type !== 'frame') return;
+     assertChromeDevTools(event.sender, 'window.InspectorFrontendHost.showContextMenuAtPoint()');
+ 
+     const template = isEditMenu ? getEditMenuItems() : convertToMenuTemplate(items, resolve);
+@@ -80,6 +81,7 @@ ipcMainInternal.handle(IPC_MESSAGES.INSPECTOR_CONTEXT_MENU, function (event, ite
+ });
+ 
+ ipcMainInternal.handle(IPC_MESSAGES.INSPECTOR_SELECT_FILE, async function (event) {
++  if (event.type !== 'frame') return [];
+   assertChromeDevTools(event.sender, 'window.UI.createFileSelectorElement()');
+ 
+   const result = await dialog.showOpenDialog({});
+@@ -92,6 +94,7 @@ ipcMainInternal.handle(IPC_MESSAGES.INSPECTOR_SELECT_FILE, async function (event
+ });
+ 
+ ipcMainUtils.handleSync(IPC_MESSAGES.INSPECTOR_CONFIRM, async function (event, message: string = '', title: string = '') {
++  if (event.type !== 'frame') return;
+   assertChromeDevTools(event.sender, 'window.confirm()');
+ 
+   const options = {
+diff --git a/lib/browser/guest-view-manager.ts b/lib/browser/guest-view-manager.ts
+index b64f599522..edceacaf5f 100644
+--- a/lib/browser/guest-view-manager.ts
++++ b/lib/browser/guest-view-manager.ts
+@@ -267,9 +267,10 @@ const isWebViewTagEnabled = function (contents: Electron.WebContents) {
+ };
+ 
+ const makeSafeHandler = function<Event extends { sender: Electron.WebContents }> (channel: string, handler: (event: Event, ...args: any[]) => any) {
+-  return (event: Event, ...args: any[]) => {
++  return (event: Electron.IpcMainInvokeEvent | Electron.IpcMainServiceWorkerInvokeEvent, ...args: any[]) => {
++    if (event.type !== 'frame') return;
+     if (isWebViewTagEnabled(event.sender)) {
+-      return handler(event, ...args);
++      return handler(event as unknown as Event, ...args);
+     } else {
+       console.error(`<webview> IPC message ${channel} sent by WebContents with <webview> disabled (${event.sender.id})`);
+       throw new Error('<webview> disabled');
+@@ -281,7 +282,7 @@ const handleMessage = function (channel: string, handler: (event: Electron.IpcMa
+   ipcMainInternal.handle(channel, makeSafeHandler(channel, handler));
+ };
+ 
+-const handleMessageSync = function (channel: string, handler: (event: ElectronInternal.IpcMainInternalEvent, ...args: any[]) => any) {
++const handleMessageSync = function (channel: string, handler: (event: { sender: Electron.WebContents }, ...args: any[]) => any) {
+   ipcMainUtils.handleSync(channel, makeSafeHandler(channel, handler));
+ };
+ 
+@@ -294,8 +295,10 @@ handleMessageSync(IPC_MESSAGES.GUEST_VIEW_MANAGER_DETACH_GUEST, function (event,
+ });
+ 
+ // this message is sent by the actual <webview>
+-ipcMainInternal.on(IPC_MESSAGES.GUEST_VIEW_MANAGER_FOCUS_CHANGE, function (event: ElectronInternal.IpcMainInternalEvent, focus: boolean) {
+-  event.sender.emit('-focus-change', {}, focus);
++ipcMainInternal.on(IPC_MESSAGES.GUEST_VIEW_MANAGER_FOCUS_CHANGE, function (event, focus: boolean) {
++  if (event.type === 'frame') {
++    event.sender.emit('-focus-change', {}, focus);
++  }
+ });
+ 
+ handleMessage(IPC_MESSAGES.GUEST_VIEW_MANAGER_CALL, function (event, guestInstanceId: number, method: string, args: any[]) {
+diff --git a/lib/browser/ipc-dispatch.ts b/lib/browser/ipc-dispatch.ts
+new file mode 100644
+index 0000000000..d801d72d09
+--- /dev/null
++++ b/lib/browser/ipc-dispatch.ts
+@@ -0,0 +1,91 @@
++import { ipcMainInternal } from '@electron/internal/browser/ipc-main-internal';
++import { MessagePortMain } from '@electron/internal/browser/message-port-main';
++
++import type { ServiceWorkerMain } from 'electron/main';
++
++const v8Util = process._linkedBinding('electron_common_v8_util');
++
++const addReturnValueToEvent = (event: Electron.IpcMainEvent | Electron.IpcMainServiceWorkerEvent) => {
++  Object.defineProperty(event, 'returnValue', {
++    set: (value) => event._replyChannel.sendReply(value),
++    get: () => {}
++  });
++};
++
++/**
++ * Listens for IPC dispatch events on `api`.
++ *
++ * NOTE: Currently this only supports dispatching IPCs for ServiceWorkerMain.
++ */
++export function addIpcDispatchListeners (api: NodeJS.EventEmitter, serviceWorkers: Electron.ServiceWorkers) {
++  const getServiceWorkerFromEvent = (event: Electron.IpcMainServiceWorkerEvent | Electron.IpcMainServiceWorkerInvokeEvent): ServiceWorkerMain | undefined => {
++    return serviceWorkers._getWorkerFromVersionIDIfExists(event.versionId);
++  };
++  const addServiceWorkerPropertyToEvent = (event: Electron.IpcMainServiceWorkerEvent | Electron.IpcMainServiceWorkerInvokeEvent) => {
++    Object.defineProperty(event, 'serviceWorker', {
++      get: () => serviceWorkers.getWorkerFromVersionID(event.versionId)
++    });
++  };
++
++  api.on('-ipc-message' as any, function (event: Electron.IpcMainEvent | Electron.IpcMainServiceWorkerEvent, channel: string, args: any[]) {
++    const internal = v8Util.getHiddenValue<boolean>(event, 'internal');
++
++    if (internal) {
++      ipcMainInternal.emit(channel, event, ...args);
++    } else if (event.type === 'service-worker') {
++      addServiceWorkerPropertyToEvent(event);
++      getServiceWorkerFromEvent(event)?.ipc.emit(channel, event, ...args);
++    }
++  } as any);
++
++  api.on('-ipc-invoke' as any, async function (event: Electron.IpcMainInvokeEvent | Electron.IpcMainServiceWorkerInvokeEvent, channel: string, args: any[]) {
++    const internal = v8Util.getHiddenValue<boolean>(event, 'internal');
++
++    const replyWithResult = (result: any) => event._replyChannel.sendReply({ result });
++    const replyWithError = (error: Error) => {
++      console.error(`Error occurred in handler for '${channel}':`, error);
++      event._replyChannel.sendReply({ error: error.toString() });
++    };
++
++    const targets: (Electron.IpcMainServiceWorker | ElectronInternal.IpcMainInternal | undefined)[] = [];
++
++    if (internal) {
++      targets.push(ipcMainInternal);
++    } else if (event.type === 'service-worker') {
++      addServiceWorkerPropertyToEvent(event);
++      const workerIpc = getServiceWorkerFromEvent(event)?.ipc;
++      targets.push(workerIpc);
++    }
++
++    const target = targets.find(target => (target as any)?._invokeHandlers.has(channel));
++    if (target) {
++      const handler = (target as any)._invokeHandlers.get(channel);
++      try {
++        replyWithResult(await Promise.resolve(handler(event, ...args)));
++      } catch (err) {
++        replyWithError(err as Error);
++      }
++    } else {
++      replyWithError(new Error(`No handler registered for '${channel}'`));
++    }
++  } as any);
++
++  api.on('-ipc-message-sync' as any, function (event: Electron.IpcMainEvent | Electron.IpcMainServiceWorkerEvent, channel: string, args: any[]) {
++    const internal = v8Util.getHiddenValue<boolean>(event, 'internal');
++    addReturnValueToEvent(event);
++    if (internal) {
++      ipcMainInternal.emit(channel, event, ...args);
++    } else if (event.type === 'service-worker') {
++      addServiceWorkerPropertyToEvent(event);
++      getServiceWorkerFromEvent(event)?.ipc.emit(channel, event, ...args);
++    }
++  } as any);
++
++  api.on('-ipc-ports' as any, function (event: Electron.IpcMainEvent | Electron.IpcMainServiceWorkerEvent, channel: string, message: any, ports: any[]) {
++    event.ports = ports.map(p => new MessagePortMain(p));
++    if (event.type === 'service-worker') {
++      addServiceWorkerPropertyToEvent(event);
++      getServiceWorkerFromEvent(event)?.ipc.emit(channel, event, message);
++    }
++  } as any);
++}
+diff --git a/lib/browser/ipc-main-internal-utils.ts b/lib/browser/ipc-main-internal-utils.ts
+index 3d917dd077..d763cd6807 100644
+--- a/lib/browser/ipc-main-internal-utils.ts
++++ b/lib/browser/ipc-main-internal-utils.ts
+@@ -19,7 +19,7 @@ export function invokeInWebContents<T> (sender: Electron.WebContents, command: s
+     const requestId = ++nextId;
+     const channel = `${command}_RESPONSE_${requestId}`;
+     ipcMainInternal.on(channel, function handler (event, error: Error, result: any) {
+-      if (event.sender !== sender) {
++      if (event.type === 'frame' && event.sender !== sender) {
+         console.error(`Reply to ${command} sent by unexpected WebContents (${event.sender.id})`);
+         return;
+       }
+diff --git a/lib/browser/rpc-server.ts b/lib/browser/rpc-server.ts
+index b305d09f11..9b8f8ab082 100644
+--- a/lib/browser/rpc-server.ts
++++ b/lib/browser/rpc-server.ts
+@@ -9,6 +9,8 @@ import * as path from 'path';
+ 
+ // Implements window.close()
+ ipcMainInternal.on(IPC_MESSAGES.BROWSER_WINDOW_CLOSE, function (event) {
++  if (event.type !== 'frame') return;
++
+   const window = event.sender.getOwnerBrowserWindow();
+   if (window) {
+     window.close();
+@@ -17,10 +19,12 @@ ipcMainInternal.on(IPC_MESSAGES.BROWSER_WINDOW_CLOSE, function (event) {
+ });
+ 
+ ipcMainInternal.handle(IPC_MESSAGES.BROWSER_GET_LAST_WEB_PREFERENCES, function (event) {
++  if (event.type !== 'frame') return;
+   return event.sender.getLastWebPreferences();
+ });
+ 
+ ipcMainInternal.handle(IPC_MESSAGES.BROWSER_GET_PROCESS_MEMORY_INFO, function (event) {
++  if (event.type !== 'frame') return;
+   return event.sender._getProcessMemoryInfo();
+ });
+ 
+@@ -45,16 +49,23 @@ ipcMainUtils.handleSync(IPC_MESSAGES.BROWSER_CLIPBOARD_SYNC, function (event, me
+ });
+ 
+ const getPreloadScriptsFromEvent = (event: ElectronInternal.IpcMainInternalEvent) => {
+-  const session: Electron.Session = event.sender.session;
+-  const preloadScripts = session.getPreloadScripts();
+-  const framePreloads = preloadScripts.filter(script => script.type === 'frame');
++  const session: Electron.Session = event.type === 'service-worker' ? event.session : event.sender.session;
++  let preloadScripts = session.getPreloadScripts();
++
++  if (event.type === 'frame') {
++    preloadScripts = preloadScripts.filter(script => script.type === 'frame');
+ 
+-  const webPrefPreload = event.sender._getPreloadScript();
+-  if (webPrefPreload) framePreloads.push(webPrefPreload);
++    const webPrefPreload = event.sender._getPreloadScript();
++    if (webPrefPreload) preloadScripts.push(webPrefPreload);
++  } else if (event.type === 'service-worker') {
++    preloadScripts = preloadScripts.filter(script => script.type === 'service-worker');
++  } else {
++    throw new Error(`getPreloadScriptsFromEvent: event.type is invalid (${(event as any).type})`);
++  }
+ 
+   // TODO(samuelmaddock): Remove filter after Session.setPreloads is fully
+   // deprecated. The new API will prevent relative paths from being registered.
+-  return framePreloads.filter(script => path.isAbsolute(script.filePath));
++  return preloadScripts.filter(script => path.isAbsolute(script.filePath));
+ };
+ 
+ const readPreloadScript = async function (script: Electron.PreloadScript): Promise<ElectronInternal.PreloadScript> {
+@@ -95,5 +106,6 @@ ipcMainUtils.handleSync(IPC_MESSAGES.BROWSER_NONSANDBOX_LOAD, function (event) {
+ });
+ 
+ ipcMainInternal.on(IPC_MESSAGES.BROWSER_PRELOAD_ERROR, function (event, preloadPath: string, error: Error) {
+-  event.sender.emit('preload-error', event, preloadPath, error);
++  if (event.type !== 'frame') return;
++  event.sender?.emit('preload-error', event, preloadPath, error);
+ });
+diff --git a/lib/preload_realm/.eslintrc.json b/lib/preload_realm/.eslintrc.json
+new file mode 100644
+index 0000000000..cb5f6cadaa
+--- /dev/null
++++ b/lib/preload_realm/.eslintrc.json
+@@ -0,0 +1,18 @@
++{
++  "rules": {
++    "no-restricted-imports": [
++      "error",
++      {
++        "paths": [
++          "electron",
++          "electron/main"
++        ],
++        "patterns": [
++          "./*",
++          "../*",
++          "@electron/internal/browser/*"
++        ]
++      }
++    ]
++  }
++}
+diff --git a/lib/preload_realm/api/exports/electron.ts b/lib/preload_realm/api/exports/electron.ts
+new file mode 100644
+index 0000000000..e1ff886b91
+--- /dev/null
++++ b/lib/preload_realm/api/exports/electron.ts
+@@ -0,0 +1,6 @@
++import { defineProperties } from '@electron/internal/common/define-properties';
++import { moduleList } from '@electron/internal/preload_realm/api/module-list';
++
++module.exports = {};
++
++defineProperties(module.exports, moduleList);
+diff --git a/lib/preload_realm/api/module-list.ts b/lib/preload_realm/api/module-list.ts
+new file mode 100644
+index 0000000000..aeaafca61e
+--- /dev/null
++++ b/lib/preload_realm/api/module-list.ts
+@@ -0,0 +1,14 @@
++export const moduleList: ElectronInternal.ModuleEntry[] = [
++  {
++    name: 'contextBridge',
++    loader: () => require('@electron/internal/renderer/api/context-bridge')
++  },
++  {
++    name: 'ipcRenderer',
++    loader: () => require('@electron/internal/renderer/api/ipc-renderer')
++  },
++  {
++    name: 'nativeImage',
++    loader: () => require('@electron/internal/common/api/native-image')
++  }
++];
+diff --git a/lib/preload_realm/init.ts b/lib/preload_realm/init.ts
+new file mode 100644
+index 0000000000..6409aaec29
+--- /dev/null
++++ b/lib/preload_realm/init.ts
+@@ -0,0 +1,58 @@
++import '@electron/internal/sandboxed_renderer/pre-init';
++import { IPC_MESSAGES } from '@electron/internal/common/ipc-messages';
++import type * as ipcRendererUtilsModule from '@electron/internal/renderer/ipc-renderer-internal-utils';
++import { createPreloadProcessObject, executeSandboxedPreloadScripts } from '@electron/internal/sandboxed_renderer/preload';
++
++import * as events from 'events';
++
++declare const binding: {
++  get: (name: string) => any;
++  process: NodeJS.Process;
++  createPreloadScript: (src: string) => Function
++};
++
++const ipcRendererUtils = require('@electron/internal/renderer/ipc-renderer-internal-utils') as typeof ipcRendererUtilsModule;
++
++const {
++  preloadScripts,
++  process: processProps
++} = ipcRendererUtils.invokeSync<{
++  preloadScripts: ElectronInternal.PreloadScript[];
++  process: NodeJS.Process;
++}>(IPC_MESSAGES.BROWSER_SANDBOX_LOAD);
++
++const electron = require('electron');
++
++const loadedModules = new Map<string, any>([
++  ['electron', electron],
++  ['electron/common', electron],
++  ['events', events],
++  ['node:events', events]
++]);
++
++const loadableModules = new Map<string, Function>([
++  ['url', () => require('url')],
++  ['node:url', () => require('url')]
++]);
++
++const preloadProcess = createPreloadProcessObject();
++
++Object.assign(preloadProcess, binding.process);
++Object.assign(preloadProcess, processProps);
++
++Object.assign(process, processProps);
++
++require('@electron/internal/renderer/ipc-native-setup');
++
++executeSandboxedPreloadScripts({
++  loadedModules,
++  loadableModules,
++  process: preloadProcess,
++  createPreloadScript: binding.createPreloadScript,
++  exposeGlobals: {
++    Buffer,
++    // FIXME(samuelmaddock): workaround webpack bug replacing this with just
++    // `__webpack_require__.g,` which causes script error
++    global: globalThis
++  }
++}, preloadScripts);
+diff --git a/lib/renderer/api/ipc-renderer.ts b/lib/renderer/api/ipc-renderer.ts
+index c82f862123..5638ff4700 100644
+--- a/lib/renderer/api/ipc-renderer.ts
++++ b/lib/renderer/api/ipc-renderer.ts
+@@ -1,8 +1,10 @@
+-import { EventEmitter } from 'events';
++import { getIPCRenderer } from '@electron/internal/renderer/ipc-renderer-bindings';
+ 
+-const { ipc } = process._linkedBinding('electron_renderer_ipc');
++import { EventEmitter } from 'events';
+ 
++const ipc = getIPCRenderer();
+ const internal = false;
++
+ class IpcRenderer extends EventEmitter implements Electron.IpcRenderer {
+   send (channel: string, ...args: any[]) {
+     return ipc.send(internal, channel, args);
+diff --git a/lib/renderer/common-init.ts b/lib/renderer/common-init.ts
+index c944125f9f..98aa779632 100644
+--- a/lib/renderer/common-init.ts
++++ b/lib/renderer/common-init.ts
+@@ -1,27 +1,16 @@
+-import { ipcRendererInternal } from '@electron/internal/renderer/ipc-renderer-internal';
+ import type * as securityWarningsModule from '@electron/internal/renderer/security-warnings';
+ import type * as webFrameInitModule from '@electron/internal/renderer/web-frame-init';
+ import type * as webViewInitModule from '@electron/internal/renderer/web-view/web-view-init';
+ import type * as windowSetupModule from '@electron/internal/renderer/window-setup';
+ 
+-import { ipcRenderer } from 'electron/renderer';
+-
+ const { mainFrame } = process._linkedBinding('electron_renderer_web_frame');
+-const v8Util = process._linkedBinding('electron_common_v8_util');
+ 
+ const nodeIntegration = mainFrame.getWebPreference('nodeIntegration');
+ const webviewTag = mainFrame.getWebPreference('webviewTag');
+ const isHiddenPage = mainFrame.getWebPreference('hiddenPage');
+ const isWebView = mainFrame.getWebPreference('isWebView');
+ 
+-// ElectronApiServiceImpl will look for the "ipcNative" hidden object when
+-// invoking the 'onMessage' callback.
+-v8Util.setHiddenValue(global, 'ipcNative', {
+-  onMessage (internal: boolean, channel: string, ports: MessagePort[], args: any[]) {
+-    const sender = internal ? ipcRendererInternal : ipcRenderer;
+-    sender.emit(channel, { sender, ports }, ...args);
+-  }
+-});
++require('@electron/internal/renderer/ipc-native-setup');
+ 
+ switch (window.location.protocol) {
+   case 'devtools:': {
+diff --git a/lib/renderer/ipc-native-setup.ts b/lib/renderer/ipc-native-setup.ts
+new file mode 100644
+index 0000000000..5b089a8c2a
+--- /dev/null
++++ b/lib/renderer/ipc-native-setup.ts
+@@ -0,0 +1,14 @@
++import { ipcRendererInternal } from '@electron/internal/renderer/ipc-renderer-internal';
++
++import { ipcRenderer } from 'electron/renderer';
++
++const v8Util = process._linkedBinding('electron_common_v8_util');
++
++// ElectronApiServiceImpl will look for the "ipcNative" hidden object when
++// invoking the 'onMessage' callback.
++v8Util.setHiddenValue(globalThis, 'ipcNative', {
++  onMessage (internal: boolean, channel: string, ports: MessagePort[], args: any[]) {
++    const sender = internal ? ipcRendererInternal : ipcRenderer;
++    sender.emit(channel, { sender, ports }, ...args);
++  }
++});
+diff --git a/lib/renderer/ipc-renderer-bindings.ts b/lib/renderer/ipc-renderer-bindings.ts
+new file mode 100644
+index 0000000000..90f67d9552
+--- /dev/null
++++ b/lib/renderer/ipc-renderer-bindings.ts
+@@ -0,0 +1,17 @@
++let ipc: NodeJS.IpcRendererImpl | undefined;
++
++/**
++ * Get IPCRenderer implementation for the current process.
++ */
++export function getIPCRenderer () {
++  if (ipc) return ipc;
++  const ipcBinding = process._linkedBinding('electron_renderer_ipc');
++  switch (process.type) {
++    case 'renderer':
++      return (ipc = ipcBinding.createForRenderFrame());
++    case 'service-worker':
++      return (ipc = ipcBinding.createForServiceWorker());
++    default:
++      throw new Error(`Cannot create IPCRenderer for '${process.type}' process`);
++  }
++};
+diff --git a/lib/renderer/ipc-renderer-internal.ts b/lib/renderer/ipc-renderer-internal.ts
+index da832d2e47..f8dc63f64b 100644
+--- a/lib/renderer/ipc-renderer-internal.ts
++++ b/lib/renderer/ipc-renderer-internal.ts
+@@ -1,7 +1,8 @@
+-import { EventEmitter } from 'events';
++import { getIPCRenderer } from '@electron/internal/renderer/ipc-renderer-bindings';
+ 
+-const { ipc } = process._linkedBinding('electron_renderer_ipc');
++import { EventEmitter } from 'events';
+ 
++const ipc = getIPCRenderer();
+ const internal = true;
+ 
+ class IpcRendererInternal extends EventEmitter implements ElectronInternal.IpcRendererInternal {
+diff --git a/lib/sandboxed_renderer/init.ts b/lib/sandboxed_renderer/init.ts
+index 6bb1374a39..ac32ba218b 100644
+--- a/lib/sandboxed_renderer/init.ts
++++ b/lib/sandboxed_renderer/init.ts
+@@ -7,12 +7,10 @@ import * as events from 'events';
+ import { setImmediate, clearImmediate } from 'timers';
+ 
+ declare const binding: {
+-  get: (name: string) => any;
+   process: NodeJS.Process;
+   createPreloadScript: (src: string) => Function
+ };
+ 
+-const v8Util = process._linkedBinding('electron_common_v8_util');
+ const ipcRendererUtils = require('@electron/internal/renderer/ipc-renderer-internal-utils') as typeof ipcRendererUtilsModule;
+ 
+ const {
+@@ -43,6 +41,7 @@ const loadableModules = new Map<string, Function>([
+ const preloadProcess = createPreloadProcessObject();
+ 
+ // InvokeEmitProcessEvent in ElectronSandboxedRendererClient will look for this
++const v8Util = process._linkedBinding('electron_common_v8_util');
+ v8Util.setHiddenValue(global, 'emit-process-event', (event: string) => {
+   (process as events.EventEmitter).emit(event);
+   (preloadProcess as events.EventEmitter).emit(event);
+diff --git a/script/gen-filenames.ts b/script/gen-filenames.ts
+index 72754d24e2..befed31e97 100644
+--- a/script/gen-filenames.ts
++++ b/script/gen-filenames.ts
+@@ -44,6 +44,10 @@ const main = async () => {
+     {
+       name: 'utility_bundle_deps',
+       config: 'webpack.config.utility.js'
++    },
++    {
++      name: 'preload_realm_bundle_deps',
++      config: 'webpack.config.preload_realm.js'
+     }
+   ];
+ 
+diff --git a/shell/browser/api/electron_api_session.cc b/shell/browser/api/electron_api_session.cc
+index 9f9c21278b..3691aa5047 100644
+--- a/shell/browser/api/electron_api_session.cc
++++ b/shell/browser/api/electron_api_session.cc
+@@ -1762,6 +1762,12 @@ gin::Handle<Session> Session::CreateFrom(
+   // to use partition strings, instead of using the Session object directly.
+   handle->Pin(isolate);
+ 
++  v8::TryCatch try_catch(isolate);
++  gin_helper::CallMethod(isolate, handle.get(), "_init");
++  if (try_catch.HasCaught()) {
++    node::errors::TriggerUncaughtException(isolate, try_catch);
++  }
++
+   App::Get()->EmitWithoutEvent("session-created", handle);
+ 
+   return handle;
+diff --git a/shell/browser/api/electron_api_session.h b/shell/browser/api/electron_api_session.h
+index 0ffaabcd2d..76e4f9559c 100644
+--- a/shell/browser/api/electron_api_session.h
++++ b/shell/browser/api/electron_api_session.h
+@@ -18,6 +18,7 @@
+ #include "gin/wrappable.h"
+ #include "services/network/public/mojom/host_resolver.mojom-forward.h"
+ #include "services/network/public/mojom/ssl_config.mojom-forward.h"
++#include "shell/browser/api/ipc_dispatcher.h"
+ #include "shell/browser/event_emitter_mixin.h"
+ #include "shell/browser/net/resolve_proxy_helper.h"
+ #include "shell/common/gin_helper/cleaned_up_at_exit.h"
+@@ -66,6 +67,7 @@ class Session final : public gin::Wrappable<Session>,
+                       public gin_helper::Constructible<Session>,
+                       public gin_helper::EventEmitterMixin<Session>,
+                       public gin_helper::CleanedUpAtExit,
++                      public IpcDispatcher<Session>,
+ #if BUILDFLAG(ENABLE_BUILTIN_SPELLCHECKER)
+                       private SpellcheckHunspellDictionary::Observer,
+ #endif
+diff --git a/shell/browser/api/electron_api_web_contents.cc b/shell/browser/api/electron_api_web_contents.cc
+index 751baa8d66..21cd725587 100644
+--- a/shell/browser/api/electron_api_web_contents.cc
++++ b/shell/browser/api/electron_api_web_contents.cc
+@@ -132,6 +132,7 @@
+ #include "shell/common/gin_helper/locker.h"
+ #include "shell/common/gin_helper/object_template_builder.h"
+ #include "shell/common/gin_helper/promise.h"
++#include "shell/common/gin_helper/reply_channel.h"
+ #include "shell/common/language_util.h"
+ #include "shell/common/node_includes.h"
+ #include "shell/common/node_util.h"
+@@ -1982,66 +1983,6 @@ void WebContents::OnFirstNonEmptyLayout(
+   }
+ }
+ 
+-namespace {
+-
+-// This object wraps the InvokeCallback so that if it gets GC'd by V8, we can
+-// still call the callback and send an error. Not doing so causes a Mojo DCHECK,
+-// since Mojo requires callbacks to be called before they are destroyed.
+-class ReplyChannel final : public gin::Wrappable<ReplyChannel> {
+- public:
+-  using InvokeCallback = electron::mojom::ElectronApiIPC::InvokeCallback;
+-  static gin::Handle<ReplyChannel> Create(v8::Isolate* isolate,
+-                                          InvokeCallback callback) {
+-    return gin::CreateHandle(isolate, new ReplyChannel(std::move(callback)));
+-  }
+-
+-  // gin::Wrappable
+-  static gin::WrapperInfo kWrapperInfo;
+-  gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
+-      v8::Isolate* isolate) override {
+-    return gin::Wrappable<ReplyChannel>::GetObjectTemplateBuilder(isolate)
+-        .SetMethod("sendReply", &ReplyChannel::SendReply);
+-  }
+-  const char* GetTypeName() override { return "ReplyChannel"; }
+-
+-  void SendError(const std::string& msg) {
+-    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
+-    // If there's no current context, it means we're shutting down, so we
+-    // don't need to send an event.
+-    if (!isolate->GetCurrentContext().IsEmpty()) {
+-      v8::HandleScope scope(isolate);
+-      auto message = gin::DataObjectBuilder(isolate).Set("error", msg).Build();
+-      SendReply(isolate, message);
+-    }
+-  }
+-
+- private:
+-  explicit ReplyChannel(InvokeCallback callback)
+-      : callback_(std::move(callback)) {}
+-  ~ReplyChannel() override {
+-    if (callback_)
+-      SendError("reply was never sent");
+-  }
+-
+-  bool SendReply(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
+-    if (!callback_)
+-      return false;
+-    blink::CloneableMessage message;
+-    if (!gin::ConvertFromV8(isolate, arg, &message)) {
+-      return false;
+-    }
+-
+-    std::move(callback_).Run(std::move(message));
+-    return true;
+-  }
+-
+-  InvokeCallback callback_;
+-};
+-
+-gin::WrapperInfo ReplyChannel::kWrapperInfo = {gin::kEmbedderNativeGin};
+-
+-}  // namespace
+-
+ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
+     v8::Isolate* isolate,
+     content::RenderFrameHost* frame,
+@@ -2050,7 +1991,7 @@ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
+   if (!GetWrapper(isolate).ToLocal(&wrapper)) {
+     if (callback) {
+       // We must always invoke the callback if present.
+-      ReplyChannel::Create(isolate, std::move(callback))
++      gin_helper::internal::ReplyChannel::Create(isolate, std::move(callback))
+           ->SendError("WebContents was destroyed");
+     }
+     return {};
+@@ -2058,9 +1999,10 @@ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
+   gin::Handle<gin_helper::internal::Event> event =
+       gin_helper::internal::Event::New(isolate);
+   gin_helper::Dictionary dict(isolate, event.ToV8().As<v8::Object>());
++  dict.Set("type", "frame");
+   if (callback)
+-    dict.Set("_replyChannel",
+-             ReplyChannel::Create(isolate, std::move(callback)));
++    dict.Set("_replyChannel", gin_helper::internal::ReplyChannel::Create(
++                                  isolate, std::move(callback)));
+   if (frame) {
+     dict.SetGetter("senderFrame", frame);
+     dict.Set("frameId", frame->GetRoutingID());
+diff --git a/shell/browser/api/ipc_dispatcher.h b/shell/browser/api/ipc_dispatcher.h
+new file mode 100644
+index 0000000000..37c3d166d7
+--- /dev/null
++++ b/shell/browser/api/ipc_dispatcher.h
+@@ -0,0 +1,89 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_BROWSER_API_IPC_DISPATCHER_H_
++#define ELECTRON_SHELL_BROWSER_API_IPC_DISPATCHER_H_
++
++#include <string>
++
++#include "base/trace_event/trace_event.h"
++#include "base/values.h"
++#include "gin/handle.h"
++#include "shell/browser/api/message_port.h"
++#include "shell/browser/javascript_environment.h"
++#include "shell/common/api/api.mojom.h"
++#include "shell/common/gin_converters/blink_converter.h"
++#include "shell/common/gin_helper/dictionary.h"
++#include "shell/common/gin_helper/event.h"
++#include "shell/common/gin_helper/reply_channel.h"
++#include "shell/common/v8_util.h"
++
++namespace electron {
++
++// Handles dispatching IPCs to JS.
++// See ipc-dispatch.ts for JS listeners.
++template <typename T>
++class IpcDispatcher {
++ public:
++  void Message(gin::Handle<gin_helper::internal::Event>& event,
++               const std::string& channel,
++               blink::CloneableMessage args) {
++    TRACE_EVENT1("electron", "IpcDispatcher::Message", "channel", channel);
++    emitter()->EmitWithoutEvent("-ipc-message", event, channel, args);
++  }
++
++  void Invoke(gin::Handle<gin_helper::internal::Event>& event,
++              const std::string& channel,
++              blink::CloneableMessage arguments,
++              electron::mojom::ElectronApiIPC::InvokeCallback callback) {
++    TRACE_EVENT1("electron", "IpcHelper::Invoke", "channel", channel);
++
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    gin_helper::Dictionary dict(isolate, event.ToV8().As<v8::Object>());
++    dict.Set("_replyChannel", gin_helper::internal::ReplyChannel::Create(
++                                  isolate, std::move(callback)));
++
++    emitter()->EmitWithoutEvent("-ipc-invoke", event, channel,
++                                std::move(arguments));
++  }
++
++  void ReceivePostMessage(gin::Handle<gin_helper::internal::Event>& event,
++                          const std::string& channel,
++                          blink::TransferableMessage message) {
++    v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
++    v8::HandleScope handle_scope(isolate);
++    auto wrapped_ports =
++        MessagePort::EntanglePorts(isolate, std::move(message.ports));
++    v8::Local<v8::Value> message_value =
++        electron::DeserializeV8Value(isolate, message);
++    emitter()->EmitWithoutEvent("-ipc-ports", event, channel, message_value,
++                                std::move(wrapped_ports));
++  }
++
++  void MessageSync(
++      gin::Handle<gin_helper::internal::Event>& event,
++      const std::string& channel,
++      blink::CloneableMessage arguments,
++      electron::mojom::ElectronApiIPC::MessageSyncCallback callback) {
++    TRACE_EVENT1("electron", "IpcHelper::MessageSync", "channel", channel);
++
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    gin_helper::Dictionary dict(isolate, event.ToV8().As<v8::Object>());
++    dict.Set("_replyChannel", gin_helper::internal::ReplyChannel::Create(
++                                  isolate, std::move(callback)));
++
++    emitter()->EmitWithoutEvent("-ipc-message-sync", event, channel,
++                                std::move(arguments));
++  }
++
++ private:
++  inline T* emitter() {
++    // T must inherit from gin_helper::EventEmitterMixin<T>
++    return static_cast<T*>(this);
++  }
++};
++
++}  // namespace electron
++
++#endif  // ELECTRON_SHELL_BROWSER_API_IPC_DISPATCHER_H_
+diff --git a/shell/browser/electron_api_sw_ipc_handler_impl.cc b/shell/browser/electron_api_sw_ipc_handler_impl.cc
+new file mode 100644
+index 0000000000..6c9bf803f0
+--- /dev/null
++++ b/shell/browser/electron_api_sw_ipc_handler_impl.cc
+@@ -0,0 +1,199 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "shell/browser/electron_api_sw_ipc_handler_impl.h"
++
++#include <utility>
++
++#include "base/containers/unique_ptr_adapters.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/render_process_host.h"
++#include "mojo/public/cpp/bindings/self_owned_receiver.h"
++#include "shell/browser/api/electron_api_session.h"
++#include "shell/browser/electron_browser_context.h"
++#include "shell/browser/javascript_environment.h"
++#include "shell/common/gin_helper/dictionary.h"
++
++namespace electron {
++
++namespace {
++const void* const kUserDataKey = &kUserDataKey;
++
++class ServiceWorkerIPCList : public base::SupportsUserData::Data {
++ public:
++  std::vector<std::unique_ptr<ElectronApiSWIPCHandlerImpl>> list;
++
++  static ServiceWorkerIPCList* Get(
++      content::RenderProcessHost* render_process_host,
++      bool create_if_not_exists) {
++    auto* service_worker_ipc_list = static_cast<ServiceWorkerIPCList*>(
++        render_process_host->GetUserData(kUserDataKey));
++    if (!service_worker_ipc_list && !create_if_not_exists) {
++      return nullptr;
++    }
++    if (!service_worker_ipc_list) {
++      auto new_ipc_list = std::make_unique<ServiceWorkerIPCList>();
++      service_worker_ipc_list = new_ipc_list.get();
++      render_process_host->SetUserData(kUserDataKey, std::move(new_ipc_list));
++    }
++    return service_worker_ipc_list;
++  }
++};
++
++}  // namespace
++
++ElectronApiSWIPCHandlerImpl::ElectronApiSWIPCHandlerImpl(
++    content::RenderProcessHost* render_process_host,
++    int64_t version_id,
++    mojo::PendingAssociatedReceiver<mojom::ElectronApiIPC> receiver)
++    : render_process_host_(render_process_host), version_id_(version_id) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++
++  receiver_.Bind(std::move(receiver));
++  receiver_.set_disconnect_handler(
++      base::BindOnce(&ElectronApiSWIPCHandlerImpl::RemoteDisconnected,
++                     base::Unretained(this)));
++
++  render_process_host_->AddObserver(this);
++}
++
++ElectronApiSWIPCHandlerImpl::~ElectronApiSWIPCHandlerImpl() {
++  render_process_host_->RemoveObserver(this);
++}
++
++void ElectronApiSWIPCHandlerImpl::RemoteDisconnected() {
++  receiver_.reset();
++  Destroy();
++}
++
++void ElectronApiSWIPCHandlerImpl::Message(bool internal,
++                                          const std::string& channel,
++                                          blink::CloneableMessage arguments) {
++  auto* session = GetSession();
++  if (session) {
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    v8::HandleScope handle_scope(isolate);
++    gin::Handle<gin_helper::internal::Event> event =
++        MakeIPCEvent(isolate, internal);
++    session->Message(event, channel, std::move(arguments));
++  }
++}
++
++void ElectronApiSWIPCHandlerImpl::Invoke(bool internal,
++                                         const std::string& channel,
++                                         blink::CloneableMessage arguments,
++                                         InvokeCallback callback) {
++  auto* session = GetSession();
++  if (session) {
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    v8::HandleScope handle_scope(isolate);
++    gin::Handle<gin_helper::internal::Event> event =
++        MakeIPCEvent(isolate, internal);
++    session->Invoke(event, channel, std::move(arguments), std::move(callback));
++  }
++}
++
++void ElectronApiSWIPCHandlerImpl::ReceivePostMessage(
++    const std::string& channel,
++    blink::TransferableMessage message) {
++  auto* session = GetSession();
++  if (session) {
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    v8::HandleScope handle_scope(isolate);
++    gin::Handle<gin_helper::internal::Event> event =
++        MakeIPCEvent(isolate, false);
++    session->ReceivePostMessage(event, channel, std::move(message));
++  }
++}
++
++void ElectronApiSWIPCHandlerImpl::MessageSync(bool internal,
++                                              const std::string& channel,
++                                              blink::CloneableMessage arguments,
++                                              MessageSyncCallback callback) {
++  auto* session = GetSession();
++  if (session) {
++    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++    v8::HandleScope handle_scope(isolate);
++    gin::Handle<gin_helper::internal::Event> event =
++        MakeIPCEvent(isolate, internal);
++    session->MessageSync(event, channel, std::move(arguments),
++                         std::move(callback));
++  }
++}
++
++void ElectronApiSWIPCHandlerImpl::MessageHost(
++    const std::string& channel,
++    blink::CloneableMessage arguments) {
++  NOTIMPLEMENTED();  // Service workers have no <webview>
++}
++
++ElectronBrowserContext* ElectronApiSWIPCHandlerImpl::GetBrowserContext() {
++  auto* browser_context = static_cast<ElectronBrowserContext*>(
++      render_process_host_->GetBrowserContext());
++  return browser_context;
++}
++
++api::Session* ElectronApiSWIPCHandlerImpl::GetSession() {
++  return api::Session::FromBrowserContext(GetBrowserContext());
++}
++
++gin::Handle<gin_helper::internal::Event>
++ElectronApiSWIPCHandlerImpl::MakeIPCEvent(v8::Isolate* isolate, bool internal) {
++  gin::Handle<gin_helper::internal::Event> event =
++      gin_helper::internal::Event::New(isolate);
++  v8::Local<v8::Object> event_object = event.ToV8().As<v8::Object>();
++
++  gin_helper::Dictionary dict(isolate, event_object);
++  dict.Set("type", "service-worker");
++  dict.Set("versionId", version_id_);
++  dict.Set("processId", render_process_host_->GetID().GetUnsafeValue());
++
++  // Set session to provide context for getting preloads
++  dict.Set("session", GetSession());
++
++  if (internal)
++    dict.SetHidden("internal", internal);
++
++  return event;
++}
++
++void ElectronApiSWIPCHandlerImpl::Destroy() {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++
++  auto* service_worker_ipc_list = ServiceWorkerIPCList::Get(
++      render_process_host_, /*create_if_not_exists=*/false);
++  CHECK(service_worker_ipc_list);
++  // std::erase_if will lead to a call to the destructor for this object.
++  std::erase_if(service_worker_ipc_list->list, base::MatchesUniquePtr(this));
++}
++
++void ElectronApiSWIPCHandlerImpl::RenderProcessExited(
++    content::RenderProcessHost* host,
++    const content::ChildProcessTerminationInfo& info) {
++  CHECK_EQ(host, render_process_host_);
++  // TODO(crbug.com/1407197): Investigate clearing the user data from
++  // RenderProcessHostImpl::Cleanup.
++  Destroy();
++  // This instance has now been deleted.
++}
++
++// static
++void ElectronApiSWIPCHandlerImpl::BindReceiver(
++    int render_process_id,
++    int64_t version_id,
++    mojo::PendingAssociatedReceiver<mojom::ElectronApiIPC> receiver) {
++  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
++  auto* render_process_host =
++      content::RenderProcessHost::FromID(render_process_id);
++  if (!render_process_host) {
++    return;
++  }
++  auto* service_worker_ipc_list = ServiceWorkerIPCList::Get(
++      render_process_host, /*create_if_not_exists=*/true);
++  service_worker_ipc_list->list.push_back(
++      std::make_unique<ElectronApiSWIPCHandlerImpl>(
++          render_process_host, version_id, std::move(receiver)));
++}
++
++}  // namespace electron
+diff --git a/shell/browser/electron_api_sw_ipc_handler_impl.h b/shell/browser/electron_api_sw_ipc_handler_impl.h
+new file mode 100644
+index 0000000000..b86f4fabac
+--- /dev/null
++++ b/shell/browser/electron_api_sw_ipc_handler_impl.h
+@@ -0,0 +1,98 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_BROWSER_ELECTRON_API_SW_IPC_HANDLER_IMPL_H_
++#define ELECTRON_SHELL_BROWSER_ELECTRON_API_SW_IPC_HANDLER_IMPL_H_
++
++#include <string>
++
++#include "base/memory/weak_ptr.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/render_process_host_observer.h"
++#include "electron/shell/common/api/api.mojom.h"
++#include "gin/handle.h"
++#include "mojo/public/cpp/bindings/associated_receiver.h"
++#include "shell/common/gin_helper/event.h"
++
++namespace content {
++class RenderProcessHost;
++}
++
++namespace electron {
++class ElectronBrowserContext;
++
++namespace api {
++class Session;
++}
++
++class ElectronApiSWIPCHandlerImpl : public mojom::ElectronApiIPC,
++                                    public content::RenderProcessHostObserver {
++ public:
++  explicit ElectronApiSWIPCHandlerImpl(
++      content::RenderProcessHost* render_process_host,
++      int64_t version_id,
++      mojo::PendingAssociatedReceiver<mojom::ElectronApiIPC> receiver);
++
++  static void BindReceiver(
++      int render_process_id,
++      int64_t version_id,
++      mojo::PendingAssociatedReceiver<mojom::ElectronApiIPC> receiver);
++
++  // disable copy
++  ElectronApiSWIPCHandlerImpl(const ElectronApiSWIPCHandlerImpl&) = delete;
++  ElectronApiSWIPCHandlerImpl& operator=(const ElectronApiSWIPCHandlerImpl&) =
++      delete;
++  ~ElectronApiSWIPCHandlerImpl() override;
++
++  // mojom::ElectronApiIPC:
++  void Message(bool internal,
++               const std::string& channel,
++               blink::CloneableMessage arguments) override;
++  void Invoke(bool internal,
++              const std::string& channel,
++              blink::CloneableMessage arguments,
++              InvokeCallback callback) override;
++  void ReceivePostMessage(const std::string& channel,
++                          blink::TransferableMessage message) override;
++  void MessageSync(bool internal,
++                   const std::string& channel,
++                   blink::CloneableMessage arguments,
++                   MessageSyncCallback callback) override;
++  void MessageHost(const std::string& channel,
++                   blink::CloneableMessage arguments) override;
++
++  base::WeakPtr<ElectronApiSWIPCHandlerImpl> GetWeakPtr() {
++    return weak_factory_.GetWeakPtr();
++  }
++
++ private:
++  ElectronBrowserContext* GetBrowserContext();
++  api::Session* GetSession();
++
++  gin::Handle<gin_helper::internal::Event> MakeIPCEvent(v8::Isolate* isolate,
++                                                        bool internal);
++
++  // content::RenderProcessHostObserver
++  void RenderProcessExited(
++      content::RenderProcessHost* host,
++      const content::ChildProcessTerminationInfo& info) override;
++
++  void RemoteDisconnected();
++
++  // Destroys this instance by removing it from the ServiceWorkerIPCList.
++  void Destroy();
++
++  // This is safe because ElectronApiSWIPCHandlerImpl is tied to the life time
++  // of RenderProcessHost.
++  const raw_ptr<content::RenderProcessHost> render_process_host_;
++
++  // Service worker version ID.
++  int64_t version_id_;
++
++  mojo::AssociatedReceiver<mojom::ElectronApiIPC> receiver_{this};
++
++  base::WeakPtrFactory<ElectronApiSWIPCHandlerImpl> weak_factory_{this};
++};
++}  // namespace electron
++#endif  // ELECTRON_SHELL_BROWSER_ELECTRON_API_SW_IPC_HANDLER_IMPL_H_
+diff --git a/shell/browser/electron_browser_client.cc b/shell/browser/electron_browser_client.cc
+index 40f29ccc9b..ac8dfca095 100644
+--- a/shell/browser/electron_browser_client.cc
++++ b/shell/browser/electron_browser_client.cc
+@@ -79,6 +79,7 @@
+ #include "shell/browser/bluetooth/electron_bluetooth_delegate.h"
+ #include "shell/browser/child_web_contents_tracker.h"
+ #include "shell/browser/electron_api_ipc_handler_impl.h"
++#include "shell/browser/electron_api_sw_ipc_handler_impl.h"
+ #include "shell/browser/electron_autofill_driver_factory.h"
+ #include "shell/browser/electron_browser_context.h"
+ #include "shell/browser/electron_browser_main_parts.h"
+@@ -581,6 +582,18 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
+         web_preferences->AppendCommandLineSwitches(
+             command_line, IsRendererSubFrame(unsafe_process_id));
+     }
++
++    // Service worker processes should only run preloads if one has been
++    // registered prior to startup.
++    auto* render_process_host = content::RenderProcessHost::FromID(process_id);
++    if (render_process_host) {
++      auto* browser_context = render_process_host->GetBrowserContext();
++      auto* session_prefs =
++          SessionPreferences::FromBrowserContext(browser_context);
++      if (session_prefs->HasServiceWorkerPreloadScript()) {
++        command_line->AppendSwitch(switches::kServiceWorkerPreload);
++      }
++    }
+   }
+ }
+ 
+@@ -1409,6 +1422,13 @@ void ElectronBrowserClient::OverrideURLLoaderFactoryParams(
+ void ElectronBrowserClient::RegisterAssociatedInterfaceBindersForServiceWorker(
+     const content::ServiceWorkerVersionBaseInfo& service_worker_version_info,
+     blink::AssociatedInterfaceRegistry& associated_registry) {
++  CHECK(service_worker_version_info.process_id !=
++        content::ChildProcessHost::kInvalidUniqueID);
++  associated_registry.AddInterface<mojom::ElectronApiIPC>(
++      base::BindRepeating(&ElectronApiSWIPCHandlerImpl::BindReceiver,
++                          service_worker_version_info.process_id,
++                          service_worker_version_info.version_id));
++
+ #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
+   associated_registry.AddInterface<extensions::mojom::RendererHost>(
+       base::BindRepeating(&extensions::RendererStartupHelper::BindForRenderer,
+diff --git a/shell/browser/session_preferences.cc b/shell/browser/session_preferences.cc
+index 89acb11410..5ef235010e 100644
+--- a/shell/browser/session_preferences.cc
++++ b/shell/browser/session_preferences.cc
+@@ -30,4 +30,13 @@ SessionPreferences* SessionPreferences::FromBrowserContext(
+   return static_cast<SessionPreferences*>(context->GetUserData(&kLocatorKey));
+ }
+ 
++bool SessionPreferences::HasServiceWorkerPreloadScript() {
++  const auto& preloads = preload_scripts();
++  auto it = std::find_if(
++      preloads.begin(), preloads.end(), [](const PreloadScript& script) {
++        return script.script_type == PreloadScript::ScriptType::kServiceWorker;
++      });
++  return it != preloads.end();
++}
++
+ }  // namespace electron
+diff --git a/shell/browser/session_preferences.h b/shell/browser/session_preferences.h
+index 8ddac4e6b3..3c03e701da 100644
+--- a/shell/browser/session_preferences.h
++++ b/shell/browser/session_preferences.h
+@@ -28,6 +28,8 @@ class SessionPreferences : public base::SupportsUserData::Data {
+ 
+   std::vector<PreloadScript>& preload_scripts() { return preload_scripts_; }
+ 
++  bool HasServiceWorkerPreloadScript();
++
+  private:
+   SessionPreferences();
+ 
+diff --git a/shell/common/gin_helper/callback.cc b/shell/common/gin_helper/callback.cc
+index fdc65b7920..4a7f71b246 100644
+--- a/shell/common/gin_helper/callback.cc
++++ b/shell/common/gin_helper/callback.cc
+@@ -33,7 +33,10 @@ struct TranslatorHolder {
+ };
+ 
+ // Cached JavaScript version of |CallTranslator|.
+-v8::Persistent<v8::FunctionTemplate> g_call_translator;
++// v8::Persistent handles are bound to a specific v8::Isolate. Require
++// initializing per-thread to avoid using the wrong isolate from service
++// worker preload scripts.
++thread_local v8::Persistent<v8::FunctionTemplate> g_call_translator;
+ 
+ void CallTranslator(v8::Local<v8::External> external,
+                     v8::Local<v8::Object> state,
+diff --git a/shell/common/gin_helper/reply_channel.cc b/shell/common/gin_helper/reply_channel.cc
+new file mode 100644
+index 0000000000..9422758c1f
+--- /dev/null
++++ b/shell/common/gin_helper/reply_channel.cc
+@@ -0,0 +1,66 @@
++// Copyright (c) 2023 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "shell/common/gin_helper/reply_channel.h"
++
++#include "base/debug/stack_trace.h"
++#include "gin/data_object_builder.h"
++#include "gin/handle.h"
++#include "gin/object_template_builder.h"
++#include "shell/browser/javascript_environment.h"
++#include "shell/common/gin_converters/blink_converter.h"
++
++namespace gin_helper::internal {
++
++// static
++using InvokeCallback = electron::mojom::ElectronApiIPC::InvokeCallback;
++gin::Handle<ReplyChannel> ReplyChannel::Create(v8::Isolate* isolate,
++                                               InvokeCallback callback) {
++  return gin::CreateHandle(isolate, new ReplyChannel(std::move(callback)));
++}
++
++gin::ObjectTemplateBuilder ReplyChannel::GetObjectTemplateBuilder(
++    v8::Isolate* isolate) {
++  return gin::Wrappable<ReplyChannel>::GetObjectTemplateBuilder(isolate)
++      .SetMethod("sendReply", &ReplyChannel::SendReply);
++}
++
++const char* ReplyChannel::GetTypeName() {
++  return "ReplyChannel";
++}
++
++ReplyChannel::ReplyChannel(InvokeCallback callback)
++    : callback_(std::move(callback)) {}
++
++ReplyChannel::~ReplyChannel() {
++  if (callback_)
++    SendError("reply was never sent");
++}
++
++void ReplyChannel::SendError(const std::string& msg) {
++  v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
++  // If there's no current context, it means we're shutting down, so we
++  // don't need to send an event.
++  if (!isolate->GetCurrentContext().IsEmpty()) {
++    v8::HandleScope scope(isolate);
++    auto message = gin::DataObjectBuilder(isolate).Set("error", msg).Build();
++    SendReply(isolate, message);
++  }
++}
++
++bool ReplyChannel::SendReply(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
++  if (!callback_)
++    return false;
++  blink::CloneableMessage message;
++  if (!gin::ConvertFromV8(isolate, arg, &message)) {
++    return false;
++  }
++
++  std::move(callback_).Run(std::move(message));
++  return true;
++}
++
++gin::WrapperInfo ReplyChannel::kWrapperInfo = {gin::kEmbedderNativeGin};
++
++}  // namespace gin_helper::internal
+diff --git a/shell/common/gin_helper/reply_channel.h b/shell/common/gin_helper/reply_channel.h
+new file mode 100644
+index 0000000000..80ecc9c5ff
+--- /dev/null
++++ b/shell/common/gin_helper/reply_channel.h
+@@ -0,0 +1,54 @@
++// Copyright (c) 2023 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_COMMON_GIN_HELPER_REPLY_CHANNEL_H_
++#define ELECTRON_SHELL_COMMON_GIN_HELPER_REPLY_CHANNEL_H_
++
++#include "gin/wrappable.h"
++#include "shell/common/api/api.mojom.h"
++
++namespace gin {
++template <typename T>
++class Handle;
++}  // namespace gin
++
++namespace v8 {
++class Isolate;
++template <typename T>
++class Local;
++class Object;
++class ObjectTemplate;
++}  // namespace v8
++
++namespace gin_helper::internal {
++
++// This object wraps the InvokeCallback so that if it gets GC'd by V8, we can
++// still call the callback and send an error. Not doing so causes a Mojo DCHECK,
++// since Mojo requires callbacks to be called before they are destroyed.
++class ReplyChannel : public gin::Wrappable<ReplyChannel> {
++ public:
++  using InvokeCallback = electron::mojom::ElectronApiIPC::InvokeCallback;
++  static gin::Handle<ReplyChannel> Create(v8::Isolate* isolate,
++                                          InvokeCallback callback);
++
++  // gin::Wrappable
++  static gin::WrapperInfo kWrapperInfo;
++  gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
++      v8::Isolate* isolate) override;
++  const char* GetTypeName() override;
++
++  void SendError(const std::string& msg);
++
++ private:
++  explicit ReplyChannel(InvokeCallback callback);
++  ~ReplyChannel() override;
++
++  bool SendReply(v8::Isolate* isolate, v8::Local<v8::Value> arg);
++
++  InvokeCallback callback_;
++};
++
++}  // namespace gin_helper::internal
++
++#endif  // ELECTRON_SHELL_COMMON_GIN_HELPER_REPLY_CHANNEL_H_
+diff --git a/shell/common/node_util.cc b/shell/common/node_util.cc
+index 66d95db934..6d18f077b6 100644
+--- a/shell/common/node_util.cc
++++ b/shell/common/node_util.cc
+@@ -31,8 +31,12 @@ v8::MaybeLocal<v8::Value> CompileAndCall(
+   v8::MaybeLocal<v8::Function> compiled = builtin_loader.LookupAndCompile(
+       context, id, parameters, node::Realm::GetCurrent(context));
+ 
+-  if (compiled.IsEmpty())
++  if (compiled.IsEmpty()) {
++    // TODO(samuelmaddock): how can we get the compilation error message?
++    LOG(ERROR) << "CompileAndCall failed to compile electron script (" << id
++               << ")";
+     return {};
++  }
+ 
+   v8::Local<v8::Function> fn = compiled.ToLocalChecked().As<v8::Function>();
+   v8::MaybeLocal<v8::Value> ret = fn->Call(
+@@ -47,7 +51,7 @@ v8::MaybeLocal<v8::Value> CompileAndCall(
+     } else if (try_catch.HasTerminated()) {
+       msg = "script execution has been terminated";
+     }
+-    LOG(ERROR) << "Failed to CompileAndCall electron script (" << id
++    LOG(ERROR) << "CompileAndCall failed to evaluate electron script (" << id
+                << "): " << msg;
+   }
+   return ret;
+diff --git a/shell/common/options_switches.h b/shell/common/options_switches.h
+index d6b95fb3c4..04b47bda3b 100644
+--- a/shell/common/options_switches.h
++++ b/shell/common/options_switches.h
+@@ -288,6 +288,10 @@ inline constexpr base::cstring_view kEnableAuthNegotiatePort =
+ // If set, NTLM v2 is disabled for POSIX platforms.
+ inline constexpr base::cstring_view kDisableNTLMv2 = "disable-ntlm-v2";
+ 
++// Indicates that preloads for service workers are registered.
++inline constexpr base::cstring_view kServiceWorkerPreload =
++    "service-worker-preload";
++
+ }  // namespace switches
+ 
+ }  // namespace electron
+diff --git a/shell/renderer/api/electron_api_context_bridge.cc b/shell/renderer/api/electron_api_context_bridge.cc
+index f1dbffa32f..7de4a65456 100644
+--- a/shell/renderer/api/electron_api_context_bridge.cc
++++ b/shell/renderer/api/electron_api_context_bridge.cc
+@@ -25,6 +25,7 @@
+ #include "shell/common/gin_helper/promise.h"
+ #include "shell/common/node_includes.h"
+ #include "shell/common/world_ids.h"
++#include "shell/renderer/preload_realm_context.h"
+ #include "third_party/blink/public/web/web_blob.h"
+ #include "third_party/blink/public/web/web_element.h"
+ #include "third_party/blink/public/web/web_local_frame.h"
+@@ -765,6 +766,14 @@ v8::MaybeLocal<v8::Context> GetTargetContext(v8::Isolate* isolate,
+         world_id == WorldIDs::MAIN_WORLD_ID
+             ? frame->MainWorldScriptContext()
+             : frame->GetScriptContextFromWorldId(isolate, world_id);
++  } else if (execution_context->IsShadowRealmGlobalScope()) {
++    if (world_id != WorldIDs::MAIN_WORLD_ID) {
++      isolate->ThrowException(v8::Exception::Error(gin::StringToV8(
++          isolate, "Isolated worlds are not supported in preload realms.")));
++      return maybe_target_context;
++    }
++    maybe_target_context =
++        electron::preload_realm::GetInitiatorContext(source_context);
+   } else {
+     NOTREACHED();
+   }
+diff --git a/shell/renderer/api/electron_api_ipc_renderer.cc b/shell/renderer/api/electron_api_ipc_renderer.cc
+index 29305a4d53..fc61978b2c 100644
+--- a/shell/renderer/api/electron_api_ipc_renderer.cc
++++ b/shell/renderer/api/electron_api_ipc_renderer.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "content/public/renderer/render_frame.h"
+ #include "content/public/renderer/render_frame_observer.h"
++#include "content/public/renderer/worker_thread.h"
+ #include "gin/dictionary.h"
+ #include "gin/handle.h"
+ #include "gin/object_template_builder.h"
+@@ -14,15 +15,20 @@
+ #include "shell/common/api/api.mojom.h"
+ #include "shell/common/gin_converters/blink_converter.h"
+ #include "shell/common/gin_converters/value_converter.h"
++#include "shell/common/gin_helper/dictionary.h"
+ #include "shell/common/gin_helper/error_thrower.h"
+ #include "shell/common/gin_helper/function_template_extensions.h"
+ #include "shell/common/gin_helper/promise.h"
+ #include "shell/common/node_bindings.h"
+ #include "shell/common/node_includes.h"
+ #include "shell/common/v8_util.h"
++#include "shell/renderer/preload_realm_context.h"
++#include "shell/renderer/service_worker_data.h"
+ #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
++#include "third_party/blink/public/web/modules/service_worker/web_service_worker_context_proxy.h"
+ #include "third_party/blink/public/web/web_local_frame.h"
+ #include "third_party/blink/public/web/web_message_port_converter.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"  // nogncheck
+ 
+ using blink::WebLocalFrame;
+ using content::RenderFrame;
+@@ -40,50 +46,23 @@ RenderFrame* GetCurrentRenderFrame() {
+   return RenderFrame::FromWebFrame(frame);
+ }
+ 
+-class IPCRenderer final : public gin::Wrappable<IPCRenderer>,
+-                          private content::RenderFrameObserver {
+- public:
+-  static gin::WrapperInfo kWrapperInfo;
+-
+-  static gin::Handle<IPCRenderer> Create(v8::Isolate* isolate) {
+-    return gin::CreateHandle(isolate, new IPCRenderer(isolate));
+-  }
+-
+-  explicit IPCRenderer(v8::Isolate* isolate)
+-      : content::RenderFrameObserver(GetCurrentRenderFrame()) {
+-    RenderFrame* render_frame = GetCurrentRenderFrame();
+-    DCHECK(render_frame);
+-    weak_context_ =
+-        v8::Global<v8::Context>(isolate, isolate->GetCurrentContext());
+-    weak_context_.SetWeak();
+-
+-    render_frame->GetRemoteAssociatedInterfaces()->GetInterface(
+-        &electron_ipc_remote_);
+-  }
++// Thread identifier for the main renderer thread (as opposed to a service
++// worker thread).
++inline constexpr int kMainThreadId = 0;
+ 
+-  void OnDestruct() override { electron_ipc_remote_.reset(); }
++bool IsWorkerThread() {
++  return content::WorkerThread::GetCurrentId() != kMainThreadId;
++}
+ 
+-  void WillReleaseScriptContext(v8::Local<v8::Context> context,
+-                                int32_t world_id) override {
+-    if (weak_context_.IsEmpty() ||
+-        weak_context_.Get(context->GetIsolate()) == context)
+-      electron_ipc_remote_.reset();
+-  }
++template <typename T>
++class IPCBase : public gin::Wrappable<T> {
++ public:
++  static gin::WrapperInfo kWrapperInfo;
+ 
+-  // gin::Wrappable:
+-  gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
+-      v8::Isolate* isolate) override {
+-    return gin::Wrappable<IPCRenderer>::GetObjectTemplateBuilder(isolate)
+-        .SetMethod("send", &IPCRenderer::SendMessage)
+-        .SetMethod("sendSync", &IPCRenderer::SendSync)
+-        .SetMethod("sendToHost", &IPCRenderer::SendToHost)
+-        .SetMethod("invoke", &IPCRenderer::Invoke)
+-        .SetMethod("postMessage", &IPCRenderer::PostMessage);
++  static gin::Handle<T> Create(v8::Isolate* isolate) {
++    return gin::CreateHandle(isolate, new T(isolate));
+   }
+ 
+-  const char* GetTypeName() override { return "IPCRenderer"; }
+-
+- private:
+   void SendMessage(v8::Isolate* isolate,
+                    gin_helper::ErrorThrower thrower,
+                    bool internal,
+@@ -202,18 +181,95 @@ class IPCRenderer final : public gin::Wrappable<IPCRenderer>,
+     return electron::DeserializeV8Value(isolate, result);
+   }
+ 
+-  v8::Global<v8::Context> weak_context_;
++  // gin::Wrappable:
++  gin::ObjectTemplateBuilder GetObjectTemplateBuilder(
++      v8::Isolate* isolate) override {
++    return gin::Wrappable<T>::GetObjectTemplateBuilder(isolate)
++        .SetMethod("send", &T::SendMessage)
++        .SetMethod("sendSync", &T::SendSync)
++        .SetMethod("sendToHost", &T::SendToHost)
++        .SetMethod("invoke", &T::Invoke)
++        .SetMethod("postMessage", &T::PostMessage);
++  }
++
++ protected:
+   mojo::AssociatedRemote<electron::mojom::ElectronApiIPC> electron_ipc_remote_;
+ };
+ 
+-gin::WrapperInfo IPCRenderer::kWrapperInfo = {gin::kEmbedderNativeGin};
++class IPCRenderFrame : public IPCBase<IPCRenderFrame>,
++                       private content::RenderFrameObserver {
++ public:
++  explicit IPCRenderFrame(v8::Isolate* isolate)
++      : content::RenderFrameObserver(GetCurrentRenderFrame()) {
++    v8::Local<v8::Context> context = isolate->GetCurrentContext();
++    blink::ExecutionContext* execution_context =
++        blink::ExecutionContext::From(context);
++
++    if (execution_context->IsWindow()) {
++      RenderFrame* render_frame = GetCurrentRenderFrame();
++      DCHECK(render_frame);
++      render_frame->GetRemoteAssociatedInterfaces()->GetInterface(
++          &electron_ipc_remote_);
++    } else {
++      NOTREACHED();
++    }
++
++    weak_context_ =
++        v8::Global<v8::Context>(isolate, isolate->GetCurrentContext());
++    weak_context_.SetWeak();
++  }
++
++  void OnDestruct() override { electron_ipc_remote_.reset(); }
++
++  void WillReleaseScriptContext(v8::Local<v8::Context> context,
++                                int32_t world_id) override {
++    if (weak_context_.IsEmpty() ||
++        weak_context_.Get(context->GetIsolate()) == context) {
++      OnDestruct();
++    }
++  }
++
++  const char* GetTypeName() override { return "IPCRenderFrame"; }
++
++ private:
++  v8::Global<v8::Context> weak_context_;
++};
++
++template <>
++gin::WrapperInfo IPCBase<IPCRenderFrame>::kWrapperInfo = {
++    gin::kEmbedderNativeGin};
++
++class IPCServiceWorker : public IPCBase<IPCServiceWorker>,
++                         public content::WorkerThread::Observer {
++ public:
++  explicit IPCServiceWorker(v8::Isolate* isolate) {
++    DCHECK(IsWorkerThread());
++    content::WorkerThread::AddObserver(this);
++
++    electron::ServiceWorkerData* service_worker_data =
++        electron::preload_realm::GetServiceWorkerData(
++            isolate->GetCurrentContext());
++    DCHECK(service_worker_data);
++    service_worker_data->proxy()->GetRemoteAssociatedInterface(
++        electron_ipc_remote_.BindNewEndpointAndPassReceiver());
++  }
++
++  void WillStopCurrentWorkerThread() override { electron_ipc_remote_.reset(); }
++
++  const char* GetTypeName() override { return "IPCServiceWorker"; }
++};
++
++template <>
++gin::WrapperInfo IPCBase<IPCServiceWorker>::kWrapperInfo = {
++    gin::kEmbedderNativeGin};
+ 
+ void Initialize(v8::Local<v8::Object> exports,
+                 v8::Local<v8::Value> unused,
+                 v8::Local<v8::Context> context,
+                 void* priv) {
+-  gin::Dictionary dict(context->GetIsolate(), exports);
+-  dict.Set("ipc", IPCRenderer::Create(context->GetIsolate()));
++  gin_helper::Dictionary dict(context->GetIsolate(), exports);
++  dict.SetMethod("createForRenderFrame", &IPCRenderFrame::Create);
++  dict.SetMethod("createForServiceWorker", &IPCServiceWorker::Create);
+ }
+ 
+ }  // namespace
+diff --git a/shell/renderer/electron_api_service_impl.cc b/shell/renderer/electron_api_service_impl.cc
+index 4bb0fc218e..bc41997852 100644
+--- a/shell/renderer/electron_api_service_impl.cc
++++ b/shell/renderer/electron_api_service_impl.cc
+@@ -21,6 +21,7 @@
+ #include "shell/common/options_switches.h"
+ #include "shell/common/thread_restrictions.h"
+ #include "shell/common/v8_util.h"
++#include "shell/renderer/electron_ipc_native.h"
+ #include "shell/renderer/electron_render_frame_observer.h"
+ #include "shell/renderer/renderer_client_base.h"
+ #include "third_party/blink/public/mojom/frame/user_activation_notification_type.mojom-shared.h"
+@@ -31,73 +32,6 @@
+ 
+ namespace electron {
+ 
+-namespace {
+-
+-constexpr std::string_view kIpcKey = "ipcNative";
+-
+-// Gets the private object under kIpcKey
+-v8::Local<v8::Object> GetIpcObject(v8::Local<v8::Context> context) {
+-  auto* isolate = context->GetIsolate();
+-  auto binding_key = gin::StringToV8(isolate, kIpcKey);
+-  auto private_binding_key = v8::Private::ForApi(isolate, binding_key);
+-  auto global_object = context->Global();
+-  auto value =
+-      global_object->GetPrivate(context, private_binding_key).ToLocalChecked();
+-  if (value.IsEmpty() || !value->IsObject()) {
+-    LOG(ERROR) << "Attempted to get the 'ipcNative' object but it was missing";
+-    return {};
+-  }
+-  return value->ToObject(context).ToLocalChecked();
+-}
+-
+-void InvokeIpcCallback(v8::Local<v8::Context> context,
+-                       const std::string& callback_name,
+-                       std::vector<v8::Local<v8::Value>> args) {
+-  TRACE_EVENT0("devtools.timeline", "FunctionCall");
+-  auto* isolate = context->GetIsolate();
+-
+-  auto ipcNative = GetIpcObject(context);
+-  if (ipcNative.IsEmpty())
+-    return;
+-
+-  // Only set up the node::CallbackScope if there's a node environment.
+-  // Sandboxed renderers don't have a node environment.
+-  std::unique_ptr<node::CallbackScope> callback_scope;
+-  if (node::Environment::GetCurrent(context)) {
+-    callback_scope = std::make_unique<node::CallbackScope>(
+-        isolate, ipcNative, node::async_context{0, 0});
+-  }
+-
+-  auto callback_key = gin::ConvertToV8(isolate, callback_name)
+-                          ->ToString(context)
+-                          .ToLocalChecked();
+-  auto callback_value = ipcNative->Get(context, callback_key).ToLocalChecked();
+-  DCHECK(callback_value->IsFunction());  // set by init.ts
+-  auto callback = callback_value.As<v8::Function>();
+-  std::ignore = callback->Call(context, ipcNative, args.size(), args.data());
+-}
+-
+-void EmitIPCEvent(v8::Local<v8::Context> context,
+-                  bool internal,
+-                  const std::string& channel,
+-                  std::vector<v8::Local<v8::Value>> ports,
+-                  v8::Local<v8::Value> args) {
+-  auto* isolate = context->GetIsolate();
+-
+-  v8::HandleScope handle_scope(isolate);
+-  v8::Context::Scope context_scope(context);
+-  v8::MicrotasksScope script_scope(isolate, context->GetMicrotaskQueue(),
+-                                   v8::MicrotasksScope::kRunMicrotasks);
+-
+-  std::vector<v8::Local<v8::Value>> argv = {
+-      gin::ConvertToV8(isolate, internal), gin::ConvertToV8(isolate, channel),
+-      gin::ConvertToV8(isolate, ports), args};
+-
+-  InvokeIpcCallback(context, "onMessage", argv);
+-}
+-
+-}  // namespace
+-
+ ElectronApiServiceImpl::~ElectronApiServiceImpl() = default;
+ 
+ ElectronApiServiceImpl::ElectronApiServiceImpl(
+@@ -166,7 +100,7 @@ void ElectronApiServiceImpl::Message(bool internal,
+ 
+   v8::Local<v8::Value> args = gin::ConvertToV8(isolate, arguments);
+ 
+-  EmitIPCEvent(context, internal, channel, {}, args);
++  ipc_native::EmitIPCEvent(context, internal, channel, {}, args);
+ }
+ 
+ void ElectronApiServiceImpl::ReceivePostMessage(
+@@ -193,7 +127,8 @@ void ElectronApiServiceImpl::ReceivePostMessage(
+ 
+   std::vector<v8::Local<v8::Value>> args = {message_value};
+ 
+-  EmitIPCEvent(context, false, channel, ports, gin::ConvertToV8(isolate, args));
++  ipc_native::EmitIPCEvent(context, false, channel, ports,
++                           gin::ConvertToV8(isolate, args));
+ }
+ 
+ void ElectronApiServiceImpl::TakeHeapSnapshot(
+diff --git a/shell/renderer/electron_ipc_native.cc b/shell/renderer/electron_ipc_native.cc
+new file mode 100644
+index 0000000000..045ffbd457
+--- /dev/null
++++ b/shell/renderer/electron_ipc_native.cc
+@@ -0,0 +1,84 @@
++// Copyright (c) 2019 Slack Technologies, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "electron/shell/renderer/electron_ipc_native.h"
++
++#include "base/trace_event/trace_event.h"
++#include "shell/common/gin_converters/blink_converter.h"
++#include "shell/common/gin_converters/value_converter.h"
++#include "shell/common/node_includes.h"
++#include "shell/common/v8_util.h"
++#include "third_party/blink/public/web/blink.h"
++#include "third_party/blink/public/web/web_message_port_converter.h"
++
++namespace electron::ipc_native {
++
++namespace {
++
++constexpr std::string_view kIpcKey = "ipcNative";
++
++// Gets the private object under kIpcKey
++v8::Local<v8::Object> GetIpcObject(const v8::Local<v8::Context>& context) {
++  auto* isolate = context->GetIsolate();
++  auto binding_key = gin::StringToV8(isolate, kIpcKey);
++  auto private_binding_key = v8::Private::ForApi(isolate, binding_key);
++  auto global_object = context->Global();
++  auto value =
++      global_object->GetPrivate(context, private_binding_key).ToLocalChecked();
++  if (value.IsEmpty() || !value->IsObject()) {
++    LOG(ERROR) << "Attempted to get the 'ipcNative' object but it was missing";
++    return {};
++  }
++  return value->ToObject(context).ToLocalChecked();
++}
++
++void InvokeIpcCallback(const v8::Local<v8::Context>& context,
++                       const std::string& callback_name,
++                       std::vector<v8::Local<v8::Value>> args) {
++  TRACE_EVENT0("devtools.timeline", "FunctionCall");
++  auto* isolate = context->GetIsolate();
++
++  auto ipcNative = GetIpcObject(context);
++  if (ipcNative.IsEmpty())
++    return;
++
++  // Only set up the node::CallbackScope if there's a node environment.
++  // Sandboxed renderers don't have a node environment.
++  std::unique_ptr<node::CallbackScope> callback_scope;
++  if (node::Environment::GetCurrent(context)) {
++    callback_scope = std::make_unique<node::CallbackScope>(
++        isolate, ipcNative, node::async_context{0, 0});
++  }
++
++  auto callback_key = gin::ConvertToV8(isolate, callback_name)
++                          ->ToString(context)
++                          .ToLocalChecked();
++  auto callback_value = ipcNative->Get(context, callback_key).ToLocalChecked();
++  DCHECK(callback_value->IsFunction());  // set by init.ts
++  auto callback = callback_value.As<v8::Function>();
++  std::ignore = callback->Call(context, ipcNative, args.size(), args.data());
++}
++
++}  // namespace
++
++void EmitIPCEvent(const v8::Local<v8::Context>& context,
++                  bool internal,
++                  const std::string& channel,
++                  std::vector<v8::Local<v8::Value>> ports,
++                  v8::Local<v8::Value> args) {
++  auto* isolate = context->GetIsolate();
++
++  v8::HandleScope handle_scope(isolate);
++  v8::Context::Scope context_scope(context);
++  v8::MicrotasksScope script_scope(isolate, context->GetMicrotaskQueue(),
++                                   v8::MicrotasksScope::kRunMicrotasks);
++
++  std::vector<v8::Local<v8::Value>> argv = {
++      gin::ConvertToV8(isolate, internal), gin::ConvertToV8(isolate, channel),
++      gin::ConvertToV8(isolate, ports), args};
++
++  InvokeIpcCallback(context, "onMessage", argv);
++}
++
++}  // namespace electron::ipc_native
+diff --git a/shell/renderer/electron_ipc_native.h b/shell/renderer/electron_ipc_native.h
+new file mode 100644
+index 0000000000..8580735aad
+--- /dev/null
++++ b/shell/renderer/electron_ipc_native.h
+@@ -0,0 +1,22 @@
++// Copyright (c) 2019 Slack Technologies, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_RENDERER_ELECTRON_IPC_NATIVE_H_
++#define ELECTRON_SHELL_RENDERER_ELECTRON_IPC_NATIVE_H_
++
++#include <vector>
++
++#include "v8/include/v8-forward.h"
++
++namespace electron::ipc_native {
++
++void EmitIPCEvent(const v8::Local<v8::Context>& context,
++                  bool internal,
++                  const std::string& channel,
++                  std::vector<v8::Local<v8::Value>> ports,
++                  v8::Local<v8::Value> args);
++
++}  // namespace electron::ipc_native
++
++#endif  // ELECTRON_SHELL_RENDERER_ELECTRON_IPC_NATIVE_H_
+diff --git a/shell/renderer/electron_sandboxed_renderer_client.cc b/shell/renderer/electron_sandboxed_renderer_client.cc
+index 09a564e0b6..398e861417 100644
+--- a/shell/renderer/electron_sandboxed_renderer_client.cc
++++ b/shell/renderer/electron_sandboxed_renderer_client.cc
+@@ -11,18 +11,19 @@
+ #include "base/base_paths.h"
+ #include "base/command_line.h"
+ #include "base/containers/contains.h"
+-#include "base/process/process_handle.h"
+ #include "base/process/process_metrics.h"
+ #include "content/public/renderer/render_frame.h"
+ #include "shell/common/api/electron_bindings.h"
+ #include "shell/common/application_info.h"
+ #include "shell/common/gin_helper/dictionary.h"
+ #include "shell/common/gin_helper/microtasks_scope.h"
+-#include "shell/common/node_bindings.h"
+ #include "shell/common/node_includes.h"
+ #include "shell/common/node_util.h"
+ #include "shell/common/options_switches.h"
+ #include "shell/renderer/electron_render_frame_observer.h"
++#include "shell/renderer/preload_realm_context.h"
++#include "shell/renderer/preload_utils.h"
++#include "shell/renderer/service_worker_data.h"
+ #include "third_party/blink/public/common/web_preferences/web_preferences.h"
+ #include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
+ #include "third_party/blink/public/web/blink.h"
+@@ -33,67 +34,10 @@ namespace electron {
+ 
+ namespace {
+ 
+-constexpr std::string_view kEmitProcessEventKey = "emit-process-event";
+-constexpr std::string_view kBindingCacheKey = "native-binding-cache";
+-
+-v8::Local<v8::Object> GetBindingCache(v8::Isolate* isolate) {
+-  auto context = isolate->GetCurrentContext();
+-  gin_helper::Dictionary global(isolate, context->Global());
+-  v8::Local<v8::Value> cache;
+-
+-  if (!global.GetHidden(kBindingCacheKey, &cache)) {
+-    cache = v8::Object::New(isolate);
+-    global.SetHidden(kBindingCacheKey, cache);
+-  }
+-
+-  return cache->ToObject(context).ToLocalChecked();
+-}
+-
+-// adapted from node.cc
+-v8::Local<v8::Value> GetBinding(v8::Isolate* isolate,
+-                                v8::Local<v8::String> key,
+-                                gin_helper::Arguments* margs) {
+-  v8::Local<v8::Object> exports;
+-  std::string binding_key = gin::V8ToString(isolate, key);
+-  gin_helper::Dictionary cache(isolate, GetBindingCache(isolate));
++// Data which only lives on the service worker's thread
++constinit thread_local ServiceWorkerData* service_worker_data = nullptr;
+ 
+-  if (cache.Get(binding_key, &exports)) {
+-    return exports;
+-  }
+-
+-  auto* mod = node::binding::get_linked_module(binding_key.c_str());
+-
+-  if (!mod) {
+-    char errmsg[1024];
+-    snprintf(errmsg, sizeof(errmsg), "No such binding: %s",
+-             binding_key.c_str());
+-    margs->ThrowError(errmsg);
+-    return exports;
+-  }
+-
+-  exports = v8::Object::New(isolate);
+-  DCHECK_EQ(mod->nm_register_func, nullptr);
+-  DCHECK_NE(mod->nm_context_register_func, nullptr);
+-  mod->nm_context_register_func(exports, v8::Null(isolate),
+-                                isolate->GetCurrentContext(), mod->nm_priv);
+-  cache.Set(binding_key, exports);
+-  return exports;
+-}
+-
+-v8::Local<v8::Value> CreatePreloadScript(v8::Isolate* isolate,
+-                                         v8::Local<v8::String> source) {
+-  auto context = isolate->GetCurrentContext();
+-  auto maybe_script = v8::Script::Compile(context, source);
+-  v8::Local<v8::Script> script;
+-  if (!maybe_script.ToLocal(&script))
+-    return {};
+-  return script->Run(context).ToLocalChecked();
+-}
+-
+-double Uptime() {
+-  return (base::Time::Now() - base::Process::Current().CreationTime())
+-      .InSecondsF();
+-}
++constexpr std::string_view kEmitProcessEventKey = "emit-process-event";
+ 
+ void InvokeEmitProcessEvent(v8::Local<v8::Context> context,
+                             const std::string& event_name) {
+@@ -132,8 +76,8 @@ void ElectronSandboxedRendererClient::InitializeBindings(
+     content::RenderFrame* render_frame) {
+   auto* isolate = context->GetIsolate();
+   gin_helper::Dictionary b(isolate, binding);
+-  b.SetMethod("get", GetBinding);
+-  b.SetMethod("createPreloadScript", CreatePreloadScript);
++  b.SetMethod("get", preload_utils::GetBinding);
++  b.SetMethod("createPreloadScript", preload_utils::CreatePreloadScript);
+ 
+   auto process = gin_helper::Dictionary::CreateEmpty(isolate);
+   b.Set("process", process);
+@@ -141,7 +85,7 @@ void ElectronSandboxedRendererClient::InitializeBindings(
+   ElectronBindings::BindProcess(isolate, &process, metrics_.get());
+   BindProcess(isolate, &process, render_frame);
+ 
+-  process.SetMethod("uptime", Uptime);
++  process.SetMethod("uptime", preload_utils::Uptime);
+   process.Set("argv", base::CommandLine::ForCurrentProcess()->argv());
+   process.SetReadOnly("pid", base::GetCurrentProcId());
+   process.SetReadOnly("sandboxed", true);
+@@ -231,4 +175,44 @@ void ElectronSandboxedRendererClient::EmitProcessEvent(
+   InvokeEmitProcessEvent(context, event_name);
+ }
+ 
++void ElectronSandboxedRendererClient::WillEvaluateServiceWorkerOnWorkerThread(
++    blink::WebServiceWorkerContextProxy* context_proxy,
++    v8::Local<v8::Context> v8_context,
++    int64_t service_worker_version_id,
++    const GURL& service_worker_scope,
++    const GURL& script_url,
++    const blink::ServiceWorkerToken& service_worker_token) {
++  RendererClientBase::WillEvaluateServiceWorkerOnWorkerThread(
++      context_proxy, v8_context, service_worker_version_id,
++      service_worker_scope, script_url, service_worker_token);
++
++  auto* command_line = base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch(switches::kServiceWorkerPreload)) {
++    if (!service_worker_data) {
++      service_worker_data = new ServiceWorkerData(
++          context_proxy, service_worker_version_id, v8_context);
++    }
++
++    preload_realm::OnCreatePreloadableV8Context(v8_context,
++                                                service_worker_data);
++  }
++}
++
++void ElectronSandboxedRendererClient::
++    WillDestroyServiceWorkerContextOnWorkerThread(
++        v8::Local<v8::Context> context,
++        int64_t service_worker_version_id,
++        const GURL& service_worker_scope,
++        const GURL& script_url) {
++  if (service_worker_data) {
++    DCHECK_EQ(service_worker_version_id,
++              service_worker_data->service_worker_version_id());
++    delete service_worker_data;
++    service_worker_data = nullptr;
++  }
++
++  RendererClientBase::WillDestroyServiceWorkerContextOnWorkerThread(
++      context, service_worker_version_id, service_worker_scope, script_url);
++}
++
+ }  // namespace electron
+diff --git a/shell/renderer/electron_sandboxed_renderer_client.h b/shell/renderer/electron_sandboxed_renderer_client.h
+index bc01047803..d162579b61 100644
+--- a/shell/renderer/electron_sandboxed_renderer_client.h
++++ b/shell/renderer/electron_sandboxed_renderer_client.h
+@@ -42,6 +42,18 @@ class ElectronSandboxedRendererClient : public RendererClientBase {
+   void RenderFrameCreated(content::RenderFrame*) override;
+   void RunScriptsAtDocumentStart(content::RenderFrame* render_frame) override;
+   void RunScriptsAtDocumentEnd(content::RenderFrame* render_frame) override;
++  void WillEvaluateServiceWorkerOnWorkerThread(
++      blink::WebServiceWorkerContextProxy* context_proxy,
++      v8::Local<v8::Context> v8_context,
++      int64_t service_worker_version_id,
++      const GURL& service_worker_scope,
++      const GURL& script_url,
++      const blink::ServiceWorkerToken& service_worker_token) override;
++  void WillDestroyServiceWorkerContextOnWorkerThread(
++      v8::Local<v8::Context> context,
++      int64_t service_worker_version_id,
++      const GURL& service_worker_scope,
++      const GURL& script_url) override;
+ 
+  private:
+   void EmitProcessEvent(content::RenderFrame* render_frame,
+diff --git a/shell/renderer/preload_realm_context.cc b/shell/renderer/preload_realm_context.cc
+new file mode 100644
+index 0000000000..5f104fe26b
+--- /dev/null
++++ b/shell/renderer/preload_realm_context.cc
+@@ -0,0 +1,295 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "shell/renderer/preload_realm_context.h"
++
++#include "base/command_line.h"
++#include "base/process/process.h"
++#include "base/process/process_metrics.h"
++#include "shell/common/api/electron_bindings.h"
++#include "shell/common/gin_helper/dictionary.h"
++#include "shell/common/node_includes.h"
++#include "shell/common/node_util.h"
++#include "shell/renderer/preload_utils.h"
++#include "shell/renderer/service_worker_data.h"
++#include "third_party/blink/renderer/bindings/core/v8/script_controller.h"  // nogncheck
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"  // nogncheck
++#include "third_party/blink/renderer/core/inspector/worker_thread_debugger.h"  // nogncheck
++#include "third_party/blink/renderer/core/shadow_realm/shadow_realm_global_scope.h"  // nogncheck
++#include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"  // nogncheck
++#include "third_party/blink/renderer/platform/bindings/script_state.h"  // nogncheck
++#include "third_party/blink/renderer/platform/bindings/v8_dom_wrapper.h"  // nogncheck
++#include "third_party/blink/renderer/platform/bindings/v8_per_context_data.h"  // nogncheck
++#include "third_party/blink/renderer/platform/context_lifecycle_observer.h"  // nogncheck
++#include "v8/include/v8-context.h"
++
++namespace electron::preload_realm {
++
++namespace {
++
++static constexpr int kElectronContextEmbedderDataIndex =
++    static_cast<int>(gin::kPerContextDataStartIndex) +
++    static_cast<int>(gin::kEmbedderElectron);
++
++// This is a helper class to make the initiator ExecutionContext the owner
++// of a ShadowRealmGlobalScope and its ScriptState. When the initiator
++// ExecutionContext is destroyed, the ShadowRealmGlobalScope is destroyed,
++// too.
++class PreloadRealmLifetimeController
++    : public blink::GarbageCollected<PreloadRealmLifetimeController>,
++      public blink::ContextLifecycleObserver {
++ public:
++  explicit PreloadRealmLifetimeController(
++      blink::ExecutionContext* initiator_execution_context,
++      blink::ScriptState* initiator_script_state,
++      blink::ShadowRealmGlobalScope* shadow_realm_global_scope,
++      blink::ScriptState* shadow_realm_script_state,
++      electron::ServiceWorkerData* service_worker_data)
++      : initiator_script_state_(initiator_script_state),
++        is_initiator_worker_or_worklet_(
++            initiator_execution_context->IsWorkerOrWorkletGlobalScope()),
++        shadow_realm_global_scope_(shadow_realm_global_scope),
++        shadow_realm_script_state_(shadow_realm_script_state),
++        service_worker_data_(service_worker_data) {
++    // Align lifetime of this controller to that of the initiator's context.
++    self_ = this;
++
++    SetContextLifecycleNotifier(initiator_execution_context);
++    RegisterDebugger(initiator_execution_context);
++
++    initiator_context()->SetAlignedPointerInEmbedderData(
++        kElectronContextEmbedderDataIndex, static_cast<void*>(this));
++    realm_context()->SetAlignedPointerInEmbedderData(
++        kElectronContextEmbedderDataIndex, static_cast<void*>(this));
++
++    metrics_ = base::ProcessMetrics::CreateCurrentProcessMetrics();
++    RunInitScript();
++  }
++
++  static PreloadRealmLifetimeController* From(v8::Local<v8::Context> context) {
++    if (context->GetNumberOfEmbedderDataFields() <=
++        kElectronContextEmbedderDataIndex) {
++      return nullptr;
++    }
++    auto* controller = static_cast<PreloadRealmLifetimeController*>(
++        context->GetAlignedPointerFromEmbedderData(
++            kElectronContextEmbedderDataIndex));
++    CHECK(controller);
++    return controller;
++  }
++
++  void Trace(blink::Visitor* visitor) const override {
++    visitor->Trace(initiator_script_state_);
++    visitor->Trace(shadow_realm_global_scope_);
++    visitor->Trace(shadow_realm_script_state_);
++    ContextLifecycleObserver::Trace(visitor);
++  }
++
++  v8::MaybeLocal<v8::Context> GetContext() {
++    return shadow_realm_script_state_->ContextIsValid()
++               ? shadow_realm_script_state_->GetContext()
++               : v8::MaybeLocal<v8::Context>();
++  }
++
++  v8::MaybeLocal<v8::Context> GetInitiatorContext() {
++    return initiator_script_state_->ContextIsValid()
++               ? initiator_script_state_->GetContext()
++               : v8::MaybeLocal<v8::Context>();
++  }
++
++  electron::ServiceWorkerData* service_worker_data() {
++    return service_worker_data_;
++  }
++
++ protected:
++  void ContextDestroyed() override {
++    v8::HandleScope handle_scope(realm_isolate());
++    realm_context()->SetAlignedPointerInEmbedderData(
++        kElectronContextEmbedderDataIndex, nullptr);
++
++    // See ShadowRealmGlobalScope::ContextDestroyed
++    shadow_realm_script_state_->DisposePerContextData();
++    if (is_initiator_worker_or_worklet_) {
++      shadow_realm_script_state_->DissociateContext();
++    }
++    shadow_realm_script_state_.Clear();
++    shadow_realm_global_scope_->NotifyContextDestroyed();
++    shadow_realm_global_scope_.Clear();
++
++    self_.Clear();
++  }
++
++ private:
++  v8::Isolate* realm_isolate() {
++    return shadow_realm_script_state_->GetIsolate();
++  }
++  v8::Local<v8::Context> realm_context() {
++    return shadow_realm_script_state_->GetContext();
++  }
++  v8::Local<v8::Context> initiator_context() {
++    return initiator_script_state_->GetContext();
++  }
++
++  void RegisterDebugger(blink::ExecutionContext* initiator_execution_context) {
++    v8::Isolate* isolate = realm_isolate();
++    v8::Local<v8::Context> context = realm_context();
++
++    blink::WorkerThreadDebugger* debugger =
++        blink::WorkerThreadDebugger::From(isolate);
++    ;
++    const auto* worker_context =
++        To<blink::WorkerOrWorkletGlobalScope>(initiator_execution_context);
++
++    // Override path to make preload realm easier to find in debugger.
++    blink::KURL url_for_debugger(worker_context->Url());
++    url_for_debugger.SetPath("electron-preload-realm");
++
++    debugger->ContextCreated(worker_context->GetThread(), url_for_debugger,
++                             context);
++  }
++
++  void RunInitScript() {
++    v8::Isolate* isolate = realm_isolate();
++    v8::Local<v8::Context> context = realm_context();
++
++    v8::Context::Scope context_scope(context);
++    v8::MicrotasksScope microtasks_scope(
++        isolate, context->GetMicrotaskQueue(),
++        v8::MicrotasksScope::kDoNotRunMicrotasks);
++
++    v8::Local<v8::Object> binding = v8::Object::New(isolate);
++
++    gin_helper::Dictionary b(isolate, binding);
++    b.SetMethod("get", preload_utils::GetBinding);
++    b.SetMethod("createPreloadScript", preload_utils::CreatePreloadScript);
++
++    gin_helper::Dictionary process = gin::Dictionary::CreateEmpty(isolate);
++    b.Set("process", process);
++
++    ElectronBindings::BindProcess(isolate, &process, metrics_.get());
++
++    process.SetMethod("uptime", preload_utils::Uptime);
++    process.Set("argv", base::CommandLine::ForCurrentProcess()->argv());
++    process.SetReadOnly("pid", base::GetCurrentProcId());
++    process.SetReadOnly("sandboxed", true);
++    process.SetReadOnly("type", "service-worker");
++    process.SetReadOnly("contextIsolated", true);
++
++    std::vector<v8::Local<v8::String>> preload_realm_bundle_params = {
++        node::FIXED_ONE_BYTE_STRING(isolate, "binding")};
++
++    std::vector<v8::Local<v8::Value>> preload_realm_bundle_args = {binding};
++
++    util::CompileAndCall(context, "electron/js2c/preload_realm_bundle",
++                         &preload_realm_bundle_params,
++                         &preload_realm_bundle_args);
++  }
++
++  const blink::WeakMember<blink::ScriptState> initiator_script_state_;
++  bool is_initiator_worker_or_worklet_;
++  blink::Member<blink::ShadowRealmGlobalScope> shadow_realm_global_scope_;
++  blink::Member<blink::ScriptState> shadow_realm_script_state_;
++
++  std::unique_ptr<base::ProcessMetrics> metrics_;
++  raw_ptr<ServiceWorkerData> service_worker_data_;
++
++  blink::Persistent<PreloadRealmLifetimeController> self_;
++};
++
++}  // namespace
++
++v8::MaybeLocal<v8::Context> GetInitiatorContext(
++    v8::Local<v8::Context> context) {
++  DCHECK(!context.IsEmpty());
++  blink::ExecutionContext* execution_context =
++      blink::ExecutionContext::From(context);
++  if (!execution_context->IsShadowRealmGlobalScope())
++    return v8::MaybeLocal<v8::Context>();
++  auto* controller = PreloadRealmLifetimeController::From(context);
++  if (controller)
++    return controller->GetInitiatorContext();
++  return v8::MaybeLocal<v8::Context>();
++}
++
++v8::MaybeLocal<v8::Context> GetPreloadRealmContext(
++    v8::Local<v8::Context> context) {
++  DCHECK(!context.IsEmpty());
++  blink::ExecutionContext* execution_context =
++      blink::ExecutionContext::From(context);
++  if (!execution_context->IsServiceWorkerGlobalScope())
++    return v8::MaybeLocal<v8::Context>();
++  auto* controller = PreloadRealmLifetimeController::From(context);
++  if (controller)
++    return controller->GetContext();
++  return v8::MaybeLocal<v8::Context>();
++}
++
++electron::ServiceWorkerData* GetServiceWorkerData(
++    v8::Local<v8::Context> context) {
++  auto* controller = PreloadRealmLifetimeController::From(context);
++  return controller ? controller->service_worker_data() : nullptr;
++}
++
++void OnCreatePreloadableV8Context(
++    v8::Local<v8::Context> initiator_context,
++    electron::ServiceWorkerData* service_worker_data) {
++  v8::Isolate* isolate = initiator_context->GetIsolate();
++  blink::ScriptState* initiator_script_state =
++      blink::ScriptState::MaybeFrom(isolate, initiator_context);
++  DCHECK(initiator_script_state);
++  blink::ExecutionContext* initiator_execution_context =
++      blink::ExecutionContext::From(initiator_context);
++  DCHECK(initiator_execution_context);
++  blink::DOMWrapperWorld* world = blink::DOMWrapperWorld::Create(
++      isolate, blink::DOMWrapperWorld::WorldType::kShadowRealm);
++  CHECK(world);  // Not yet run out of the world id.
++
++  // Create a new ShadowRealmGlobalScope.
++  blink::ShadowRealmGlobalScope* shadow_realm_global_scope =
++      blink::MakeGarbageCollected<blink::ShadowRealmGlobalScope>(
++          initiator_execution_context);
++  const blink::WrapperTypeInfo* wrapper_type_info =
++      shadow_realm_global_scope->GetWrapperTypeInfo();
++
++  // Create a new v8::Context.
++  // Initialize V8 extensions before creating the context.
++  v8::ExtensionConfiguration extension_configuration =
++      blink::ScriptController::ExtensionsFor(shadow_realm_global_scope);
++
++  v8::Local<v8::ObjectTemplate> global_template =
++      wrapper_type_info->GetV8ClassTemplate(isolate, *world)
++          .As<v8::FunctionTemplate>()
++          ->InstanceTemplate();
++  v8::Local<v8::Object> global_proxy;  // Will request a new global proxy.
++  v8::Local<v8::Context> context =
++      v8::Context::New(isolate, &extension_configuration, global_template,
++                       global_proxy, v8::DeserializeInternalFieldsCallback(),
++                       initiator_execution_context->GetMicrotaskQueue());
++  context->UseDefaultSecurityToken();
++
++  // Associate the Blink object with the v8::Context.
++  blink::ScriptState* script_state =
++      blink::ScriptState::Create(context, world, shadow_realm_global_scope);
++
++  // Associate the Blink object with the v8::Objects.
++  global_proxy = context->Global();
++  blink::V8DOMWrapper::SetNativeInfo(isolate, global_proxy,
++                                     shadow_realm_global_scope);
++  v8::Local<v8::Object> global_object =
++      global_proxy->GetPrototype().As<v8::Object>();
++  blink::V8DOMWrapper::SetNativeInfo(isolate, global_object,
++                                     shadow_realm_global_scope);
++
++  // Install context-dependent properties.
++  std::ignore =
++      script_state->PerContextData()->ConstructorForType(wrapper_type_info);
++
++  // Make the initiator execution context the owner of the
++  // ShadowRealmGlobalScope and the ScriptState.
++  blink::MakeGarbageCollected<PreloadRealmLifetimeController>(
++      initiator_execution_context, initiator_script_state,
++      shadow_realm_global_scope, script_state, service_worker_data);
++}
++
++}  // namespace electron::preload_realm
+diff --git a/shell/renderer/preload_realm_context.h b/shell/renderer/preload_realm_context.h
+new file mode 100644
+index 0000000000..4a57670cb1
+--- /dev/null
++++ b/shell/renderer/preload_realm_context.h
+@@ -0,0 +1,34 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_RENDERER_PRELOAD_REALM_CONTEXT_H_
++#define ELECTRON_SHELL_RENDERER_PRELOAD_REALM_CONTEXT_H_
++
++#include "v8/include/v8-forward.h"
++
++namespace electron {
++class ServiceWorkerData;
++}
++
++namespace electron::preload_realm {
++
++// Get initiator context given the preload context.
++v8::MaybeLocal<v8::Context> GetInitiatorContext(v8::Local<v8::Context> context);
++
++// Get the preload context given the initiator context.
++v8::MaybeLocal<v8::Context> GetPreloadRealmContext(
++    v8::Local<v8::Context> context);
++
++// Get service worker data given the preload realm context.
++electron::ServiceWorkerData* GetServiceWorkerData(
++    v8::Local<v8::Context> context);
++
++// Create
++void OnCreatePreloadableV8Context(
++    v8::Local<v8::Context> initiator_context,
++    electron::ServiceWorkerData* service_worker_data);
++
++}  // namespace electron::preload_realm
++
++#endif  // ELECTRON_SHELL_RENDERER_PRELOAD_REALM_CONTEXT_H_
+diff --git a/shell/renderer/preload_utils.cc b/shell/renderer/preload_utils.cc
+new file mode 100644
+index 0000000000..a8af3739af
+--- /dev/null
++++ b/shell/renderer/preload_utils.cc
+@@ -0,0 +1,80 @@
++// Copyright (c) 2016 GitHub, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "shell/renderer/preload_utils.h"
++
++#include "base/process/process.h"
++#include "shell/common/gin_helper/arguments.h"
++#include "shell/common/gin_helper/dictionary.h"
++#include "shell/common/node_includes.h"
++#include "v8/include/v8-context.h"
++
++namespace electron::preload_utils {
++
++namespace {
++
++constexpr std::string_view kBindingCacheKey = "native-binding-cache";
++
++v8::Local<v8::Object> GetBindingCache(v8::Isolate* isolate) {
++  auto context = isolate->GetCurrentContext();
++  gin_helper::Dictionary global(isolate, context->Global());
++  v8::Local<v8::Value> cache;
++
++  if (!global.GetHidden(kBindingCacheKey, &cache)) {
++    cache = v8::Object::New(isolate);
++    global.SetHidden(kBindingCacheKey, cache);
++  }
++
++  return cache->ToObject(context).ToLocalChecked();
++}
++
++}  // namespace
++
++// adapted from node.cc
++v8::Local<v8::Value> GetBinding(v8::Isolate* isolate,
++                                v8::Local<v8::String> key,
++                                gin_helper::Arguments* margs) {
++  v8::Local<v8::Object> exports;
++  std::string binding_key = gin::V8ToString(isolate, key);
++  gin_helper::Dictionary cache(isolate, GetBindingCache(isolate));
++
++  if (cache.Get(binding_key, &exports)) {
++    return exports;
++  }
++
++  auto* mod = node::binding::get_linked_module(binding_key.c_str());
++
++  if (!mod) {
++    char errmsg[1024];
++    snprintf(errmsg, sizeof(errmsg), "No such binding: %s",
++             binding_key.c_str());
++    margs->ThrowError(errmsg);
++    return exports;
++  }
++
++  exports = v8::Object::New(isolate);
++  DCHECK_EQ(mod->nm_register_func, nullptr);
++  DCHECK_NE(mod->nm_context_register_func, nullptr);
++  mod->nm_context_register_func(exports, v8::Null(isolate),
++                                isolate->GetCurrentContext(), mod->nm_priv);
++  cache.Set(binding_key, exports);
++  return exports;
++}
++
++v8::Local<v8::Value> CreatePreloadScript(v8::Isolate* isolate,
++                                         v8::Local<v8::String> source) {
++  auto context = isolate->GetCurrentContext();
++  auto maybe_script = v8::Script::Compile(context, source);
++  v8::Local<v8::Script> script;
++  if (!maybe_script.ToLocal(&script))
++    return {};
++  return script->Run(context).ToLocalChecked();
++}
++
++double Uptime() {
++  return (base::Time::Now() - base::Process::Current().CreationTime())
++      .InSecondsF();
++}
++
++}  // namespace electron::preload_utils
+diff --git a/shell/renderer/preload_utils.h b/shell/renderer/preload_utils.h
+new file mode 100644
+index 0000000000..542e76a125
+--- /dev/null
++++ b/shell/renderer/preload_utils.h
+@@ -0,0 +1,27 @@
++// Copyright (c) 2016 GitHub, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_RENDERER_PRELOAD_UTILS_H_
++#define ELECTRON_SHELL_RENDERER_PRELOAD_UTILS_H_
++
++#include "v8/include/v8-forward.h"
++
++namespace gin_helper {
++class Arguments;
++}
++
++namespace electron::preload_utils {
++
++v8::Local<v8::Value> GetBinding(v8::Isolate* isolate,
++                                v8::Local<v8::String> key,
++                                gin_helper::Arguments* margs);
++
++v8::Local<v8::Value> CreatePreloadScript(v8::Isolate* isolate,
++                                         v8::Local<v8::String> source);
++
++double Uptime();
++
++}  // namespace electron::preload_utils
++
++#endif  // ELECTRON_SHELL_RENDERER_PRELOAD_UTILS_H_
+diff --git a/shell/renderer/service_worker_data.cc b/shell/renderer/service_worker_data.cc
+new file mode 100644
+index 0000000000..07ebf48925
+--- /dev/null
++++ b/shell/renderer/service_worker_data.cc
+@@ -0,0 +1,72 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#include "electron/shell/renderer/service_worker_data.h"
++
++#include "shell/common/gin_converters/blink_converter.h"
++#include "shell/common/gin_converters/value_converter.h"
++#include "shell/common/heap_snapshot.h"
++#include "shell/renderer/electron_ipc_native.h"
++#include "shell/renderer/preload_realm_context.h"
++#include "third_party/blink/public/common/associated_interfaces/associated_interface_registry.h"
++
++namespace electron {
++
++ServiceWorkerData::~ServiceWorkerData() = default;
++
++ServiceWorkerData::ServiceWorkerData(blink::WebServiceWorkerContextProxy* proxy,
++                                     int64_t service_worker_version_id,
++                                     const v8::Local<v8::Context>& v8_context)
++    : proxy_(proxy),
++      service_worker_version_id_(service_worker_version_id),
++      isolate_(v8_context->GetIsolate()),
++      v8_context_(v8_context->GetIsolate(), v8_context) {
++  proxy_->GetAssociatedInterfaceRegistry()
++      .AddInterface<mojom::ElectronRenderer>(
++          base::BindRepeating(&ServiceWorkerData::OnElectronRendererRequest,
++                              weak_ptr_factory_.GetWeakPtr()));
++}
++
++void ServiceWorkerData::OnElectronRendererRequest(
++    mojo::PendingAssociatedReceiver<mojom::ElectronRenderer> receiver) {
++  receiver_.reset();
++  receiver_.Bind(std::move(receiver));
++}
++
++void ServiceWorkerData::Message(bool internal,
++                                const std::string& channel,
++                                blink::CloneableMessage arguments) {
++  v8::Isolate* isolate = isolate_.get();
++  v8::HandleScope handle_scope(isolate);
++
++  v8::Local<v8::Context> context = v8_context_.Get(isolate_);
++
++  v8::MaybeLocal<v8::Context> maybe_preload_context =
++      preload_realm::GetPreloadRealmContext(context);
++
++  if (maybe_preload_context.IsEmpty()) {
++    return;
++  }
++
++  v8::Local<v8::Context> preload_context =
++      maybe_preload_context.ToLocalChecked();
++  v8::Context::Scope context_scope(preload_context);
++
++  v8::Local<v8::Value> args = gin::ConvertToV8(isolate, arguments);
++
++  ipc_native::EmitIPCEvent(preload_context, internal, channel, {}, args);
++}
++
++void ServiceWorkerData::ReceivePostMessage(const std::string& channel,
++                                           blink::TransferableMessage message) {
++  NOTIMPLEMENTED();
++}
++
++void ServiceWorkerData::TakeHeapSnapshot(mojo::ScopedHandle file,
++                                         TakeHeapSnapshotCallback callback) {
++  NOTIMPLEMENTED();
++  std::move(callback).Run(false);
++}
++
++}  // namespace electron
+diff --git a/shell/renderer/service_worker_data.h b/shell/renderer/service_worker_data.h
+new file mode 100644
+index 0000000000..9a6387a243
+--- /dev/null
++++ b/shell/renderer/service_worker_data.h
+@@ -0,0 +1,68 @@
++// Copyright (c) 2025 Salesforce, Inc.
++// Use of this source code is governed by the MIT license that can be
++// found in the LICENSE file.
++
++#ifndef ELECTRON_SHELL_RENDERER_SERVICE_WORKER_DATA_H_
++#define ELECTRON_SHELL_RENDERER_SERVICE_WORKER_DATA_H_
++
++#include <string>
++
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "electron/shell/common/api/api.mojom.h"
++#include "mojo/public/cpp/bindings/associated_receiver.h"
++#include "mojo/public/cpp/bindings/associated_remote.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "third_party/blink/public/web/modules/service_worker/web_service_worker_context_proxy.h"
++#include "v8/include/v8-context.h"
++#include "v8/include/v8-forward.h"
++
++namespace electron {
++
++// Per ServiceWorker data in worker thread.
++class ServiceWorkerData : public mojom::ElectronRenderer {
++ public:
++  ServiceWorkerData(blink::WebServiceWorkerContextProxy* proxy,
++                    int64_t service_worker_version_id,
++                    const v8::Local<v8::Context>& v8_context);
++  ~ServiceWorkerData() override;
++
++  // disable copy
++  ServiceWorkerData(const ServiceWorkerData&) = delete;
++  ServiceWorkerData& operator=(const ServiceWorkerData&) = delete;
++
++  int64_t service_worker_version_id() const {
++    return service_worker_version_id_;
++  }
++
++  blink::WebServiceWorkerContextProxy* proxy() const { return proxy_; }
++
++  // mojom::ElectronRenderer
++  void Message(bool internal,
++               const std::string& channel,
++               blink::CloneableMessage arguments) override;
++  void ReceivePostMessage(const std::string& channel,
++                          blink::TransferableMessage message) override;
++  void TakeHeapSnapshot(mojo::ScopedHandle file,
++                        TakeHeapSnapshotCallback callback) override;
++
++ private:
++  void OnElectronRendererRequest(
++      mojo::PendingAssociatedReceiver<mojom::ElectronRenderer> receiver);
++
++  raw_ptr<blink::WebServiceWorkerContextProxy> proxy_;
++  const int64_t service_worker_version_id_;
++
++  // The v8 context the bindings are accessible to.
++  raw_ptr<v8::Isolate> isolate_;
++  v8::Global<v8::Context> v8_context_;
++
++  mojo::AssociatedReceiver<mojom::ElectronRenderer> receiver_{this};
++
++  base::WeakPtrFactory<ServiceWorkerData> weak_ptr_factory_{this};
++};
++
++}  // namespace electron
++
++#endif  // ELECTRON_SHELL_RENDERER_SERVICE_WORKER_DATA_H_
+diff --git a/spec/api-service-worker-main-spec.ts b/spec/api-service-worker-main-spec.ts
+index 0bc404c314..d6f3d65c87 100644
+--- a/spec/api-service-worker-main-spec.ts
++++ b/spec/api-service-worker-main-spec.ts
+@@ -1,4 +1,4 @@
+-import { session, webContents as webContentsModule, WebContents } from 'electron/main';
++import { ipcMain, session, webContents as webContentsModule, WebContents } from 'electron/main';
+ 
+ import { expect } from 'chai';
+ 
+@@ -14,6 +14,7 @@ const DEBUG = !process.env.CI;
+ 
+ describe('ServiceWorkerMain module', () => {
+   const fixtures = path.resolve(__dirname, 'fixtures');
++  const preloadRealmFixtures = path.resolve(fixtures, 'api/preload-realm');
+   const webContentsInternal: typeof ElectronInternal.WebContents = webContentsModule as any;
+ 
+   let ses: Electron.Session;
+@@ -61,8 +62,17 @@ describe('ServiceWorkerMain module', () => {
+   afterEach(async () => {
+     if (!wc.isDestroyed()) wc.destroy();
+     server.close();
++    ses.getPreloadScripts().map(({ id }) => ses.unregisterPreloadScript(id));
+   });
+ 
++  function registerPreload (scriptName: string) {
++    const id = ses.registerPreloadScript({
++      type: 'service-worker',
++      filePath: path.resolve(preloadRealmFixtures, scriptName)
++    });
++    expect(id).to.be.a('string');
++  }
++
+   async function loadWorkerScript (scriptUrl?: string) {
+     const scriptParams = scriptUrl ? `?scriptUrl=${scriptUrl}` : '';
+     return wc.loadURL(`${baseUrl}/index.html${scriptParams}`);
+@@ -93,6 +103,21 @@ describe('ServiceWorkerMain module', () => {
+     return serviceWorker!;
+   }
+ 
++  /** Runs a test using the framework in preload-tests.js */
++  const runTest = async (serviceWorker: Electron.ServiceWorkerMain, rpc: { name: string, args: any[] }) => {
++    const uuid = crypto.randomUUID();
++    serviceWorker.send('test', uuid, rpc.name, ...rpc.args);
++    return new Promise((resolve, reject) => {
++      serviceWorker.ipc.once(`test-result-${uuid}`, (_event, { error, result }) => {
++        if (error) {
++          reject(result);
++        } else {
++          resolve(result);
++        }
++      });
++    });
++  };
++
+   describe('serviceWorkers.getWorkerFromVersionID', () => {
+     it('returns undefined for non-live service worker', () => {
+       expect(serviceWorkers.getWorkerFromVersionID(-1)).to.be.undefined();
+@@ -255,7 +280,7 @@ describe('ServiceWorkerMain module', () => {
+       expect(() => serviceWorker.startTask()).to.throw();
+     });
+ 
+-    it('throws when ending task after destroyed', async function () {
++    it('throws when ending task after destroyed', async () => {
+       loadWorkerScript();
+       const serviceWorker = await waitForServiceWorker();
+       const task = serviceWorker.startTask();
+@@ -288,4 +313,113 @@ describe('ServiceWorkerMain module', () => {
+       expect(serviceWorker.scope).to.equal(`${baseUrl}/`);
+     });
+   });
++
++  describe('ipc', () => {
++    beforeEach(() => {
++      registerPreload('preload-tests.js');
++    });
++
++    describe('on(channel)', () => {
++      it('can receive a message during startup', async () => {
++        registerPreload('preload-send-ping.js');
++        loadWorkerScript();
++        const serviceWorker = await waitForServiceWorker();
++        const pingPromise = once(serviceWorker.ipc, 'ping');
++        await pingPromise;
++      });
++
++      it('receives a message', async () => {
++        loadWorkerScript();
++        const serviceWorker = await waitForServiceWorker('running');
++        const pingPromise = once(serviceWorker.ipc, 'ping');
++        runTest(serviceWorker, { name: 'testSend', args: ['ping'] });
++        await pingPromise;
++      });
++
++      it('does not receive message on ipcMain', async () => {
++        loadWorkerScript();
++        const serviceWorker = await waitForServiceWorker('running');
++        const abortController = new AbortController();
++        try {
++          let pingReceived = false;
++          once(ipcMain, 'ping', { signal: abortController.signal }).then(() => {
++            pingReceived = true;
++          });
++          runTest(serviceWorker, { name: 'testSend', args: ['ping'] });
++          await once(ses, '-ipc-message');
++          await new Promise<void>(queueMicrotask);
++          expect(pingReceived).to.be.false();
++        } finally {
++          abortController.abort();
++        }
++      });
++    });
++
++    describe('handle(channel)', () => {
++      it('receives and responds to message', async () => {
++        loadWorkerScript();
++        const serviceWorker = await waitForServiceWorker('running');
++        serviceWorker.ipc.handle('ping', () => 'pong');
++        const result = await runTest(serviceWorker, { name: 'testInvoke', args: ['ping'] });
++        expect(result).to.equal('pong');
++      });
++
++      it('works after restarting worker', async () => {
++        loadWorkerScript();
++        const serviceWorker = await waitForServiceWorker('running');
++        const { scope } = serviceWorker;
++        serviceWorker.ipc.handle('ping', () => 'pong');
++        await serviceWorkers._stopAllWorkers();
++        await serviceWorkers.startWorkerForScope(scope);
++        const result = await runTest(serviceWorker, { name: 'testInvoke', args: ['ping'] });
++        expect(result).to.equal('pong');
++      });
++    });
++  });
++
++  describe('contextBridge', () => {
++    beforeEach(() => {
++      registerPreload('preload-tests.js');
++    });
++
++    it('can evaluate func from preload realm', async () => {
++      loadWorkerScript();
++      const serviceWorker = await waitForServiceWorker('running');
++      const result = await runTest(serviceWorker, { name: 'testEvaluate', args: ['evalConstructorName'] });
++      expect(result).to.equal('ServiceWorkerGlobalScope');
++    });
++  });
++
++  describe('extensions', () => {
++    const extensionFixtures = path.join(fixtures, 'extensions');
++    const testExtensionFixture = path.join(extensionFixtures, 'mv3-service-worker');
++
++    beforeEach(async () => {
++      ses = session.fromPartition(`persist:${crypto.randomUUID()}-service-worker-main-spec`);
++      serviceWorkers = ses.serviceWorkers;
++    });
++
++    it('can observe extension service workers', async () => {
++      const serviceWorkerPromise = waitForServiceWorker();
++      const extension = await ses.loadExtension(testExtensionFixture);
++      const serviceWorker = await serviceWorkerPromise;
++      expect(serviceWorker.scope).to.equal(extension.url);
++    });
++
++    it('has extension state available when preload runs', async () => {
++      registerPreload('preload-send-extension.js');
++      const serviceWorkerPromise = waitForServiceWorker();
++      const extensionPromise = ses.loadExtension(testExtensionFixture);
++      const serviceWorker = await serviceWorkerPromise;
++      const result = await new Promise<any>((resolve) => {
++        serviceWorker.ipc.handleOnce('preload-extension-result', (_event, result) => {
++          resolve(result);
++        });
++      });
++      const extension = await extensionPromise;
++      expect(result).to.be.an('object');
++      expect(result.id).to.equal(extension.id);
++      expect(result.manifest).to.deep.equal(result.manifest);
++    });
++  });
+ });
+diff --git a/spec/api-service-workers-spec.ts b/spec/api-service-workers-spec.ts
+index 2fef6b0d65..5f29651232 100644
+--- a/spec/api-service-workers-spec.ts
++++ b/spec/api-service-workers-spec.ts
+@@ -27,8 +27,9 @@ describe('session.serviceWorkers', () => {
+     const uuid = v4();
+ 
+     server = http.createServer((req, res) => {
++      const url = new URL(req.url!, `http://${req.headers.host}`);
+       // /{uuid}/{file}
+-      const file = req.url!.split('/')[2]!;
++      const file = url.pathname!.split('/')[2]!;
+ 
+       if (file.endsWith('.js')) {
+         res.setHeader('Content-Type', 'application/javascript');
+@@ -76,7 +77,7 @@ describe('session.serviceWorkers', () => {
+   describe('console-message event', () => {
+     it('should correctly keep the source, message and level', async () => {
+       const messages: Record<string, Electron.MessageDetails> = {};
+-      w.loadURL(`${baseUrl}/logs.html`);
++      w.loadURL(`${baseUrl}/index.html?scriptUrl=sw-logs.js`);
+       for await (const [, details] of on(ses.serviceWorkers, 'console-message')) {
+         messages[details.message] = details;
+         expect(details).to.have.property('source', 'console-api');
+diff --git a/spec/fixtures/api/preload-realm/preload-send-extension.js b/spec/fixtures/api/preload-realm/preload-send-extension.js
+new file mode 100644
+index 0000000000..407e4b9ffb
+--- /dev/null
++++ b/spec/fixtures/api/preload-realm/preload-send-extension.js
+@@ -0,0 +1,16 @@
++const { contextBridge, ipcRenderer } = require('electron');
++
++let result;
++try {
++  result = contextBridge.executeInMainWorld({
++    func: () => ({
++      chromeType: typeof chrome,
++      id: globalThis.chrome?.runtime.id,
++      manifest: globalThis.chrome?.runtime.getManifest()
++    })
++  });
++} catch (error) {
++  console.error(error);
++}
++
++ipcRenderer.invoke('preload-extension-result', result);
+diff --git a/spec/fixtures/api/preload-realm/preload-send-ping.js b/spec/fixtures/api/preload-realm/preload-send-ping.js
+new file mode 100644
+index 0000000000..e2af7034c8
+--- /dev/null
++++ b/spec/fixtures/api/preload-realm/preload-send-ping.js
+@@ -0,0 +1,3 @@
++const { ipcRenderer } = require('electron');
++
++ipcRenderer.send('ping');
+diff --git a/spec/fixtures/api/preload-realm/preload-tests.js b/spec/fixtures/api/preload-realm/preload-tests.js
+new file mode 100644
+index 0000000000..bdea973776
+--- /dev/null
++++ b/spec/fixtures/api/preload-realm/preload-tests.js
+@@ -0,0 +1,34 @@
++const { contextBridge, ipcRenderer } = require('electron');
++
++const evalTests = {
++  evalConstructorName: () => globalThis.constructor.name
++};
++
++const tests = {
++  testSend: (name, ...args) => {
++    ipcRenderer.send(name, ...args);
++  },
++  testInvoke: async (name, ...args) => {
++    const result = await ipcRenderer.invoke(name, ...args);
++    return result;
++  },
++  testEvaluate: (testName, args) => {
++    const func = evalTests[testName];
++    const result = args
++      ? contextBridge.executeInMainWorld({ func, args })
++      : contextBridge.executeInMainWorld({ func });
++    return result;
++  }
++};
++
++ipcRenderer.on('test', async (_event, uuid, name, ...args) => {
++  console.debug(`running test ${name} for ${uuid}`);
++  try {
++    const result = await tests[name]?.(...args);
++    console.debug(`responding test ${name} for ${uuid}`);
++    ipcRenderer.send(`test-result-${uuid}`, { error: false, result });
++  } catch (error) {
++    console.debug(`erroring test ${name} for ${uuid}`);
++    ipcRenderer.send(`test-result-${uuid}`, { error: true, result: error.message });
++  }
++});
+diff --git a/spec/fixtures/api/service-workers/logs.html b/spec/fixtures/api/service-workers/logs.html
+deleted file mode 100644
+index 9627972c4b..0000000000
+--- a/spec/fixtures/api/service-workers/logs.html
++++ /dev/null
+@@ -1,10 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en">
+-<body>
+-    <script>
+-        navigator.serviceWorker.register('sw-logs.js', {
+-            scope: location.pathname.split('/').slice(0, 2).join('/') + '/'
+-        })
+-    </script>
+-</body>
+-</html>
+\ No newline at end of file
+diff --git a/typings/internal-ambient.d.ts b/typings/internal-ambient.d.ts
+index 25196e752f..c0f5c03052 100644
+--- a/typings/internal-ambient.d.ts
++++ b/typings/internal-ambient.d.ts
+@@ -21,7 +21,7 @@ declare namespace NodeJS {
+     isComponentBuild(): boolean;
+   }
+ 
+-  interface IpcRendererBinding {
++  interface IpcRendererImpl {
+     send(internal: boolean, channel: string, args: any[]): void;
+     sendSync(internal: boolean, channel: string, args: any[]): any;
+     sendToHost(channel: string, args: any[]): void;
+@@ -29,6 +29,11 @@ declare namespace NodeJS {
+     postMessage(channel: string, message: any, transferables: MessagePort[]): void;
+   }
+ 
++  interface IpcRendererBinding {
++    createForRenderFrame(): IpcRendererImpl;
++    createForServiceWorker(): IpcRendererImpl;
++  }
++
+   interface V8UtilBinding {
+     getHiddenValue<T>(obj: any, key: string): T;
+     setHiddenValue<T>(obj: any, key: string, value: T): void;
+@@ -240,7 +245,7 @@ declare namespace NodeJS {
+     _linkedBinding(name: 'electron_browser_web_view_manager'): WebViewManagerBinding;
+     _linkedBinding(name: 'electron_browser_web_frame_main'): WebFrameMainBinding;
+     _linkedBinding(name: 'electron_renderer_crash_reporter'): Electron.CrashReporter;
+-    _linkedBinding(name: 'electron_renderer_ipc'): { ipc: IpcRendererBinding };
++    _linkedBinding(name: 'electron_renderer_ipc'): IpcRendererBinding;
+     _linkedBinding(name: 'electron_renderer_web_frame'): WebFrameBinding;
+     log: NodeJS.WriteStream['write'];
+     activateUvLoop(): void;
+diff --git a/typings/internal-electron.d.ts b/typings/internal-electron.d.ts
+index c7cac707b5..7a86a3701f 100644
+--- a/typings/internal-electron.d.ts
++++ b/typings/internal-electron.d.ts
+@@ -72,11 +72,15 @@ declare namespace Electron {
+   }
+ 
+   interface ServiceWorkerMain {
++    _send(internal: boolean, channel: string, args: any): void;
+     _startExternalRequest(hasTimeout: boolean): { id: string, ok: boolean };
+     _finishExternalRequest(uuid: string): void;
+     _countExternalRequests(): number;
+   }
+ 
++  interface Session {
++    _init(): void;
++  }
+ 
+   interface TouchBar {
+     _removeFromWindow: (win: BaseWindow) => void;
+@@ -196,6 +200,14 @@ declare namespace Electron {
+     frameTreeNodeId?: number;
+   }
+ 
++  interface IpcMainServiceWorkerEvent {
++    _replyChannel: ReplyChannel;
++  }
++
++  interface IpcMainServiceWorkerInvokeEvent {
++    _replyChannel: ReplyChannel;
++  }
++
+   // Deprecated / undocumented BrowserWindow methods
+   interface BrowserWindow {
+     getURL(): string;
+@@ -271,11 +283,11 @@ declare namespace ElectronInternal {
+     invoke<T>(channel: string, ...args: any[]): Promise<T>;
+   }
+ 
+-  interface IpcMainInternalEvent extends Omit<Electron.IpcMainEvent, 'reply'> {
+-  }
++  type IpcMainInternalEvent = Omit<Electron.IpcMainEvent, 'reply'> | Omit<Electron.IpcMainServiceWorkerEvent, 'reply'>;
++  type IpcMainInternalInvokeEvent = Electron.IpcMainInvokeEvent | Electron.IpcMainServiceWorkerInvokeEvent;
+ 
+   interface IpcMainInternal extends NodeJS.EventEmitter {
+-    handle(channel: string, listener: (event: Electron.IpcMainInvokeEvent, ...args: any[]) => Promise<any> | any): void;
++    handle(channel: string, listener: (event: IpcMainInternalInvokeEvent, ...args: any[]) => Promise<any> | any): void;
+     on(channel: string, listener: (event: IpcMainInternalEvent, ...args: any[]) => void): this;
+     once(channel: string, listener: (event: IpcMainInternalEvent, ...args: any[]) => void): this;
+   }

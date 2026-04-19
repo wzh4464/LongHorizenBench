@@ -1,0 +1,4 @@
+api/BUILD
+api/versioning/BUILD
+contrib/golang/filters/http/source/go/go.sum
+contrib/golang/filters/http/test/test_data/passthrough/go.sum

@@ -1,0 +1,1583 @@
+diff --git a/pkg/api/pod/util.go b/pkg/api/pod/util.go
+index cf0ff826a83..37e411f6845 100644
+--- a/pkg/api/pod/util.go
++++ b/pkg/api/pod/util.go
+@@ -23,6 +23,8 @@ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	metavalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apimachinery/pkg/util/validation"
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	api "k8s.io/kubernetes/pkg/apis/core"
+ 	"k8s.io/kubernetes/pkg/apis/core/helper"
+@@ -386,6 +388,10 @@ func GetValidationOptionsFromPodSpecAndMeta(podSpec, oldPodSpec *api.PodSpec, po
+ 		AllowNonLocalProjectedTokenPath:                   false,
+ 	}
+ 
++	// If old spec uses relaxed validation or enabled the RelaxedEnvironmentVariableValidation feature gate,
++	// we must allow it
++	opts.AllowRelaxedEnvironmentVariableValidation = useRelaxedEnvironmentVariableValidation(podSpec, oldPodSpec)
++
+ 	if oldPodSpec != nil {
+ 		// if old spec has status.hostIPs downwardAPI set, we must allow it
+ 		opts.AllowHostIPsField = opts.AllowHostIPsField || hasUsedDownwardAPIFieldPathWithPodSpec(oldPodSpec, "status.hostIPs")
+@@ -419,6 +425,84 @@ func GetValidationOptionsFromPodSpecAndMeta(podSpec, oldPodSpec *api.PodSpec, po
+ 	return opts
+ }
+ 
++func useRelaxedEnvironmentVariableValidation(podSpec, oldPodSpec *api.PodSpec) bool {
++	var oldPodEnvVarNames, podEnvVarNames sets.Set[string]
++	if oldPodSpec != nil {
++		oldPodEnvVarNames = gatherPodEnvVarNames(oldPodSpec)
++	}
++
++	if podSpec != nil {
++		podEnvVarNames = gatherPodEnvVarNames(podSpec)
++	}
++
++	for env := range podEnvVarNames {
++		if utilfeature.DefaultFeatureGate.Enabled(features.RelaxedEnvironmentVariableValidation) || relaxedEnvVarUsed(env, oldPodEnvVarNames) {
++			return true
++		}
++	}
++
++	return false
++}
++
++func gatherPodEnvVarNames(podSpec *api.PodSpec) sets.Set[string] {
++	podEnvVarNames := sets.Set[string]{}
++
++	for _, c := range podSpec.Containers {
++		for _, env := range c.Env {
++			podEnvVarNames.Insert(env.Name)
++		}
++
++		for _, env := range c.EnvFrom {
++			podEnvVarNames.Insert(env.Prefix)
++		}
++	}
++
++	for _, c := range podSpec.InitContainers {
++		for _, env := range c.Env {
++			podEnvVarNames.Insert(env.Name)
++		}
++
++		for _, env := range c.EnvFrom {
++			podEnvVarNames.Insert(env.Prefix)
++		}
++	}
++
++	for _, c := range podSpec.EphemeralContainers {
++		for _, env := range c.Env {
++			podEnvVarNames.Insert(env.Name)
++		}
++
++		for _, env := range c.EnvFrom {
++			podEnvVarNames.Insert(env.Prefix)
++		}
++	}
++
++	return podEnvVarNames
++}
++
++func relaxedEnvVarUsed(name string, oldPodEnvVarNames sets.Set[string]) bool {
++	// A length of 0 means this is not an update request,
++	// or the old pod does not exist in the env.
++	// We will let the feature gate decide whether to use relaxed rules.
++	if oldPodEnvVarNames.Len() == 0 {
++		return false
++	}
++
++	if len(validation.IsEnvVarName(name)) == 0 || len(validation.IsRelaxedEnvVarName(name)) != 0 {
++		// It's either a valid name by strict rules or an invalid name under relaxed rules.
++		// Either way, we'll use strict rules to validate.
++		return false
++	}
++
++	// The name in question failed strict rules but passed relaxed rules.
++	if oldPodEnvVarNames.Has(name) {
++		// This relaxed-rules name was already in use.
++		return true
++	}
++
++	return false
++}
++
+ func hasUsedDownwardAPIFieldPathWithPodSpec(podSpec *api.PodSpec, fieldPath string) bool {
+ 	if podSpec == nil {
+ 		return false
+diff --git a/pkg/apis/core/types.go b/pkg/apis/core/types.go
+index ddc78e3207e..9929c8e2e70 100644
+--- a/pkg/apis/core/types.go
++++ b/pkg/apis/core/types.go
+@@ -2068,7 +2068,11 @@ type VolumeDevice struct {
+ 
+ // EnvVar represents an environment variable present in a Container.
+ type EnvVar struct {
+-	// Required: This must be a C_IDENTIFIER.
++	// Required: Name of the environment variable.
++	// When the RelaxedEnvironmentVariableValidation feature gate is disabled, this must consist of alphabetic characters,
++	// digits, '_', '-', or '.', and must not start with a digit.
++	// When the RelaxedEnvironmentVariableValidation feature gate is enabled,
++	// this may contain any printable ASCII characters except '='.
+ 	Name string
+ 	// Optional: no more than one of the following may be specified.
+ 	// Optional: Defaults to ""; variable references $(VAR_NAME) are expanded
+diff --git a/pkg/apis/core/validation/validation.go b/pkg/apis/core/validation/validation.go
+index 9457ef47eb4..43fc05d22da 100644
+--- a/pkg/apis/core/validation/validation.go
++++ b/pkg/apis/core/validation/validation.go
+@@ -2557,8 +2557,14 @@ func ValidateEnv(vars []core.EnvVar, fldPath *field.Path, opts PodValidationOpti
+ 		if len(ev.Name) == 0 {
+ 			allErrs = append(allErrs, field.Required(idxPath.Child("name"), ""))
+ 		} else {
+-			for _, msg := range validation.IsEnvVarName(ev.Name) {
+-				allErrs = append(allErrs, field.Invalid(idxPath.Child("name"), ev.Name, msg))
++			if opts.AllowRelaxedEnvironmentVariableValidation {
++				for _, msg := range validation.IsRelaxedEnvVarName(ev.Name) {
++					allErrs = append(allErrs, field.Invalid(idxPath.Child("name"), ev.Name, msg))
++				}
++			} else {
++				for _, msg := range validation.IsEnvVarName(ev.Name) {
++					allErrs = append(allErrs, field.Invalid(idxPath.Child("name"), ev.Name, msg))
++				}
+ 			}
+ 		}
+ 		allErrs = append(allErrs, validateEnvVarValueFrom(ev, idxPath.Child("valueFrom"), opts)...)
+@@ -2703,13 +2709,19 @@ func validateContainerResourceFieldSelector(fs *core.ResourceFieldSelector, expr
+ 	return allErrs
+ }
+ 
+-func ValidateEnvFrom(vars []core.EnvFromSource, fldPath *field.Path) field.ErrorList {
++func ValidateEnvFrom(vars []core.EnvFromSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 	for i, ev := range vars {
+ 		idxPath := fldPath.Index(i)
+ 		if len(ev.Prefix) > 0 {
+-			for _, msg := range validation.IsEnvVarName(ev.Prefix) {
+-				allErrs = append(allErrs, field.Invalid(idxPath.Child("prefix"), ev.Prefix, msg))
++			if opts.AllowRelaxedEnvironmentVariableValidation {
++				for _, msg := range validation.IsRelaxedEnvVarName(ev.Prefix) {
++					allErrs = append(allErrs, field.Invalid(idxPath.Child("prefix"), ev.Prefix, msg))
++				}
++			} else {
++				for _, msg := range validation.IsEnvVarName(ev.Prefix) {
++					allErrs = append(allErrs, field.Invalid(idxPath.Child("prefix"), ev.Prefix, msg))
++				}
+ 			}
+ 		}
+ 
+@@ -3532,7 +3544,7 @@ func validateContainerCommon(ctr *core.Container, volumes map[string]core.Volume
+ 	volDevices := GetVolumeDeviceMap(ctr.VolumeDevices)
+ 	allErrs = append(allErrs, validateContainerPorts(ctr.Ports, path.Child("ports"))...)
+ 	allErrs = append(allErrs, ValidateEnv(ctr.Env, path.Child("env"), opts)...)
+-	allErrs = append(allErrs, ValidateEnvFrom(ctr.EnvFrom, path.Child("envFrom"))...)
++	allErrs = append(allErrs, ValidateEnvFrom(ctr.EnvFrom, path.Child("envFrom"), opts)...)
+ 	allErrs = append(allErrs, ValidateVolumeMounts(ctr.VolumeMounts, volDevices, volumes, ctr, path.Child("volumeMounts"))...)
+ 	allErrs = append(allErrs, ValidateVolumeDevices(ctr.VolumeDevices, volMounts, volumes, path.Child("volumeDevices"))...)
+ 	allErrs = append(allErrs, validatePullPolicy(ctr.ImagePullPolicy, path.Child("imagePullPolicy"))...)
+@@ -3981,6 +3993,8 @@ type PodValidationOptions struct {
+ 	// The top-level resource being validated is a Pod, not just a PodSpec
+ 	// embedded in some other resource.
+ 	ResourceIsPod bool
++	// Allow relaxed validation of environment variable names
++	AllowRelaxedEnvironmentVariableValidation bool
+ }
+ 
+ // validatePodMetadataAndSpec tests if required fields in the pod.metadata and pod.spec are set,
+diff --git a/pkg/apis/core/validation/validation_test.go b/pkg/apis/core/validation/validation_test.go
+index 3c7cfe631a8..97ff073bea1 100644
+--- a/pkg/apis/core/validation/validation_test.go
++++ b/pkg/apis/core/validation/validation_test.go
+@@ -50,10 +50,11 @@ import (
+ )
+ 
+ const (
+-	dnsLabelErrMsg          = "a lowercase RFC 1123 label must consist of"
+-	dnsSubdomainLabelErrMsg = "a lowercase RFC 1123 subdomain"
+-	envVarNameErrMsg        = "a valid environment variable name must consist of"
+-	defaultGracePeriod      = int64(30)
++	dnsLabelErrMsg                    = "a lowercase RFC 1123 label must consist of"
++	dnsSubdomainLabelErrMsg           = "a lowercase RFC 1123 subdomain"
++	envVarNameErrMsg                  = "a valid environment variable name must consist of"
++	relaxedEnvVarNameFmtErrMsg string = "a valid environment variable names must be printable ASCII characters other than '=' character"
++	defaultGracePeriod                = int64(30)
+ )
+ 
+ var (
+@@ -5981,6 +5982,361 @@ func TestHugePagesEnv(t *testing.T) {
+ 	}
+ }
+ 
++func TestRelaxedValidateEnv(t *testing.T) {
++	successCase := []core.EnvVar{
++		{Name: "!\"#$%&'()", Value: "value"},
++		{Name: "* +,-./0123456789", Value: "value"},
++		{Name: ":;<>?@", Value: "value"},
++		{Name: "ABCDEFG", Value: "value"},
++		{Name: "abcdefghijklmn", Value: "value"},
++		{Name: "[\\]^_`{}|~", Value: "value"},
++		{
++			Name: "!\"#$%&'()",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.annotations['key']",
++				},
++			},
++		}, {
++			Name: "!\"#$%&'()",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.labels['key']",
++				},
++			},
++		}, {
++			Name: "* +,-./0123456789",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.name",
++				},
++			},
++		}, {
++			Name: "* +,-./0123456789",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.namespace",
++				},
++			},
++		}, {
++			Name: "* +,-./0123456789",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.uid",
++				},
++			},
++		}, {
++			Name: ":;<>?@",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "spec.nodeName",
++				},
++			},
++		}, {
++			Name: ":;<>?@",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "spec.serviceAccountName",
++				},
++			},
++		}, {
++			Name: ":;<>?@",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "status.hostIP",
++				},
++			},
++		}, {
++			Name: ":;<>?@",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "status.podIP",
++				},
++			},
++		}, {
++			Name: "abcdefghijklmn",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "status.podIPs",
++				},
++			},
++		},
++		{
++			Name: "abcdefghijklmn",
++			ValueFrom: &core.EnvVarSource{
++				SecretKeyRef: &core.SecretKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "some-secret",
++					},
++					Key: "secret-key",
++				},
++			},
++		}, {
++			Name: "!\"#$%&'()",
++			ValueFrom: &core.EnvVarSource{
++				ConfigMapKeyRef: &core.ConfigMapKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "some-config-map",
++					},
++					Key: "some-key",
++				},
++			},
++		},
++	}
++	if errs := ValidateEnv(successCase, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) != 0 {
++		t.Errorf("expected success, got: %v", errs)
++	}
++
++	errorCases := []struct {
++		name          string
++		envs          []core.EnvVar
++		expectedError string
++	}{{
++		name:          "illegal character",
++		envs:          []core.EnvVar{{Name: "=abc"}},
++		expectedError: `[0].name: Invalid value: "=abc": ` + relaxedEnvVarNameFmtErrMsg,
++	}, {
++		name:          "zero-length name",
++		envs:          []core.EnvVar{{Name: ""}},
++		expectedError: "[0].name: Required value",
++	}, {
++		name: "value and valueFrom specified",
++		envs: []core.EnvVar{{
++			Name:  "abc",
++			Value: "foo",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.name",
++				},
++			},
++		}},
++		expectedError: "[0].valueFrom: Invalid value: \"\": may not be specified when `value` is not empty",
++	}, {
++		name: "valueFrom without a source",
++		envs: []core.EnvVar{{
++			Name:      "abc",
++			ValueFrom: &core.EnvVarSource{},
++		}},
++		expectedError: "[0].valueFrom: Invalid value: \"\": must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef` or `secretKeyRef`",
++	}, {
++		name: "valueFrom.fieldRef and valueFrom.secretKeyRef specified",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.name",
++				},
++				SecretKeyRef: &core.SecretKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "a-secret",
++					},
++					Key: "a-key",
++				},
++			},
++		}},
++		expectedError: "[0].valueFrom: Invalid value: \"\": may not have more than one field specified at a time",
++	}, {
++		name: "valueFrom.fieldRef and valueFrom.configMapKeyRef set",
++		envs: []core.EnvVar{{
++			Name: "some_var_name",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.name",
++				},
++				ConfigMapKeyRef: &core.ConfigMapKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "some-config-map",
++					},
++					Key: "some-key",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom: Invalid value: "": may not have more than one field specified at a time`,
++	}, {
++		name: "valueFrom.fieldRef and valueFrom.secretKeyRef specified",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++					FieldPath:  "metadata.name",
++				},
++				SecretKeyRef: &core.SecretKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "a-secret",
++					},
++					Key: "a-key",
++				},
++				ConfigMapKeyRef: &core.ConfigMapKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "some-config-map",
++					},
++					Key: "some-key",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom: Invalid value: "": may not have more than one field specified at a time`,
++	}, {
++		name: "valueFrom.secretKeyRef.name invalid",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				SecretKeyRef: &core.SecretKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "$%^&*#",
++					},
++					Key: "a-key",
++				},
++			},
++		}},
++	}, {
++		name: "valueFrom.configMapKeyRef.name invalid",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				ConfigMapKeyRef: &core.ConfigMapKeySelector{
++					LocalObjectReference: core.LocalObjectReference{
++						Name: "$%^&*#",
++					},
++					Key: "some-key",
++				},
++			},
++		}},
++	}, {
++		name: "missing FieldPath on ObjectFieldSelector",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.fieldPath: Required value`,
++	}, {
++		name: "missing APIVersion on ObjectFieldSelector",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath: "metadata.name",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.apiVersion: Required value`,
++	}, {
++		name: "invalid fieldPath",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.whoops",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.fieldPath: Invalid value: "metadata.whoops": error converting fieldPath`,
++	}, {
++		name: "metadata.name with subscript",
++		envs: []core.EnvVar{{
++			Name: "labels",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.name['key']",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.fieldPath: Invalid value: "metadata.name['key']": error converting fieldPath: field label does not support subscript`,
++	}, {
++		name: "metadata.labels without subscript",
++		envs: []core.EnvVar{{
++			Name: "labels",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.labels",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.fieldPath: Unsupported value: "metadata.labels": supported values: "metadata.name", "metadata.namespace", "metadata.uid", "spec.nodeName", "spec.serviceAccountName", "status.hostIP", "status.hostIPs", "status.podIP", "status.podIPs"`,
++	}, {
++		name: "metadata.annotations without subscript",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.annotations",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `[0].valueFrom.fieldRef.fieldPath: Unsupported value: "metadata.annotations": supported values: "metadata.name", "metadata.namespace", "metadata.uid", "spec.nodeName", "spec.serviceAccountName", "status.hostIP", "status.hostIPs", "status.podIP", "status.podIPs"`,
++	}, {
++		name: "metadata.annotations with invalid key",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.annotations['invalid~key']",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `field[0].valueFrom.fieldRef: Invalid value: "invalid~key"`,
++	}, {
++		name: "metadata.labels with invalid key",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "metadata.labels['Www.k8s.io/test']",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `field[0].valueFrom.fieldRef: Invalid value: "Www.k8s.io/test"`,
++	}, {
++		name: "unsupported fieldPath",
++		envs: []core.EnvVar{{
++			Name: "abc",
++			ValueFrom: &core.EnvVarSource{
++				FieldRef: &core.ObjectFieldSelector{
++					FieldPath:  "status.phase",
++					APIVersion: "v1",
++				},
++			},
++		}},
++		expectedError: `valueFrom.fieldRef.fieldPath: Unsupported value: "status.phase": supported values: "metadata.name", "metadata.namespace", "metadata.uid", "spec.nodeName", "spec.serviceAccountName", "status.hostIP", "status.hostIPs", "status.podIP", "status.podIPs"`,
++	},
++	}
++	for _, tc := range errorCases {
++		if errs := ValidateEnv(tc.envs, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) == 0 {
++			t.Errorf("expected failure for %s", tc.name)
++		} else {
++			for i := range errs {
++				str := errs[i].Error()
++				if str != "" && !strings.Contains(str, tc.expectedError) {
++					t.Errorf("%s: expected error detail either empty or %q, got %q", tc.name, tc.expectedError, str)
++				}
++			}
++		}
++	}
++}
++
+ func TestValidateEnv(t *testing.T) {
+ 	successCase := []core.EnvVar{
+ 		{Name: "abc", Value: "value"},
+@@ -6094,6 +6450,67 @@ func TestValidateEnv(t *testing.T) {
+ 		t.Errorf("expected success, got: %v", errs)
+ 	}
+ 
++	updateSuccessCase := []core.EnvVar{
++		{Name: "!\"#$%&'()", Value: "value"},
++		{Name: "* +,-./0123456789", Value: "value"},
++		{Name: ":;<>?@", Value: "value"},
++		{Name: "ABCDEFG", Value: "value"},
++		{Name: "abcdefghijklmn", Value: "value"},
++		{Name: "[\\]^_`{}|~", Value: "value"},
++	}
++
++	if errs := ValidateEnv(updateSuccessCase, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) != 0 {
++		t.Errorf("expected success, got: %v", errs)
++	}
++
++	updateErrorCase := []struct {
++		name          string
++		envs          []core.EnvVar
++		expectedError string
++	}{
++		{
++			name: "invalid name a",
++			envs: []core.EnvVar{
++				{Name: "!\"#$%&'()", Value: "value"},
++			},
++			expectedError: `field[0].name: Invalid value: ` + "\"!\\\"#$%&'()\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name b",
++			envs: []core.EnvVar{
++				{Name: "* +,-./0123456789", Value: "value"},
++			},
++			expectedError: `field[0].name: Invalid value: ` + "\"* +,-./0123456789\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name c",
++			envs: []core.EnvVar{
++				{Name: ":;<>?@", Value: "value"},
++			},
++			expectedError: `field[0].name: Invalid value: ` + "\":;<>?@\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name d",
++			envs: []core.EnvVar{
++				{Name: "[\\]^_{}|~", Value: "value"},
++			},
++			expectedError: `field[0].name: Invalid value: ` + "\"[\\\\]^_{}|~\": " + envVarNameErrMsg,
++		},
++	}
++
++	for _, tc := range updateErrorCase {
++		if errs := ValidateEnv(tc.envs, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
++			t.Errorf("expected failure for %s", tc.name)
++		} else {
++			for i := range errs {
++				str := errs[i].Error()
++				if str != "" && !strings.Contains(str, tc.expectedError) {
++					t.Errorf("%s: expected error detail either empty or %q, got %q", tc.name, tc.expectedError, str)
++				}
++			}
++		}
++	}
++
+ 	errorCases := []struct {
+ 		name          string
+ 		envs          []core.EnvVar
+@@ -6102,22 +6519,6 @@ func TestValidateEnv(t *testing.T) {
+ 		name:          "zero-length name",
+ 		envs:          []core.EnvVar{{Name: ""}},
+ 		expectedError: "[0].name: Required value",
+-	}, {
+-		name:          "illegal character",
+-		envs:          []core.EnvVar{{Name: "a!b"}},
+-		expectedError: `[0].name: Invalid value: "a!b": ` + envVarNameErrMsg,
+-	}, {
+-		name:          "dot only",
+-		envs:          []core.EnvVar{{Name: "."}},
+-		expectedError: `[0].name: Invalid value: ".": must not be`,
+-	}, {
+-		name:          "double dots only",
+-		envs:          []core.EnvVar{{Name: ".."}},
+-		expectedError: `[0].name: Invalid value: "..": must not be`,
+-	}, {
+-		name:          "leading double dots",
+-		envs:          []core.EnvVar{{Name: "..abc"}},
+-		expectedError: `[0].name: Invalid value: "..abc": must not start with`,
+ 	}, {
+ 		name: "value and valueFrom specified",
+ 		envs: []core.EnvVar{{
+@@ -6377,10 +6778,112 @@ func TestValidateEnvFrom(t *testing.T) {
+ 		},
+ 	},
+ 	}
+-	if errs := ValidateEnvFrom(successCase, field.NewPath("field")); len(errs) != 0 {
++	if errs := ValidateEnvFrom(successCase, nil, PodValidationOptions{}); len(errs) != 0 {
+ 		t.Errorf("expected success: %v", errs)
+ 	}
+ 
++	updateSuccessCase := []core.EnvFromSource{{
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "* +,-./0123456789",
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: ":;<>?@",
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "abcdefghijklmn",
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "[\\]^_`{}|~",
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}}
++
++	if errs := ValidateEnvFrom(updateSuccessCase, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) != 0 {
++		t.Errorf("expected success, got: %v", errs)
++	}
++
++	updateErrorCase := []struct {
++		name          string
++		envs          []core.EnvFromSource
++		expectedError string
++	}{
++		{
++			name: "invalid name a",
++			envs: []core.EnvFromSource{
++				{
++					Prefix: "!\"#$%&'()",
++					SecretRef: &core.SecretEnvSource{
++						LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++					},
++				},
++			},
++			expectedError: `field[0].prefix: Invalid value: ` + "\"!\\\"#$%&'()\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name b",
++			envs: []core.EnvFromSource{
++				{
++					Prefix: "* +,-./0123456789",
++					SecretRef: &core.SecretEnvSource{
++						LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++					},
++				},
++			},
++			expectedError: `field[0].prefix: Invalid value: ` + "\"* +,-./0123456789\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name c",
++			envs: []core.EnvFromSource{
++				{
++					Prefix: ":;<>?@",
++					SecretRef: &core.SecretEnvSource{
++						LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++					},
++				},
++			},
++			expectedError: `field[0].prefix: Invalid value: ` + "\":;<>?@\": " + envVarNameErrMsg,
++		},
++		{
++			name: "invalid name d",
++			envs: []core.EnvFromSource{
++				{
++					Prefix: "[\\]^_{}|~",
++					SecretRef: &core.SecretEnvSource{
++						LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++					},
++				},
++			},
++			expectedError: `field[0].prefix: Invalid value: ` + "\"[\\\\]^_{}|~\": " + envVarNameErrMsg,
++		},
++	}
++
++	for _, tc := range updateErrorCase {
++		if errs := ValidateEnvFrom(tc.envs, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
++			t.Errorf("expected failure for %s", tc.name)
++		} else {
++			for i := range errs {
++				str := errs[i].Error()
++				if str != "" && !strings.Contains(str, tc.expectedError) {
++					t.Errorf("%s: expected error detail either empty or %q, got %q", tc.name, tc.expectedError, str)
++				}
++			}
++		}
++	}
++
+ 	errorCases := []struct {
+ 		name          string
+ 		envs          []core.EnvFromSource
+@@ -6399,14 +6902,6 @@ func TestValidateEnvFrom(t *testing.T) {
+ 				LocalObjectReference: core.LocalObjectReference{Name: "$"}},
+ 		}},
+ 		expectedError: "field[0].configMapRef.name: Invalid value",
+-	}, {
+-		name: "invalid prefix",
+-		envs: []core.EnvFromSource{{
+-			Prefix: "a!b",
+-			ConfigMapRef: &core.ConfigMapEnvSource{
+-				LocalObjectReference: core.LocalObjectReference{Name: "abc"}},
+-		}},
+-		expectedError: `field[0].prefix: Invalid value: "a!b": ` + envVarNameErrMsg,
+ 	}, {
+ 		name: "zero-length name",
+ 		envs: []core.EnvFromSource{{
+@@ -6421,14 +6916,6 @@ func TestValidateEnvFrom(t *testing.T) {
+ 				LocalObjectReference: core.LocalObjectReference{Name: "&"}},
+ 		}},
+ 		expectedError: "field[0].secretRef.name: Invalid value",
+-	}, {
+-		name: "invalid prefix",
+-		envs: []core.EnvFromSource{{
+-			Prefix: "a!b",
+-			SecretRef: &core.SecretEnvSource{
+-				LocalObjectReference: core.LocalObjectReference{Name: "abc"}},
+-		}},
+-		expectedError: `field[0].prefix: Invalid value: "a!b": ` + envVarNameErrMsg,
+ 	}, {
+ 		name: "no refs",
+ 		envs: []core.EnvFromSource{
+@@ -6461,7 +6948,123 @@ func TestValidateEnvFrom(t *testing.T) {
+ 	},
+ 	}
+ 	for _, tc := range errorCases {
+-		if errs := ValidateEnvFrom(tc.envs, field.NewPath("field")); len(errs) == 0 {
++		if errs := ValidateEnvFrom(tc.envs, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
++			t.Errorf("expected failure for %s", tc.name)
++		} else {
++			for i := range errs {
++				str := errs[i].Error()
++				if str != "" && !strings.Contains(str, tc.expectedError) {
++					t.Errorf("%s: expected error detail either empty or %q, got %q", tc.name, tc.expectedError, str)
++				}
++			}
++		}
++	}
++}
++
++func TestRelaxedValidateEnvFrom(t *testing.T) {
++	successCase := []core.EnvFromSource{{
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "!\"#$%&'()",
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "* +,-./0123456789",
++		ConfigMapRef: &core.ConfigMapEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: ":;<>?@",
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	}, {
++		Prefix: "[\\]^_`{}|~",
++		SecretRef: &core.SecretEnvSource{
++			LocalObjectReference: core.LocalObjectReference{Name: "abc"},
++		},
++	},
++	}
++	if errs := ValidateEnvFrom(successCase, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) != 0 {
++		t.Errorf("expected success: %v", errs)
++	}
++
++	errorCases := []struct {
++		name          string
++		envs          []core.EnvFromSource
++		expectedError string
++	}{
++		{
++			name: "zero-length name",
++			envs: []core.EnvFromSource{{
++				ConfigMapRef: &core.ConfigMapEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: ""}},
++			}},
++			expectedError: "field[0].configMapRef.name: Required value",
++		},
++		{
++			name: "invalid prefix",
++			envs: []core.EnvFromSource{{
++				Prefix: "=abc",
++				ConfigMapRef: &core.ConfigMapEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "abc"}},
++			}},
++			expectedError: `field[0].prefix: Invalid value: "=abc": ` + relaxedEnvVarNameFmtErrMsg,
++		},
++		{
++			name: "zero-length name",
++			envs: []core.EnvFromSource{{
++				SecretRef: &core.SecretEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: ""}},
++			}},
++			expectedError: "field[0].secretRef.name: Required value",
++		}, {
++			name: "invalid name",
++			envs: []core.EnvFromSource{{
++				SecretRef: &core.SecretEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "&"}},
++			}},
++			expectedError: "field[0].secretRef.name: Invalid value",
++		}, {
++			name: "no refs",
++			envs: []core.EnvFromSource{
++				{},
++			},
++			expectedError: "field: Invalid value: \"\": must specify one of: `configMapRef` or `secretRef`",
++		}, {
++			name: "multiple refs",
++			envs: []core.EnvFromSource{{
++				SecretRef: &core.SecretEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "abc"}},
++				ConfigMapRef: &core.ConfigMapEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "abc"}},
++			}},
++			expectedError: "field: Invalid value: \"\": may not have more than one field specified at a time",
++		}, {
++			name: "invalid secret ref name",
++			envs: []core.EnvFromSource{{
++				SecretRef: &core.SecretEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "$%^&*#"}},
++			}},
++			expectedError: "field[0].secretRef.name: Invalid value: \"$%^&*#\": " + dnsSubdomainLabelErrMsg,
++		}, {
++			name: "invalid config ref name",
++			envs: []core.EnvFromSource{{
++				ConfigMapRef: &core.ConfigMapEnvSource{
++					LocalObjectReference: core.LocalObjectReference{Name: "$%^&*#"}},
++			}},
++			expectedError: "field[0].configMapRef.name: Invalid value: \"$%^&*#\": " + dnsSubdomainLabelErrMsg,
++		},
++	}
++	for _, tc := range errorCases {
++		if errs := ValidateEnvFrom(tc.envs, field.NewPath("field"), PodValidationOptions{AllowRelaxedEnvironmentVariableValidation: true}); len(errs) == 0 {
+ 			t.Errorf("expected failure for %s", tc.name)
+ 		} else {
+ 			for i := range errs {
+diff --git a/pkg/features/kube_features.go b/pkg/features/kube_features.go
+index 89d5a386dee..35cbf90074e 100644
+--- a/pkg/features/kube_features.go
++++ b/pkg/features/kube_features.go
+@@ -665,6 +665,13 @@ const (
+ 	// Allow users to recover from volume expansion failure
+ 	RecoverVolumeExpansionFailure featuregate.Feature = "RecoverVolumeExpansionFailure"
+ 
++	// owner: @HirazawaUi
++	// kep: https://kep.k8s.io/4369
++	// alpha: v1.30
++	//
++	// Allow almost all printable ASCII characters in environment variables
++	RelaxedEnvironmentVariableValidation featuregate.Feature = "RelaxedEnvironmentVariableValidation"
++
+ 	// owner: @mikedanese
+ 	// alpha: v1.7
+ 	// beta: v1.12
+@@ -1137,6 +1144,8 @@ var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureS
+ 
+ 	RecoverVolumeExpansionFailure: {Default: false, PreRelease: featuregate.Alpha},
+ 
++	RelaxedEnvironmentVariableValidation: {Default: false, PreRelease: featuregate.Alpha},
++
+ 	RotateKubeletServerCertificate: {Default: true, PreRelease: featuregate.Beta},
+ 
+ 	RuntimeClassInImageCriAPI: {Default: false, PreRelease: featuregate.Alpha},
+diff --git a/pkg/kubelet/kubelet_pods.go b/pkg/kubelet/kubelet_pods.go
+index 38681899a2a..a193730d0bd 100644
+--- a/pkg/kubelet/kubelet_pods.go
++++ b/pkg/kubelet/kubelet_pods.go
+@@ -724,21 +724,13 @@ func (kl *Kubelet) makeEnvironmentVariables(pod *v1.Pod, container *v1.Container
+ 				configMaps[name] = configMap
+ 			}
+ 
+-			invalidKeys := []string{}
+ 			for k, v := range configMap.Data {
+ 				if len(envFrom.Prefix) > 0 {
+ 					k = envFrom.Prefix + k
+ 				}
+-				if errMsgs := utilvalidation.IsEnvVarName(k); len(errMsgs) != 0 {
+-					invalidKeys = append(invalidKeys, k)
+-					continue
+-				}
++
+ 				tmpEnv[k] = v
+ 			}
+-			if len(invalidKeys) > 0 {
+-				sort.Strings(invalidKeys)
+-				kl.recorder.Eventf(pod, v1.EventTypeWarning, "InvalidEnvironmentVariableNames", "Keys [%s] from the EnvFrom configMap %s/%s were skipped since they are considered invalid environment variable names.", strings.Join(invalidKeys, ", "), pod.Namespace, name)
+-			}
+ 		case envFrom.SecretRef != nil:
+ 			s := envFrom.SecretRef
+ 			name := s.Name
+@@ -759,21 +751,13 @@ func (kl *Kubelet) makeEnvironmentVariables(pod *v1.Pod, container *v1.Container
+ 				secrets[name] = secret
+ 			}
+ 
+-			invalidKeys := []string{}
+ 			for k, v := range secret.Data {
+ 				if len(envFrom.Prefix) > 0 {
+ 					k = envFrom.Prefix + k
+ 				}
+-				if errMsgs := utilvalidation.IsEnvVarName(k); len(errMsgs) != 0 {
+-					invalidKeys = append(invalidKeys, k)
+-					continue
+-				}
++
+ 				tmpEnv[k] = string(v)
+ 			}
+-			if len(invalidKeys) > 0 {
+-				sort.Strings(invalidKeys)
+-				kl.recorder.Eventf(pod, v1.EventTypeWarning, "InvalidEnvironmentVariableNames", "Keys [%s] from the EnvFrom secret %s/%s were skipped since they are considered invalid environment variable names.", strings.Join(invalidKeys, ", "), pod.Namespace, name)
+-			}
+ 		}
+ 	}
+ 
+diff --git a/pkg/kubelet/kubelet_pods_test.go b/pkg/kubelet/kubelet_pods_test.go
+index faa33fabdf5..73fe56d23d5 100644
+--- a/pkg/kubelet/kubelet_pods_test.go
++++ b/pkg/kubelet/kubelet_pods_test.go
+@@ -406,19 +406,20 @@ func TestMakeEnvironmentVariables(t *testing.T) {
+ 	trueValue := true
+ 	falseValue := false
+ 	testCases := []struct {
+-		name               string                 // the name of the test case
+-		ns                 string                 // the namespace to generate environment for
+-		enableServiceLinks *bool                  // enabling service links
+-		container          *v1.Container          // the container to use
+-		nilLister          bool                   // whether the lister should be nil
+-		staticPod          bool                   // whether the pod should be a static pod (versus an API pod)
+-		unsyncedServices   bool                   // whether the services should NOT be synced
+-		configMap          *v1.ConfigMap          // an optional ConfigMap to pull from
+-		secret             *v1.Secret             // an optional Secret to pull from
+-		podIPs             []string               // the pod IPs
+-		expectedEnvs       []kubecontainer.EnvVar // a set of expected environment vars
+-		expectedError      bool                   // does the test fail
+-		expectedEvent      string                 // does the test emit an event
++		name                                       string                 // the name of the test case
++		ns                                         string                 // the namespace to generate environment for
++		enableServiceLinks                         *bool                  // enabling service links
++		enableRelaxedEnvironmentVariableValidation bool                   // enable enableRelaxedEnvironmentVariableValidation feature gate
++		container                                  *v1.Container          // the container to use
++		nilLister                                  bool                   // whether the lister should be nil
++		staticPod                                  bool                   // whether the pod should be a static pod (versus an API pod)
++		unsyncedServices                           bool                   // whether the services should NOT be synced
++		configMap                                  *v1.ConfigMap          // an optional ConfigMap to pull from
++		secret                                     *v1.Secret             // an optional Secret to pull from
++		podIPs                                     []string               // the pod IPs
++		expectedEnvs                               []kubecontainer.EnvVar // a set of expected environment vars
++		expectedError                              bool                   // does the test fail
++		expectedEvent                              string                 // does the test emit an event
+ 	}{
+ 		{
+ 			name:               "if services aren't synced, non-static pods should fail",
+@@ -1332,6 +1333,102 @@ func TestMakeEnvironmentVariables(t *testing.T) {
+ 				},
+ 			},
+ 		},
++		{
++			name:               "configmap allow prefix to start with a digital",
++			ns:                 "test1",
++			enableServiceLinks: &falseValue,
++			enableRelaxedEnvironmentVariableValidation: true,
++			container: &v1.Container{
++				EnvFrom: []v1.EnvFromSource{
++					{
++						ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}},
++					},
++					{
++						Prefix:       "1_",
++						ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}},
++					},
++				},
++				Env: []v1.EnvVar{
++					{
++						Name:  "TEST_LITERAL",
++						Value: "test-test-test",
++					},
++					{
++						Name:  "EXPANSION_TEST",
++						Value: "$(REPLACE_ME)",
++					},
++					{
++						Name:  "DUPE_TEST",
++						Value: "ENV_VAR",
++					},
++				},
++			},
++			nilLister: false,
++			configMap: &v1.ConfigMap{
++				ObjectMeta: metav1.ObjectMeta{
++					Namespace: "test1",
++					Name:      "test-configmap",
++				},
++				Data: map[string]string{
++					"REPLACE_ME": "FROM_CONFIG_MAP",
++					"DUPE_TEST":  "CONFIG_MAP",
++				},
++			},
++			expectedEnvs: []kubecontainer.EnvVar{
++				{
++					Name:  "TEST_LITERAL",
++					Value: "test-test-test",
++				},
++				{
++					Name:  "REPLACE_ME",
++					Value: "FROM_CONFIG_MAP",
++				},
++				{
++					Name:  "EXPANSION_TEST",
++					Value: "FROM_CONFIG_MAP",
++				},
++				{
++					Name:  "DUPE_TEST",
++					Value: "ENV_VAR",
++				},
++				{
++					Name:  "1_REPLACE_ME",
++					Value: "FROM_CONFIG_MAP",
++				},
++				{
++					Name:  "1_DUPE_TEST",
++					Value: "CONFIG_MAP",
++				},
++				{
++					Name:  "KUBERNETES_SERVICE_HOST",
++					Value: "1.2.3.1",
++				},
++				{
++					Name:  "KUBERNETES_SERVICE_PORT",
++					Value: "8081",
++				},
++				{
++					Name:  "KUBERNETES_PORT",
++					Value: "tcp://1.2.3.1:8081",
++				},
++				{
++					Name:  "KUBERNETES_PORT_8081_TCP",
++					Value: "tcp://1.2.3.1:8081",
++				},
++				{
++					Name:  "KUBERNETES_PORT_8081_TCP_PROTO",
++					Value: "tcp",
++				},
++				{
++					Name:  "KUBERNETES_PORT_8081_TCP_PORT",
++					Value: "8081",
++				},
++				{
++					Name:  "KUBERNETES_PORT_8081_TCP_ADDR",
++					Value: "1.2.3.1",
++				},
++			},
++		},
+ 		{
+ 			name:               "configmap, service env vars",
+ 			ns:                 "test1",
+@@ -1487,62 +1584,6 @@ func TestMakeEnvironmentVariables(t *testing.T) {
+ 				{Name: "KUBERNETES_PORT_8081_TCP_ADDR", Value: "1.2.3.1"},
+ 			},
+ 		},
+-		{
+-			name:               "configmap_invalid_keys",
+-			ns:                 "test",
+-			enableServiceLinks: &falseValue,
+-			container: &v1.Container{
+-				EnvFrom: []v1.EnvFromSource{
+-					{ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-config-map"}}},
+-				},
+-			},
+-			configMap: &v1.ConfigMap{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Namespace: "test1",
+-					Name:      "test-configmap",
+-				},
+-				Data: map[string]string{
+-					"1234": "abc",
+-					"1z":   "abc",
+-					"key":  "value",
+-				},
+-			},
+-			expectedEnvs: []kubecontainer.EnvVar{
+-				{
+-					Name:  "key",
+-					Value: "value",
+-				},
+-				{
+-					Name:  "KUBERNETES_SERVICE_HOST",
+-					Value: "1.2.3.1",
+-				},
+-				{
+-					Name:  "KUBERNETES_SERVICE_PORT",
+-					Value: "8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT",
+-					Value: "tcp://1.2.3.1:8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP",
+-					Value: "tcp://1.2.3.1:8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_PROTO",
+-					Value: "tcp",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_PORT",
+-					Value: "8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_ADDR",
+-					Value: "1.2.3.1",
+-				},
+-			},
+-			expectedEvent: "Warning InvalidEnvironmentVariableNames Keys [1234, 1z] from the EnvFrom configMap test/test-config-map were skipped since they are considered invalid environment variable names.",
+-		},
+ 		{
+ 			name:               "configmap_invalid_keys_valid",
+ 			ns:                 "test",
+@@ -1849,62 +1890,6 @@ func TestMakeEnvironmentVariables(t *testing.T) {
+ 				{Name: "KUBERNETES_PORT_8081_TCP_ADDR", Value: "1.2.3.1"},
+ 			},
+ 		},
+-		{
+-			name:               "secret_invalid_keys",
+-			ns:                 "test",
+-			enableServiceLinks: &falseValue,
+-			container: &v1.Container{
+-				EnvFrom: []v1.EnvFromSource{
+-					{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "test-secret"}}},
+-				},
+-			},
+-			secret: &v1.Secret{
+-				ObjectMeta: metav1.ObjectMeta{
+-					Namespace: "test1",
+-					Name:      "test-secret",
+-				},
+-				Data: map[string][]byte{
+-					"1234":  []byte("abc"),
+-					"1z":    []byte("abc"),
+-					"key.1": []byte("value"),
+-				},
+-			},
+-			expectedEnvs: []kubecontainer.EnvVar{
+-				{
+-					Name:  "key.1",
+-					Value: "value",
+-				},
+-				{
+-					Name:  "KUBERNETES_SERVICE_HOST",
+-					Value: "1.2.3.1",
+-				},
+-				{
+-					Name:  "KUBERNETES_SERVICE_PORT",
+-					Value: "8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT",
+-					Value: "tcp://1.2.3.1:8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP",
+-					Value: "tcp://1.2.3.1:8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_PROTO",
+-					Value: "tcp",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_PORT",
+-					Value: "8081",
+-				},
+-				{
+-					Name:  "KUBERNETES_PORT_8081_TCP_ADDR",
+-					Value: "1.2.3.1",
+-				},
+-			},
+-			expectedEvent: "Warning InvalidEnvironmentVariableNames Keys [1234, 1z] from the EnvFrom secret test/test-secret were skipped since they are considered invalid environment variable names.",
+-		},
+ 		{
+ 			name:               "secret_invalid_keys_valid",
+ 			ns:                 "test",
+@@ -1988,6 +1973,8 @@ func TestMakeEnvironmentVariables(t *testing.T) {
+ 
+ 	for _, tc := range testCases {
+ 		t.Run(tc.name, func(t *testing.T) {
++			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RelaxedEnvironmentVariableValidation, tc.enableRelaxedEnvironmentVariableValidation)()
++
+ 			fakeRecorder := record.NewFakeRecorder(1)
+ 			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+ 			testKubelet.kubelet.recorder = fakeRecorder
+diff --git a/staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go b/staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go
+index 94c3fdb77f4..d1da92060a5 100644
+--- a/staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go
++++ b/staging/src/k8s.io/apimachinery/pkg/util/validation/validation.go
+@@ -21,6 +21,7 @@ import (
+ 	"math"
+ 	"regexp"
+ 	"strings"
++	"unicode"
+ 
+ 	"k8s.io/apimachinery/pkg/util/validation/field"
+ 	netutils "k8s.io/utils/net"
+@@ -418,6 +419,9 @@ func IsHTTPHeaderName(value string) []string {
+ const envVarNameFmt = "[-._a-zA-Z][-._a-zA-Z0-9]*"
+ const envVarNameFmtErrMsg string = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit"
+ 
++// TODO(hirazawaui): Rename this when the RelaxedEnvironmentVariableValidation gate is removed.
++const relaxedEnvVarNameFmtErrMsg string = "a valid environment variable names must be printable ASCII characters other than '=' character"
++
+ var envVarNameRegexp = regexp.MustCompile("^" + envVarNameFmt + "$")
+ 
+ // IsEnvVarName tests if a string is a valid environment variable name.
+@@ -431,6 +435,24 @@ func IsEnvVarName(value string) []string {
+ 	return errs
+ }
+ 
++// IsRelaxedEnvVarName tests if a string is a valid environment variable name.
++func IsRelaxedEnvVarName(value string) []string {
++	var errs []string
++
++	if len(value) == 0 {
++		errs = append(errs, "environment variable name"+EmptyError())
++	}
++
++	for _, r := range value {
++		if r > unicode.MaxASCII || !unicode.IsPrint(r) || r == '=' {
++			errs = append(errs, relaxedEnvVarNameFmtErrMsg)
++			break
++		}
++	}
++
++	return errs
++}
++
+ const configMapKeyFmt = `[-._a-zA-Z0-9]+`
+ const configMapKeyErrMsg string = "a valid config key must consist of alphanumeric characters, '-', '_' or '.'"
+ 
+diff --git a/staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go b/staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go
+index da62083db72..8bcf36b6b3d 100644
+--- a/staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go
++++ b/staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go
+@@ -904,3 +904,30 @@ func TestIsDomainPrefixedPath(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestIsRelaxedEnvVarName(t *testing.T) {
++	goodValues := []string{
++		"-", ":", "_", "+a", ">a", "<a",
++		"a.", "a..", "*a", "%a", "?a",
++		"a:a", "a_a", "aAz", "~a", "|a",
++		"a0a", "a9", "/a", "a ", "#a",
++		"0a", "0 a", "'a", "(a", "@a",
++	}
++	for _, val := range goodValues {
++		if msgs := IsRelaxedEnvVarName(val); len(msgs) != 0 {
++			t.Errorf("expected true for '%s': %v", val, msgs)
++		}
++	}
++
++	badValues := []string{
++		"", "=", "a=", "1=a", "a=b", "#%=&&",
++		string(rune(1)) + "abc", string(rune(130)) + "abc",
++		"Ç ç", "Ä ä", "Ñ ñ", "Ø ø",
++	}
++
++	for _, val := range badValues {
++		if msgs := IsRelaxedEnvVarName(val); len(msgs) == 0 {
++			t.Errorf("expected false for '%s'", val)
++		}
++	}
++}
+diff --git a/test/e2e/common/node/configmap.go b/test/e2e/common/node/configmap.go
+index e7fd1713d3a..309441c1634 100644
+--- a/test/e2e/common/node/configmap.go
++++ b/test/e2e/common/node/configmap.go
+@@ -25,6 +25,7 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/kubernetes/test/e2e/feature"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+ 	imageutils "k8s.io/kubernetes/test/utils/image"
+@@ -242,6 +243,54 @@ var _ = SIGDescribe("ConfigMap", func() {
+ 		framework.ExpectNoError(err, "failed to list ConfigMap by LabelSelector")
+ 		gomega.Expect(configMapList.Items).To(gomega.BeEmpty(), "ConfigMap is still present after being deleted by collection")
+ 	})
++
++	/*
++		Release: v1.30
++		Testname: ConfigMap, from environment field
++		Description: Create a Pod with an environment variable value set using a value from ConfigMap.
++		Allows users to use envFrom to set prefix starting with a digit as environment variable names.
++	*/
++	framework.It("should be consumable as environment variable names when configmap keys start with a digit",
++		feature.RelaxedEnvironmentVariableValidation, func(ctx context.Context) {
++			name := "configmap-test-" + string(uuid.NewUUID())
++			configMap := newConfigMap(f, name)
++			ginkgo.By(fmt.Sprintf("Creating configMap %v/%v", f.Namespace.Name, configMap.Name))
++			var err error
++			if configMap, err = f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, configMap, metav1.CreateOptions{}); err != nil {
++				framework.Failf("unable to create test configMap %s: %v", configMap.Name, err)
++			}
++
++			pod := &v1.Pod{
++				ObjectMeta: metav1.ObjectMeta{
++					Name: "pod-configmaps-" + string(uuid.NewUUID()),
++				},
++				Spec: v1.PodSpec{
++					Containers: []v1.Container{
++						{
++							Name:    "env-test",
++							Image:   imageutils.GetE2EImage(imageutils.BusyBox),
++							Command: []string{"sh", "-c", "env"},
++							EnvFrom: []v1.EnvFromSource{
++								{
++									ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: name}},
++								},
++								{
++									// prefix start with a digit can be consumed as environment variables.
++									Prefix:       "1-",
++									ConfigMapRef: &v1.ConfigMapEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: name}},
++								},
++							},
++						},
++					},
++					RestartPolicy: v1.RestartPolicyNever,
++				},
++			}
++
++			e2epodoutput.TestContainerOutput(ctx, f, "consume configMaps", pod, 0, []string{
++				"data-1=value-1", "data-2=value-2", "data-3=value-3",
++				"1-data-1=value-1", "1-data-2=value-2", "1-data-3=value-3",
++			})
++		})
+ })
+ 
+ func newConfigMap(f *framework.Framework, name string) *v1.ConfigMap {
+diff --git a/test/e2e/common/node/expansion.go b/test/e2e/common/node/expansion.go
+index a24f48b7857..48f6f410e5e 100644
+--- a/test/e2e/common/node/expansion.go
++++ b/test/e2e/common/node/expansion.go
+@@ -22,6 +22,7 @@ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/kubernetes/test/e2e/feature"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+ 	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+@@ -371,6 +372,42 @@ var _ = SIGDescribe("Variable Expansion", func() {
+ 		err = e2epod.DeletePodWithWait(ctx, f.ClientSet, pod)
+ 		framework.ExpectNoError(err, "failed to delete pod")
+ 	})
++
++	/*
++		Release: v1.30
++		Testname: Environment variables, expansion
++		Description: Create a Pod with environment variables. Environment variables defined using previously defined environment variables MUST expand to proper values.
++		Allow almost all printable ASCII characters in environment variables.
++	*/
++	framework.It("allow almost all printable ASCII characters as environment variable names", feature.RelaxedEnvironmentVariableValidation, func(ctx context.Context) {
++		envVars := []v1.EnvVar{
++			{
++				Name:  "!\"#$%&'()",
++				Value: "value-1",
++			},
++			{
++				Name:  "* +,-./0123456789",
++				Value: "value-2",
++			},
++			{
++				Name:  ":;<>?@",
++				Value: "value-3",
++			},
++			{
++				Name:  "[\\]^_`{}|~",
++				Value: "value-4",
++			},
++		}
++		pod := newPod([]string{"sh", "-c", "env"}, envVars, nil, nil)
++
++		e2epodoutput.TestContainerOutput(ctx, f, "env composition", pod, 0, []string{
++			"!\"#$%&'()=value-1",
++			"* +,-./0123456789=value-2",
++			":;<>?@=value-3",
++			"[\\]^_`{}|~=value-4",
++		})
++	})
++
+ })
+ 
+ func testPodFailSubpath(ctx context.Context, f *framework.Framework, pod *v1.Pod) {
+diff --git a/test/e2e/common/node/secrets.go b/test/e2e/common/node/secrets.go
+index 885c2c4b9a9..29be3811933 100644
+--- a/test/e2e/common/node/secrets.go
++++ b/test/e2e/common/node/secrets.go
+@@ -22,17 +22,18 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 
+-	"github.com/onsi/ginkgo/v2"
+-	"github.com/onsi/gomega"
+-
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/kubernetes/test/e2e/feature"
+ 	"k8s.io/kubernetes/test/e2e/framework"
+ 	e2epodoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+ 	imageutils "k8s.io/kubernetes/test/utils/image"
+ 	admissionapi "k8s.io/pod-security-admission/api"
++
++	"github.com/onsi/ginkgo/v2"
++	"github.com/onsi/gomega"
+ )
+ 
+ var _ = SIGDescribe("Secrets", func() {
+@@ -238,6 +239,54 @@ var _ = SIGDescribe("Secrets", func() {
+ 			framework.Failf("secret %s/%s was not deleted successfully", f.Namespace.Name, secretTestName)
+ 		}
+ 	})
++
++	/*
++		Release: v1.30
++		Testname: Secrets, pod environment from source
++		Description: Create a secret. Create a Pod with Container that declares a environment variable using 'EnvFrom' which references the secret created to extract a key value from the secret.
++		Allows users to use envFrom to set prefix starting with a digit as environment variable names.
++	*/
++	framework.It("should be consumable as environment variable names when secret keys start with a digit", feature.RelaxedEnvironmentVariableValidation, func(ctx context.Context) {
++		name := "secret-test-" + string(uuid.NewUUID())
++		secret := secretForTest(f.Namespace.Name, name)
++
++		ginkgo.By(fmt.Sprintf("creating secret %v/%v", f.Namespace.Name, secret.Name))
++		var err error
++		if secret, err = f.ClientSet.CoreV1().Secrets(f.Namespace.Name).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
++			framework.Failf("unable to create test secret %s: %v", secret.Name, err)
++		}
++
++		pod := &v1.Pod{
++			ObjectMeta: metav1.ObjectMeta{
++				Name: "pod-configmaps-" + string(uuid.NewUUID()),
++			},
++			Spec: v1.PodSpec{
++				Containers: []v1.Container{
++					{
++						Name:    "env-test",
++						Image:   imageutils.GetE2EImage(imageutils.BusyBox),
++						Command: []string{"sh", "-c", "env"},
++						EnvFrom: []v1.EnvFromSource{
++							{
++								SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: name}},
++							},
++							{
++								// prefix start with a digit can be consumed as environment variables.
++								Prefix:    "1-",
++								SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: name}},
++							},
++						},
++					},
++				},
++				RestartPolicy: v1.RestartPolicyNever,
++			},
++		}
++
++		e2epodoutput.TestContainerOutput(ctx, f, "consume secrets", pod, 0, []string{
++			"data-1=value-1", "data-2=value-2", "data-3=value-3",
++			"1-data-1=value-1", "1-data-2=value-2", "1-data-3=value-3",
++		})
++	})
+ })
+ 
+ func secretForTest(namespace, name string) *v1.Secret {
+diff --git a/test/e2e/feature/feature.go b/test/e2e/feature/feature.go
+index 8fb32c519b0..db0200bbe42 100644
+--- a/test/e2e/feature/feature.go
++++ b/test/e2e/feature/feature.go
+@@ -253,6 +253,10 @@ var (
+ 	// TODO: document the feature (owning SIG, when to use this feature for a test)
+ 	RecoverVolumeExpansionFailure = framework.WithFeature(framework.ValidFeatures.Add("RecoverVolumeExpansionFailure"))
+ 
++	// RelaxedEnvironmentVariableValidation used when we verify whether the pod can consume all printable ASCII characters as environment variable names,
++	// and whether the pod can consume configmap/secret that key starts with a number.
++	RelaxedEnvironmentVariableValidation = framework.WithFeature(framework.ValidFeatures.Add("RelaxedEnvironmentVariableValidation"))
++
+ 	// TODO: document the feature (owning SIG, when to use this feature for a test)
+ 	Recreate = framework.WithFeature(framework.ValidFeatures.Add("Recreate"))
+ 

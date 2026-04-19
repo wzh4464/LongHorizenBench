@@ -1,0 +1,2079 @@
+diff --git a/doc/testing.html b/doc/testing.html
+index c1c0f15fed9..6288a552bf0 100644
+--- a/doc/testing.html
++++ b/doc/testing.html
+@@ -72,6 +72,9 @@ id="toc-notes-for-specific-tests">Notes for Specific Tests</a>
+ <li><a href="#non-us-locale" id="toc-non-us-locale">Non-US
+ locale</a></li>
+ <li><a href="#pkcs11-tests" id="toc-pkcs11-tests">PKCS11 Tests</a></li>
++<li><a href="#testing-ahead-of-time-optimizations"
++id="toc-testing-ahead-of-time-optimizations">Testing Ahead-of-time
++Optimizations</a></li>
+ <li><a href="#testing-with-alternative-security-providers"
+ id="toc-testing-with-alternative-security-providers">Testing with
+ alternative security providers</a></li>
+@@ -596,6 +599,37 @@ element of the appropriate <code>@Artifact</code> class. (See
+     JTREG=&quot;JAVA_OPTIONS=-Djdk.test.lib.artifacts.nsslib-linux_aarch64=/path/to/NSS-libs&quot;</code></pre>
+ <p>For more notes about the PKCS11 tests, please refer to
+ test/jdk/sun/security/pkcs11/README.</p>
++<h3 id="testing-ahead-of-time-optimizations">Testing Ahead-of-time
++Optimizations</h3>
++<p>One way to improve test coverage of ahead-of-time (AOT) optimizations
++in the JDK is to run existing jtreg test cases in a special "AOT_JDK"
++mode. Example:</p>
++<pre><code>$ make test JTREG=&quot;AOT_JDK=onestep&quot; \
++    TEST=open/test/hotspot/jtreg/runtime/invokedynamic</code></pre>
++<p>In this testing mode, we first perform an AOT training run (see
++https://openjdk.org/jeps/483) of a special test program (<a
++href="../test/setup_aot/TestSetupAOT.java">test/setup_aot/TestSetupAOT.java</a>)
++that accesses about 5,0000 classes in the JDK core libraries.
++Optimization artifacts for these classes (such as pre-linked lambda
++expressions, execution profiles, and pre-generated native code) are
++stored into an AOT cache file, which will be used by all the JVMs
++launched by the selected jtreg test cases.</p>
++<p>When the jtreg tests call into the core libraries classes that are in
++the AOT cache, we will be able to test the AOT optimizations that were
++used on those classes.</p>
++<p>Please note that not all existing jtreg test cases can be executed
++with the AOT_JDK mode. See <a
++href="../test/hotspot/jtreg/ProblemList-AotJdk.txt">test/hotspot/jtreg/ProblemList-AotJdk.txt</a>
++and <a
++href="../test/jdk/ProblemList-AotJdk.txt">test/jdk/ProblemList-AotJdk.txt</a>.</p>
++<p>Also, test cases that were written specifically to test AOT, such as
++the tests under <a
++href="../test/hotspot/jtreg/runtime/cds/">test/hotspot/jtreg/runtime/cds</a>,
++cannot be executed with the AOT_JDK mode.</p>
++<p>Valid values for <code>AOT_JDK</code> are <code>onestep</code> and
++<code>twostep</code>. These control how the AOT cache is generated. See
++https://openjdk.org/jeps/514 for details. All other values are
++ignored.</p>
+ <h3 id="testing-with-alternative-security-providers">Testing with
+ alternative security providers</h3>
+ <p>Some security tests use a hardcoded provider for
+diff --git a/doc/testing.md b/doc/testing.md
+index f6a25457b5e..bb56c05c295 100644
+--- a/doc/testing.md
++++ b/doc/testing.md
+@@ -611,6 +611,43 @@ $ make test TEST="jtreg:sun/security/pkcs11/Secmod/AddTrustedCert.java" \
+ For more notes about the PKCS11 tests, please refer to
+ test/jdk/sun/security/pkcs11/README.
+ 
++### Testing Ahead-of-time Optimizations
++-------------------------------------------------------------------------------
++One way to improve test coverage of ahead-of-time (AOT) optimizations in
++the JDK is to run existing jtreg test cases in a special "AOT_JDK" mode.
++Example:
++
++```
++$ make test JTREG="AOT_JDK=onestep" \
++    TEST=open/test/hotspot/jtreg/runtime/invokedynamic
++```
++
++In this testing mode, we first perform an AOT training run
++(see https://openjdk.org/jeps/483) of a special test program
++([test/setup_aot/TestSetupAOT.java](../test/setup_aot/TestSetupAOT.java))
++that accesses about 5,0000 classes in the JDK core libraries.
++Optimization artifacts for these classes (such as pre-linked
++lambda expressions, execution profiles, and pre-generated native code)
++are stored into an AOT cache file, which will be used by all the JVMs
++launched by the selected jtreg test cases.
++
++When the jtreg tests call into the core libraries classes that are in
++the AOT cache, we will be able to test the AOT optimizations that were
++used on those classes.
++
++Please note that not all existing jtreg test cases can be executed with
++the AOT_JDK mode. See
++[test/hotspot/jtreg/ProblemList-AotJdk.txt](../test/hotspot/jtreg/ProblemList-AotJdk.txt)
++and [test/jdk/ProblemList-AotJdk.txt](../test/jdk/ProblemList-AotJdk.txt).
++
++Also, test cases that were written specifically to test AOT, such as the tests
++under [test/hotspot/jtreg/runtime/cds](../test/hotspot/jtreg/runtime/cds/),
++cannot be executed with the AOT_JDK mode.
++
++Valid values for `AOT_JDK` are `onestep` and `twostep`. These control how
++the AOT cache is generated. See https://openjdk.org/jeps/514 for details.
++All other values are ignored.
++
+ ### Testing with alternative security providers
+ 
+ Some security tests use a hardcoded provider for `KeyFactory`, `Cipher`,
+diff --git a/make/RunTests.gmk b/make/RunTests.gmk
+index 51c75cc4872..60ae1bd4763 100644
+--- a/make/RunTests.gmk
++++ b/make/RunTests.gmk
+@@ -725,6 +725,7 @@ endef
+ # Parameter 1 is the name of the rule.
+ #
+ # Remaining parameters are named arguments.
++#   TRAINING    The AOT training mode: onestep or twostep
+ #   VM_OPTIONS  List of JVM arguments to use when creating AOT cache
+ #
+ #  After calling this, the following variables are defined
+@@ -753,23 +754,39 @@ define SetupAOTBody
+   $$($1_AOT_JDK_CACHE): $$(JDK_IMAGE_DIR)/release
+ 	$$(call MakeDir, $$($1_AOT_JDK_OUTPUT_DIR))
+ 
+-	$$(call LogWarn, AOT: Create cache configuration) \
+-	$$(call ExecuteWithLog, $$($1_AOT_JDK_OUTPUT_DIR), ( \
+-            cd $$($1_AOT_JDK_OUTPUT_DIR); \
+-	    $(JAR) --extract --file $(TEST_IMAGE_DIR)/setup_aot/TestSetupAOT.jar; \
+-	    $$(FIXPATH) $(JDK_UNDER_TEST)/bin/java $$($1_VM_OPTIONS) \
+-	        -Xlog:class+load,aot,aot+class=debug:file=$$($1_AOT_JDK_CONF).log -Xlog:cds*=error -Xlog:aot*=error \
+-	        -XX:AOTMode=record -XX:AOTConfiguration=$$($1_AOT_JDK_CONF) \
+-	        TestSetupAOT $$($1_AOT_JDK_OUTPUT_DIR) > $$($1_AOT_JDK_LOG) \
+-	))
+-
+-	$$(call LogWarn, AOT: Generate AOT cache $$($1_AOT_JDK_CACHE) with flags: $$($1_VM_OPTIONS))
+-	$$(call ExecuteWithLog, $$($1_AOT_JDK_OUTPUT_DIR), ( \
+-	    $$(FIXPATH) $(JDK_UNDER_TEST)/bin/java \
+-	        $$($1_VM_OPTIONS) -Xlog:aot,aot+class=debug:file=$$($1_AOT_JDK_CACHE).log -Xlog:cds*=error -Xlog:aot*=error \
+-	        -XX:ExtraSharedClassListFile=$(JDK_UNDER_TEST)/lib/classlist \
+-	        -XX:AOTMode=create -XX:AOTConfiguration=$$($1_AOT_JDK_CONF) -XX:AOTCache=$$($1_AOT_JDK_CACHE) \
+-	))
++        ifeq ($$($1_TRAINING), onestep)
++
++	  $$(call LogWarn, AOT: Create AOT cache $$($1_AOT_JDK_CACHE) in one step with flags: $$($1_VM_OPTIONS)) \
++	  $$(call ExecuteWithLog, $$($1_AOT_JDK_OUTPUT_DIR), ( \
++	      cd $$($1_AOT_JDK_OUTPUT_DIR); \
++	      $(JAR) --extract --file $(TEST_IMAGE_DIR)/setup_aot/TestSetupAOT.jar; \
++	      $$(FIXPATH) $(JDK_UNDER_TEST)/bin/java $$($1_VM_OPTIONS) \
++	          -Xlog:class+load,aot,aot+class=debug:file=$$($1_AOT_JDK_CACHE).log  -Xlog:cds*=error -Xlog:aot*=error  \
++	          -XX:AOTMode=record -XX:AOTCacheOutput=$$($1_AOT_JDK_CACHE) \
++	          TestSetupAOT $$($1_AOT_JDK_OUTPUT_DIR) > $$($1_AOT_JDK_LOG) \
++	  ))
++
++        else
++
++	  $$(call LogWarn, AOT: Create cache configuration) \
++	  $$(call ExecuteWithLog, $$($1_AOT_JDK_OUTPUT_DIR), ( \
++	      cd $$($1_AOT_JDK_OUTPUT_DIR); \
++	      $(JAR) --extract --file $(TEST_IMAGE_DIR)/setup_aot/TestSetupAOT.jar; \
++	      $$(FIXPATH) $(JDK_UNDER_TEST)/bin/java $$($1_VM_OPTIONS) \
++	          -Xlog:class+load,aot,aot+class=debug:file=$$($1_AOT_JDK_CONF).log  -Xlog:cds*=error -Xlog:aot*=error \
++	          -XX:AOTMode=record -XX:AOTConfiguration=$$($1_AOT_JDK_CONF) \
++	          TestSetupAOT $$($1_AOT_JDK_OUTPUT_DIR) > $$($1_AOT_JDK_LOG) \
++	  ))
++
++	  $$(call LogWarn, AOT: Generate AOT cache $$($1_AOT_JDK_CACHE) with flags: $$($1_VM_OPTIONS))
++	  $$(call ExecuteWithLog, $$($1_AOT_JDK_OUTPUT_DIR), ( \
++	      $$(FIXPATH) $(JDK_UNDER_TEST)/bin/java \
++	          $$($1_VM_OPTIONS) -Xlog:aot,aot+class=debug:file=$$($1_AOT_JDK_CACHE).log -Xlog:cds*=error -Xlog:aot*=error \
++	          -XX:ExtraSharedClassListFile=$(JDK_UNDER_TEST)/lib/classlist \
++	          -XX:AOTMode=create -XX:AOTConfiguration=$$($1_AOT_JDK_CONF) -XX:AOTCache=$$($1_AOT_JDK_CACHE) \
++	  ))
++
++        endif
+ 
+   $1_AOT_TARGETS += $$($1_AOT_JDK_CACHE)
+ 
+@@ -835,7 +852,7 @@ define SetupRunJtregTestBody
+   JTREG_RETRY_COUNT ?= 0
+   JTREG_REPEAT_COUNT ?= 0
+   JTREG_REPORT ?= files
+-  JTREG_AOT_JDK ?= false
++  JTREG_AOT_JDK ?= none
+ 
+   ifneq ($$(JTREG_RETRY_COUNT), 0)
+     ifneq ($$(JTREG_REPEAT_COUNT), 0)
+@@ -975,12 +992,12 @@ define SetupRunJtregTestBody
+     endif
+   endif
+ 
+-  ifeq ($$(JTREG_AOT_JDK), true)
++  ifneq ($$(filter $$(JTREG_AOT_JDK), onestep twostep), )
+     $$(call LogWarn, Add AOT target for $1)
+-    $$(eval $$(call SetupAOT, $1, VM_OPTIONS := $$(JTREG_ALL_OPTIONS) ))
+-
++    $$(eval $$(call SetupAOT, $1, \
++        TRAINING := $$(JTREG_AOT_JDK), \
++        VM_OPTIONS := $$(JTREG_ALL_OPTIONS) ))
+     $$(call LogWarn, AOT_JDK_CACHE=$$($1_AOT_JDK_CACHE))
+-
+     $1_JTREG_BASIC_OPTIONS += -vmoption:-XX:AOTCache="$$($1_AOT_JDK_CACHE)"
+   endif
+ 
+diff --git a/src/hotspot/share/cds/cdsConfig.cpp b/src/hotspot/share/cds/cdsConfig.cpp
+index c8888fe6bb3..b3c13b63aff 100644
+--- a/src/hotspot/share/cds/cdsConfig.cpp
++++ b/src/hotspot/share/cds/cdsConfig.cpp
+@@ -49,6 +49,8 @@ bool CDSConfig::_is_using_optimized_module_handling = true;
+ bool CDSConfig::_is_dumping_full_module_graph = true;
+ bool CDSConfig::_is_using_full_module_graph = true;
+ bool CDSConfig::_has_aot_linked_classes = false;
++bool CDSConfig::_is_single_command_training = false;
++bool CDSConfig::_has_temp_aot_config_file = false;
+ bool CDSConfig::_old_cds_flags_used = false;
+ bool CDSConfig::_new_aot_flags_used = false;
+ bool CDSConfig::_disable_heap_dumping = false;
+@@ -398,12 +400,14 @@ void CDSConfig::check_aot_flags() {
+     _old_cds_flags_used = true;
+   }
+ 
+-  // "New" AOT flags must not be mixed with "classic" flags such as -Xshare:dump
++  // "New" AOT flags must not be mixed with "classic" CDS flags such as -Xshare:dump
+   CHECK_NEW_FLAG(AOTCache);
++  CHECK_NEW_FLAG(AOTCacheOutput);
+   CHECK_NEW_FLAG(AOTConfiguration);
+   CHECK_NEW_FLAG(AOTMode);
+ 
+   CHECK_SINGLE_PATH(AOTCache);
++  CHECK_SINGLE_PATH(AOTCacheOutput);
+   CHECK_SINGLE_PATH(AOTConfiguration);
+ 
+   if (FLAG_IS_DEFAULT(AOTCache) && AOTAdapterCaching) {
+@@ -413,29 +417,41 @@ void CDSConfig::check_aot_flags() {
+     log_debug(aot,codecache,init)("AOTCache is not specified - AOTStubCaching is ignored");
+   }
+ 
+-  if (FLAG_IS_DEFAULT(AOTCache) && FLAG_IS_DEFAULT(AOTConfiguration) && FLAG_IS_DEFAULT(AOTMode)) {
+-    // AOTCache/AOTConfiguration/AOTMode not used -> using the "classic CDS" workflow.
++  bool has_cache = !FLAG_IS_DEFAULT(AOTCache);
++  bool has_cache_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
++  bool has_config = !FLAG_IS_DEFAULT(AOTConfiguration);
++  bool has_mode = !FLAG_IS_DEFAULT(AOTMode);
++
++  if (!has_cache && !has_cache_output && !has_config && !has_mode) {
++    // AOT flags are not used. Use classic CDS workflow
+     return;
+-  } else {
+-    _new_aot_flags_used = true;
+   }
+ 
++  if (has_cache && has_cache_output) {
++    vm_exit_during_initialization("Only one of AOTCache or AOTCacheOutput can be specified");
++  }
++
++  if (!has_cache && (!has_mode || strcmp(AOTMode, "auto") == 0)) {
++    if (has_cache_output) {
++      // If AOTCacheOutput has been set, effective mode is "record".
++      // Default value for AOTConfiguration, if necessary, will be assigned in check_aotmode_record().
++      log_info(aot)("Selected AOTMode=record because AOTCacheOutput is specified");
++      FLAG_SET_ERGO(AOTMode, "record");
++    }
++  }
++
++  // At least one AOT flag has been used
++  _new_aot_flags_used = true;
++
+   if (FLAG_IS_DEFAULT(AOTMode) || strcmp(AOTMode, "auto") == 0 || strcmp(AOTMode, "on") == 0) {
+     check_aotmode_auto_or_on();
+   } else if (strcmp(AOTMode, "off") == 0) {
+     check_aotmode_off();
++  } else if (strcmp(AOTMode, "record") == 0) {
++    check_aotmode_record();
+   } else {
+-    // AOTMode is record or create
+-    if (FLAG_IS_DEFAULT(AOTConfiguration)) {
+-      vm_exit_during_initialization(err_msg("-XX:AOTMode=%s cannot be used without setting AOTConfiguration", AOTMode));
+-    }
+-
+-    if (strcmp(AOTMode, "record") == 0) {
+-      check_aotmode_record();
+-    } else {
+-      assert(strcmp(AOTMode, "create") == 0, "checked by AOTModeConstraintFunc");
+-      check_aotmode_create();
+-    }
++    assert(strcmp(AOTMode, "create") == 0, "checked by AOTModeConstraintFunc");
++    check_aotmode_create();
+   }
+ 
+   // This is an old flag used by CDS regression testing only. It doesn't apply
+@@ -450,7 +466,8 @@ void CDSConfig::check_aotmode_off() {
+ 
+ void CDSConfig::check_aotmode_auto_or_on() {
+   if (!FLAG_IS_DEFAULT(AOTConfiguration)) {
+-    vm_exit_during_initialization("AOTConfiguration can only be used with -XX:AOTMode=record or -XX:AOTMode=create");
++    vm_exit_during_initialization(err_msg("AOTConfiguration can only be used with when AOTMode is record or create (selected AOTMode = %s)",
++                                          FLAG_IS_DEFAULT(AOTMode) ? "auto" : AOTMode));
+   }
+ 
+   UseSharedSpaces = true;
+@@ -462,11 +479,63 @@ void CDSConfig::check_aotmode_auto_or_on() {
+   }
+ }
+ 
++// %p substitution in AOTCache, AOTCacheOutput and AOTCacheConfiguration
++static void substitute_aot_filename(JVMFlagsEnum flag_enum) {
++  JVMFlag* flag = JVMFlag::flag_from_enum(flag_enum);
++  const char* filename = flag->read<const char*>();
++  assert(filename != nullptr, "must not have default value");
++
++  // For simplicity, we don't allow %p/%t to be specified twice, because make_log_name()
++  // substitutes only the first occurrence. Otherwise, if we run with
++  //     java -XX:AOTCacheOutput=%p%p.aot
++ // it will end up with both the pid of the training process and the assembly process.
++  const char* first_p = strstr(filename, "%p");
++  if (first_p != nullptr && strstr(first_p + 2, "%p") != nullptr) {
++    vm_exit_during_initialization(err_msg("%s cannot contain more than one %%p", flag->name()));
++  }
++  const char* first_t = strstr(filename, "%t");
++  if (first_t != nullptr && strstr(first_t + 2, "%t") != nullptr) {
++    vm_exit_during_initialization(err_msg("%s cannot contain more than one %%t", flag->name()));
++  }
++
++  // Note: with single-command training, %p will be the pid of the training process, not the
++  // assembly process.
++  const char* new_filename = make_log_name(filename, nullptr);
++  if (strcmp(filename, new_filename) != 0) {
++    JVMFlag::Error err = JVMFlagAccess::set_ccstr(flag, &new_filename, JVMFlagOrigin::ERGONOMIC);
++    assert(err == JVMFlag::SUCCESS, "must never fail");
++  }
++  FREE_C_HEAP_ARRAY(char, new_filename);
++}
++
+ void CDSConfig::check_aotmode_record() {
++  bool has_config = !FLAG_IS_DEFAULT(AOTConfiguration);
++  bool has_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
++
++  if (!has_output && !has_config) {
++      vm_exit_during_initialization("At least one of AOTCacheOutput and AOTConfiguration must be specified when using -XX:AOTMode=record");
++  }
++
++  if (has_output) {
++    _is_single_command_training = true;
++    substitute_aot_filename(FLAG_MEMBER_ENUM(AOTCacheOutput));
++    if (!has_config) {
++      // Too early; can't use resource allocation yet.
++      size_t len = strlen(AOTCacheOutput) + 10;
++      char* temp = AllocateHeap(len, mtArguments);
++      jio_snprintf(temp, len, "%s.config", AOTCacheOutput);
++      FLAG_SET_ERGO(AOTConfiguration, temp);
++      FreeHeap(temp);
++      _has_temp_aot_config_file = true;
++    }
++  }
++
+   if (!FLAG_IS_DEFAULT(AOTCache)) {
+     vm_exit_during_initialization("AOTCache must not be specified when using -XX:AOTMode=record");
+   }
+ 
++  substitute_aot_filename(FLAG_MEMBER_ENUM(AOTConfiguration));
++
+   UseSharedSpaces = false;
+   RequireSharedSpaces = false;
+   _is_dumping_static_archive = true;
+@@ -478,10 +547,27 @@ void CDSConfig::check_aotmode_record() {
+ }
+ 
+ void CDSConfig::check_aotmode_create() {
+-  if (FLAG_IS_DEFAULT(AOTCache)) {
+-    vm_exit_during_initialization("AOTCache must be specified when using -XX:AOTMode=create");
++  if (FLAG_IS_DEFAULT(AOTConfiguration)) {
++    vm_exit_during_initialization("AOTConfiguration must be specified when using -XX:AOTMode=create");
+   }
+ 
++  bool has_cache = !FLAG_IS_DEFAULT(AOTCache);
++  bool has_cache_output = !FLAG_IS_DEFAULT(AOTCacheOutput);
++
++  assert(!(has_cache && has_cache_output), "already checked");
++
++  if (!has_cache && !has_cache_output) {
++    vm_exit_during_initialization("AOTCache or AOTCacheOutput must be specified when using -XX:AOTMode=create");
++  }
++
++  if (!has_cache) {
++    precond(has_cache_output);
++    FLAG_SET_ERGO(AOTCache, AOTCacheOutput);
++  }
++  // No need to check for (!has_cache_output), as we don't look at AOTCacheOutput after here.
++
++  substitute_aot_filename(FLAG_MEMBER_ENUM(AOTCache));
++
+   _is_dumping_final_static_archive = true;
+   UseSharedSpaces = true;
+   RequireSharedSpaces = true;
+diff --git a/src/hotspot/share/cds/cdsConfig.hpp b/src/hotspot/share/cds/cdsConfig.hpp
+index 22378f5c42c..1fd229ff34f 100644
+--- a/src/hotspot/share/cds/cdsConfig.hpp
++++ b/src/hotspot/share/cds/cdsConfig.hpp
+@@ -41,6 +41,8 @@ class CDSConfig : public AllStatic {
+   static bool _is_dumping_full_module_graph;
+   static bool _is_using_full_module_graph;
+   static bool _has_aot_linked_classes;
++  static bool _is_single_command_training;
++  static bool _has_temp_aot_config_file;
+ 
+   const static char* _default_archive_path;
+   const static char* _input_static_archive_path;
+@@ -142,6 +144,9 @@ public:
+   // Misc CDS features
+   static bool allow_only_single_java_thread()                NOT_CDS_RETURN_(false);
+ 
++  static bool is_single_command_training()                   { return CDS_ONLY(_is_single_command_training) NOT_CDS(false); }
++  static bool has_temp_aot_config_file()                     { return CDS_ONLY(_has_temp_aot_config_file) NOT_CDS(false); }
++
+   // This is *Legacy* optimization for lambdas before JEP 483. May be removed in the future.
+   static bool is_dumping_lambdas_in_legacy_mode()            NOT_CDS_RETURN_(false);
+ 
+diff --git a/src/hotspot/share/cds/cds_globals.hpp b/src/hotspot/share/cds/cds_globals.hpp
+index aab5647e0b8..e51dd26ff06 100644
+--- a/src/hotspot/share/cds/cds_globals.hpp
++++ b/src/hotspot/share/cds/cds_globals.hpp
+@@ -119,6 +119,9 @@
+           "Cache for improving start up and warm up")                       \
+           constraint(AOTCacheConstraintFunc, AtParse)                       \
+                                                                             \
++  product(ccstr, AOTCacheOutput, nullptr,                                   \
++          "Specifies the file name for writing the AOT cache")              \
++                                                                            \
+   product(bool, AOTInvokeDynamicLinking, false, DIAGNOSTIC,                 \
+           "AOT-link JVM_CONSTANT_InvokeDynamic entries in cached "          \
+           "ConstantPools")                                                  \
+diff --git a/src/hotspot/share/cds/filemap.cpp b/src/hotspot/share/cds/filemap.cpp
+index 7094e1c326d..375a3ccffbc 100644
+--- a/src/hotspot/share/cds/filemap.cpp
++++ b/src/hotspot/share/cds/filemap.cpp
+@@ -744,7 +744,7 @@ void FileMapInfo::open_as_output() {
+     if (CDSConfig::is_dumping_preimage_static_archive()) {
+       log_info(aot)("Writing binary AOTConfiguration file: %s",  _full_path);
+     } else {
+-      log_info(aot)("Writing binary AOTConfiguration file: %s",  _full_path);
++      log_info(aot)("Writing AOTCache file: %s",  _full_path);
+     }
+   } else {
+     aot_log_info(aot)("Dumping shared data to file: %s", _full_path);
+diff --git a/src/hotspot/share/cds/metaspaceShared.cpp b/src/hotspot/share/cds/metaspaceShared.cpp
+index 4e82395dba9..233e64c5e3e 100644
+--- a/src/hotspot/share/cds/metaspaceShared.cpp
++++ b/src/hotspot/share/cds/metaspaceShared.cpp
+@@ -72,6 +72,7 @@
+ #include "memory/memoryReserver.hpp"
+ #include "memory/metaspace.hpp"
+ #include "memory/metaspaceClosure.hpp"
++#include "memory/oopFactory.hpp"
+ #include "memory/resourceArea.hpp"
+ #include "memory/universe.hpp"
+ #include "nmt/memTracker.hpp"
+@@ -828,7 +829,6 @@ void MetaspaceShared::preload_and_dump(TRAPS) {
+       // We are in the JVM that runs the training run. Continue execution,
+       // so that it can finish all clean-up and return the correct exit
+       // code to the OS.
+-      tty->print_cr("AOTConfiguration recorded: %s", AOTConfiguration);
+     } else {
+       // The JLI launcher only recognizes the "old" -Xshare:dump flag.
+       // When the new -XX:AOTMode=create flag is used, we can't return
+@@ -1027,7 +1027,16 @@ void MetaspaceShared::preload_and_dump_impl(StaticArchiveBuilder& builder, TRAPS
+     CDSConfig::disable_dumping_aot_code();
+   }
+ 
+-  if (!write_static_archive(&builder, op.map_info(), op.heap_info())) {
++  bool status = write_static_archive(&builder, op.map_info(), op.heap_info());
++  if (status && CDSConfig::is_dumping_preimage_static_archive()) {
++    tty->print_cr("%s AOTConfiguration recorded: %s",
++                  CDSConfig::has_temp_aot_config_file() ? "Temporary" : "", AOTConfiguration);
++    if (CDSConfig::is_single_command_training()) {
++      fork_and_dump_final_static_archive(CHECK);
++    }
++  }
++
++  if (!status) {
+     THROW_MSG(vmSymbols::java_io_IOException(), "Encountered error while dumping");
+   }
+ }
+@@ -1050,6 +1059,132 @@ bool MetaspaceShared::write_static_archive(ArchiveBuilder* builder, FileMapInfo*
+   return true;
+ }
+ 
++static void print_java_launcher(outputStream* st) {
++  st->print("%s%sbin%sjava", Arguments::get_java_home(), os::file_separator(), os::file_separator());
++}
++
++static void append_args(GrowableArray<Handle>* args, const char* arg, TRAPS) {
++  Handle string = java_lang_String::create_from_str(arg, CHECK);
++  args->append(string);
++}
++
++// Pass all options in Arguments::jvm_args_array() to a child JVM process
++// using the JAVA_TOOL_OPTIONS environment variable.
++static int exec_jvm_with_java_tool_options(const char* java_launcher_path, TRAPS) {
++  ResourceMark rm(THREAD);
++  HandleMark hm(THREAD);
++  GrowableArray<Handle> args;
++
++  const char* cp = Arguments::get_appclasspath();
++  if (cp != nullptr && strlen(cp) > 0 && strcmp(cp, ".") != 0) {
++    // We cannot use "-cp", because "-cp" is only interpreted by the java launcher,
++    // and is not interpreter by arguments.cpp when it loads args from JAVA_TOOL_OPTIONS
++    stringStream ss;
++    ss.print("-Djava.class.path=");
++    ss.print_raw(cp);
++    append_args(&args, ss.freeze(), CHECK_0);
++    // CDS$ProcessLauncher::execWithJavaToolOptions() must unset CLASSPATH, which has
++    // a higher priority than -Djava.class.path=
++  }
++
++  // Pass all arguments. These include those from JAVA_TOOL_OPTIONS and _JAVA_OPTIONS.
++  for (int i = 0; i < Arguments::num_jvm_args(); i++) {
++    const char* arg = Arguments::jvm_args_array()[i];
++    if (strstr(arg, "-XX:AOTCacheOutput=") == arg || // arg starts with ...
++        strstr(arg, "-XX:AOTConfiguration=") == arg ||
++        strstr(arg, "-XX:AOTMode=") == arg) {
++      // Filter these out. They wiill be set below.
++    } else {
++      append_args(&args, arg, CHECK_0);
++    }
++  }
++
++  // Note: because we are running in AOTMode=record, JDK_AOT_VM_OPTIONS have not been
++  // parsed, so they are not in Arguments::jvm_args_array. If JDK_AOT_VM_OPTIONS is in
++  // the environment, it will be inherited and parsed by the child JVM process
++  // in Arguments::parse_java_tool_options_environment_variable().
++  precond(strcmp(AOTMode, "record") == 0);
++
++  // We don't pass Arguments::jvm_flags_array(), as those will be added by
++  // the child process when it loads .hotspotrc
++
++  {
++    // If AOTCacheOutput contains %p, it should have been already substituted with the
++    // pid of the training process.
++    stringStream ss;
++    ss.print("-XX:AOTCacheOutput=");
++    ss.print_raw(AOTCacheOutput);
++    append_args(&args, ss.freeze(), CHECK_0);
++  }
++  {
++    // If AOTCacheConfiguration contains %p, it should have been already substituted with the
++    // pid of the training process.
++    // If AOTCacheConfiguration was not explicitly specified, it should have been assigned a
++    // temporary file name.
++    stringStream ss;
++    ss.print("-XX:AOTConfiguration=");
++    ss.print_raw(AOTConfiguration);
++    append_args(&args, ss.freeze(), CHECK_0);
++  }
++
++  append_args(&args, "-XX:AOTMode=create", CHECK_0);
++
++  Symbol* klass_name = SymbolTable::new_symbol("jdk/internal/misc/CDS$ProcessLauncher");
++  Klass* k = SystemDictionary::resolve_or_fail(klass_name, true, CHECK_0);
++  Symbol* methodName = SymbolTable::new_symbol("execWithJavaToolOptions");
++  Symbol* methodSignature = SymbolTable::new_symbol("(Ljava/lang/String;[Ljava/lang/String;)I");
++
++  Handle launcher = java_lang_String::create_from_str(java_launcher_path, CHECK_0);
++  objArrayOop array = oopFactory::new_objArray(vmClasses::String_klass(), args.length(), CHECK_0);
++  for (int i = 0; i < args.length(); i++) {
++    array->obj_at_put(i, args.at(i)());
++  }
++  objArrayHandle launcher_args(THREAD, array);
++
++  // The following call will pass all options inside the JAVA_TOOL_OPTIONS env variable to
++  // the child process. It will also clear the _JAVA_OPTIONS and CLASSPATH env variables for
++  // the child process.
++  //
++  // Note: the env variables are set only for the child process. They are not changed
++  // for the current process. See java.lang.ProcessBuilder::environment().
++  JavaValue result(T_OBJECT);
++  JavaCallArguments javacall_args(2);
++  javacall_args.push_oop(launcher);
++  javacall_args.push_oop(launcher_args);
++  JavaCalls::call_static(&result,
++                          InstanceKlass::cast(k),
++                          methodName,
++                          methodSignature,
++                          &javacall_args,
++                          CHECK_0);
++  return result.get_jint();
++}
++
++void MetaspaceShared::fork_and_dump_final_static_archive(TRAPS) {
++  assert(CDSConfig::is_dumping_preimage_static_archive(), "sanity");
++
++  ResourceMark rm;
++  stringStream ss;
++  print_java_launcher(&ss);
++  const char* cmd = ss.freeze();
++  tty->print_cr("Launching child process %s to assemble AOT cache %s using configuration %s", cmd, AOTCacheOutput, AOTConfiguration);
++  int status = exec_jvm_with_java_tool_options(cmd, CHECK);
++  if (status != 0) {
++    log_error(aot)("Child process failed; status = %d", status);
++    // We leave the temp config file for debugging
++  } else if (CDSConfig::has_temp_aot_config_file()) {
++    const char* tmp_config = AOTConfiguration;
++    // On Windows, need WRITE permission to remove the file.
++    WINDOWS_ONLY(chmod(tmp_config, _S_IREAD | _S_IWRITE));
++    status = remove(tmp_config);
++    if (status != 0) {
++      log_error(aot)("Failed to remove temporary AOT configuration file %s", tmp_config);
++    } else {
++      tty->print_cr("Removed temporary AOT configuration file %s", tmp_config);
++    }
++  }
++}
++
+ // Returns true if the class's status has changed.
+ bool MetaspaceShared::try_link_class(JavaThread* current, InstanceKlass* ik) {
+   ExceptionMark em(current);
+diff --git a/src/hotspot/share/cds/metaspaceShared.hpp b/src/hotspot/share/cds/metaspaceShared.hpp
+index 2423141b8fa..130e7fe4484 100644
+--- a/src/hotspot/share/cds/metaspaceShared.hpp
++++ b/src/hotspot/share/cds/metaspaceShared.hpp
+@@ -179,6 +179,7 @@ public:
+ 
+ private:
+   static void read_extra_data(JavaThread* current, const char* filename) NOT_CDS_RETURN;
++  static void fork_and_dump_final_static_archive(TRAPS);
+   static bool write_static_archive(ArchiveBuilder* builder, FileMapInfo* map_info, ArchiveHeapInfo* heap_info);
+   static FileMapInfo* open_static_archive();
+   static FileMapInfo* open_dynamic_archive();
+diff --git a/src/hotspot/share/classfile/systemDictionaryShared.cpp b/src/hotspot/share/classfile/systemDictionaryShared.cpp
+index c949119d363..8bd09a0d947 100644
+--- a/src/hotspot/share/classfile/systemDictionaryShared.cpp
++++ b/src/hotspot/share/classfile/systemDictionaryShared.cpp
+@@ -309,7 +309,7 @@ bool SystemDictionaryShared::check_for_exclusion_impl(InstanceKlass* k) {
+       return warn_excluded(k, "Unlinked class not supported by AOTClassLinking");
+     } else if (CDSConfig::is_dumping_preimage_static_archive()) {
+       // When dumping the final static archive, we will unconditionally load and link all
+-      // classes from tje preimage. We don't want to get a VerifyError when linking this class.
++      // classes from the preimage. We don't want to get a VerifyError when linking this class.
+       return warn_excluded(k, "Unlinked class not supported by AOTConfiguration");
+     }
+   } else {
+diff --git a/src/hotspot/share/runtime/arguments.cpp b/src/hotspot/share/runtime/arguments.cpp
+index 62fcc65743a..b7ce095b41b 100644
+--- a/src/hotspot/share/runtime/arguments.cpp
++++ b/src/hotspot/share/runtime/arguments.cpp
+@@ -136,6 +136,11 @@ static bool xshare_auto_cmd_line = false;
+ // True if -Xint/-Xmixed/-Xcomp were specified
+ static bool mode_flag_cmd_line = false;
+ 
++struct VMInitArgsGroup {
++  const JavaVMInitArgs* _args;
++  JVMFlagOrigin _origin;
++};
++
+ bool PathString::set_value(const char *value, AllocFailType alloc_failmode) {
+   char* new_value = AllocateHeap(strlen(value)+1, mtArguments, alloc_failmode);
+   if (new_value == nullptr) {
+@@ -1950,12 +1955,7 @@ Arguments::ArgsRange Arguments::parse_memory_size(const char* s,
+   return check_memory_size(*long_arg, min_size, max_size);
+ }
+ 
+-// Parse JavaVMInitArgs structure
+-
+-jint Arguments::parse_vm_init_args(const JavaVMInitArgs *vm_options_args,
+-                                   const JavaVMInitArgs *java_tool_options_args,
+-                                   const JavaVMInitArgs *java_options_args,
+-                                   const JavaVMInitArgs *cmd_line_args) {
++jint Arguments::parse_vm_init_args(GrowableArrayCHeap<VMInitArgsGroup, mtArguments>* all_args) {
+   // Save default settings for some mode flags
+   Arguments::_AlwaysCompileLoopMethods = AlwaysCompileLoopMethods;
+   Arguments::_UseOnStackReplacement    = UseOnStackReplacement;
+@@ -1968,30 +1968,12 @@ jint Arguments::parse_vm_init_args(const JavaVMInitArgs *vm_options_args,
+   // Setup flags for mixed which is the default
+   set_mode_flags(_mixed);
+ 
+-  // Parse args structure generated from java.base vm options resource
+-  jint result = parse_each_vm_init_arg(vm_options_args, JVMFlagOrigin::JIMAGE_RESOURCE);
+-  if (result != JNI_OK) {
+-    return result;
+-  }
+-
+-  // Parse args structure generated from JAVA_TOOL_OPTIONS environment
+-  // variable (if present).
+-  result = parse_each_vm_init_arg(java_tool_options_args, JVMFlagOrigin::ENVIRON_VAR);
+-  if (result != JNI_OK) {
+-    return result;
+-  }
+-
+-  // Parse args structure generated from the command line flags.
+-  result = parse_each_vm_init_arg(cmd_line_args, JVMFlagOrigin::COMMAND_LINE);
+-  if (result != JNI_OK) {
+-    return result;
+-  }
+-
+-  // Parse args structure generated from the _JAVA_OPTIONS environment
+-  // variable (if present) (mimics classic VM)
+-  result = parse_each_vm_init_arg(java_options_args, JVMFlagOrigin::ENVIRON_VAR);
+-  if (result != JNI_OK) {
+-    return result;
++  jint result;
++  for (int i = 0; i < all_args->length(); i++) {
++    result = parse_each_vm_init_arg(all_args->at(i)._args, all_args->at(i)._origin);
++    if (result != JNI_OK) {
++      return result;
++    }
+   }
+ 
+   // Disable CDS for exploded image
+@@ -3093,6 +3075,50 @@ jint Arguments::parse_java_tool_options_environment_variable(ScopedVMInitArgs* a
+   return parse_options_environment_variable("JAVA_TOOL_OPTIONS", args);
+ }
+ 
++static JavaVMOption* get_last_aotmode_arg(const JavaVMInitArgs* args) {
++  for (int index = args->nOptions - 1; index >= 0; index--) {
++    JavaVMOption* option = args->options + index;
++    if (strstr(option->optionString, "-XX:AOTMode=") == option->optionString) {
++      return option;
++    }
++  }
++
++  return nullptr;
++}
++
++jint Arguments::parse_jdk_aot_vm_options_environment_variable(GrowableArrayCHeap<VMInitArgsGroup, mtArguments>* all_args,
++                                                            ScopedVMInitArgs* jdk_aot_vm_options_args) {
++  // Don't bother scanning all the args if this env variable is not set
++  if (::getenv("JDK_AOT_VM_OPTIONS") == nullptr) {
++    return JNI_OK;
++  }
++
++  // Scan backwards and find the last occurrence of -XX:AOTMode=xxx, which will decide the value
++  // of AOTMode.
++  JavaVMOption* option = nullptr;
++  for (int i = all_args->length() - 1; i >= 0; i--) {
++    if ((option = get_last_aotmode_arg(all_args->at(i)._args)) != nullptr) {
++      break;
++    }
++  }
++
++  if (option != nullptr) {
++    // We have found the last -XX:AOTMode=xxx. At this point <option> has NOT been parsed yet,
++    // so its value is not reflected inside the global variable AOTMode.
++    if (strcmp(option->optionString, "-XX:AOTMode=create") != 0) {
++      return JNI_OK; // Do not parse JDK_AOT_VM_OPTIONS
++    }
++  } else {
++    // -XX:AOTMode is not specified in any of 4 options_args, let's check AOTMode,
++    // which would have been set inside process_settings_file();
++    if (AOTMode == nullptr || strcmp(AOTMode, "create") != 0) {
++      return JNI_OK; // Do not parse JDK_AOT_VM_OPTIONS
++    }
++  }
++
++  return parse_options_environment_variable("JDK_AOT_VM_OPTIONS", jdk_aot_vm_options_args);
++}
++
+ jint Arguments::parse_options_environment_variable(const char* name,
+                                                    ScopedVMInitArgs* vm_args) {
+   char *buffer = ::getenv(name);
+@@ -3471,19 +3497,23 @@ jint Arguments::parse(const JavaVMInitArgs* initial_cmd_args) {
+   ScopedVMInitArgs initial_vm_options_args("");
+   ScopedVMInitArgs initial_java_tool_options_args("env_var='JAVA_TOOL_OPTIONS'");
+   ScopedVMInitArgs initial_java_options_args("env_var='_JAVA_OPTIONS'");
++  ScopedVMInitArgs initial_jdk_aot_vm_options_args("env_var='JDK_AOT_VM_OPTIONS'");
+ 
+   // Pointers to current working set of containers
+   JavaVMInitArgs* cur_cmd_args;
+   JavaVMInitArgs* cur_vm_options_args;
+   JavaVMInitArgs* cur_java_options_args;
+   JavaVMInitArgs* cur_java_tool_options_args;
++  JavaVMInitArgs* cur_jdk_aot_vm_options_args;
+ 
+   // Containers for modified/expanded options
+   ScopedVMInitArgs mod_cmd_args("cmd_line_args");
+   ScopedVMInitArgs mod_vm_options_args("vm_options_args");
+   ScopedVMInitArgs mod_java_tool_options_args("env_var='JAVA_TOOL_OPTIONS'");
+   ScopedVMInitArgs mod_java_options_args("env_var='_JAVA_OPTIONS'");
++  ScopedVMInitArgs mod_jdk_aot_vm_options_args("env_var='_JDK_AOT_VM_OPTIONS'");
+ 
++  GrowableArrayCHeap<VMInitArgsGroup, mtArguments> all_args;
+ 
+   jint code =
+       parse_java_tool_options_environment_variable(&initial_java_tool_options_args);
+@@ -3491,6 +3521,8 @@ jint Arguments::parse(const JavaVMInitArgs* initial_cmd_args) {
+     return code;
+   }
+ 
++  // Yet another environment variable: _JAVA_OPTIONS. This mimics the classic VM.
++  // This is an undocumented feature.
+   code = parse_java_options_environment_variable(&initial_java_options_args);
+   if (code != JNI_OK) {
+     return code;
+@@ -3537,23 +3569,17 @@ jint Arguments::parse(const JavaVMInitArgs* initial_cmd_args) {
+   const char* flags_file = Arguments::get_jvm_flags_file();
+   settings_file_specified = (flags_file != nullptr);
+ 
+-  if (IgnoreUnrecognizedVMOptions) {
+-    cur_cmd_args->ignoreUnrecognized = true;
+-    cur_java_tool_options_args->ignoreUnrecognized = true;
+-    cur_java_options_args->ignoreUnrecognized = true;
+-  }
+-
+-  // Parse specified settings file
++  // Parse specified settings file (s) -- the effects are applied immediately into the JVM global flags.
+   if (settings_file_specified) {
+     if (!process_settings_file(flags_file, true,
+-                               cur_cmd_args->ignoreUnrecognized)) {
++                               IgnoreUnrecognizedVMOptions)) {
+       return JNI_EINVAL;
+     }
+   } else {
+ #ifdef ASSERT
+     // Parse default .hotspotrc settings file
+     if (!process_settings_file(".hotspotrc", false,
+-                               cur_cmd_args->ignoreUnrecognized)) {
++                               IgnoreUnrecognizedVMOptions)) {
+       return JNI_EINVAL;
+     }
+ #else
+@@ -3564,17 +3590,59 @@ jint Arguments::parse(const JavaVMInitArgs* initial_cmd_args) {
+ #endif
+   }
+ 
++  // The settings in the args are applied in this order to the the JVM global flags.
++  // For historical reasons, the order is DIFFERENT than the scanning order of
++  // the above expand_vm_options_as_needed() calls.
++  all_args.append({cur_vm_options_args, JVMFlagOrigin::JIMAGE_RESOURCE});
++  all_args.append({cur_java_tool_options_args, JVMFlagOrigin::ENVIRON_VAR});
++  all_args.append({cur_cmd_args, JVMFlagOrigin::COMMAND_LINE});
++  all_args.append({cur_java_options_args, JVMFlagOrigin::ENVIRON_VAR});
++
++  // JDK_AOT_VM_OPTIONS are parsed only if -XX:AOTMode=create has been detected from all
++  // the options that have been gathered above.
++  code = parse_jdk_aot_vm_options_environment_variable(&all_args, &initial_jdk_aot_vm_options_args);
++  if (code != JNI_OK) {
++    return code;
++  }
++  code = expand_vm_options_as_needed(initial_jdk_aot_vm_options_args.get(),
++                                     &mod_jdk_aot_vm_options_args,
++                                     &cur_jdk_aot_vm_options_args);
++  if (code != JNI_OK) {
++    return code;
++  }
++
++  for (int index = 0; index < cur_jdk_aot_vm_options_args->nOptions; index++) {
++    JavaVMOption* option = cur_jdk_aot_vm_options_args->options + index;
++    const char* optionString = option->optionString;
++    if (strstr(optionString, "-XX:AOTMode=") == optionString &&
++        strcmp(optionString, "-XX:AOTMode=create") != 0) {
++      jio_fprintf(defaultStream::error_stream(),
++                  "Option %s cannot be specified in JDK_AOT_VM_OPTIONS\n", optionString);
++      return JNI_ERR;
++    }
++  }
++
++  all_args.append({cur_jdk_aot_vm_options_args, JVMFlagOrigin::ENVIRON_VAR});
++
++  if (IgnoreUnrecognizedVMOptions) {
++    // Note: unrecognized options in cur_vm_options_arg cannot be ignored. They are part of
++    // the JDK so it shouldn't have bad options.
++    cur_cmd_args->ignoreUnrecognized = true;
++    cur_java_tool_options_args->ignoreUnrecognized = true;
++    cur_java_options_args->ignoreUnrecognized = true;
++    cur_jdk_aot_vm_options_args->ignoreUnrecognized = true;
++  }
++
+   if (PrintVMOptions) {
++    // For historical reasons, options specified in cur_vm_options_arg and -XX:Flags are not printed.
+     print_options(cur_java_tool_options_args);
+     print_options(cur_cmd_args);
+     print_options(cur_java_options_args);
++    print_options(cur_jdk_aot_vm_options_args);
+   }
+ 
+-  // Parse JavaVMInitArgs structure passed in, as well as JAVA_TOOL_OPTIONS and _JAVA_OPTIONS
+-  jint result = parse_vm_init_args(cur_vm_options_args,
+-                                   cur_java_tool_options_args,
+-                                   cur_java_options_args,
+-                                   cur_cmd_args);
++  // Apply the settings in these args to the JVM global flags.
++  jint result = parse_vm_init_args(&all_args);
+ 
+   if (result != JNI_OK) {
+     return result;
+diff --git a/src/hotspot/share/runtime/arguments.hpp b/src/hotspot/share/runtime/arguments.hpp
+index 55667df2c59..5eb9601e4c5 100644
+--- a/src/hotspot/share/runtime/arguments.hpp
++++ b/src/hotspot/share/runtime/arguments.hpp
+@@ -148,6 +148,9 @@ class SystemProperty : public PathString {
+ // Helper class for controlling the lifetime of JavaVMInitArgs objects.
+ class ScopedVMInitArgs;
+ 
++struct VMInitArgsGroup;
++template <typename E, MemTag MT> class GrowableArrayCHeap;
++
+ class Arguments : AllStatic {
+   friend class VMStructs;
+   friend class JvmtiExport;
+@@ -310,6 +313,8 @@ class Arguments : AllStatic {
+   static jint parse_options_environment_variable(const char* name, ScopedVMInitArgs* vm_args);
+   static jint parse_java_tool_options_environment_variable(ScopedVMInitArgs* vm_args);
+   static jint parse_java_options_environment_variable(ScopedVMInitArgs* vm_args);
++  static jint parse_jdk_aot_vm_options_environment_variable(GrowableArrayCHeap<VMInitArgsGroup, mtArguments>* all_args,
++                                                            ScopedVMInitArgs* jdk_aot_vm_options_args);
+   static jint parse_vm_options_file(const char* file_name, ScopedVMInitArgs* vm_args);
+   static jint parse_options_buffer(const char* name, char* buffer, const size_t buf_len, ScopedVMInitArgs* vm_args);
+   static jint parse_xss(const JavaVMOption* option, const char* tail, intx* out_ThreadStackSize);
+@@ -327,10 +332,7 @@ class Arguments : AllStatic {
+ 
+   static bool handle_deprecated_print_gc_flags();
+ 
+-  static jint parse_vm_init_args(const JavaVMInitArgs *vm_options_args,
+-                                 const JavaVMInitArgs *java_tool_options_args,
+-                                 const JavaVMInitArgs *java_options_args,
+-                                 const JavaVMInitArgs *cmd_line_args);
++  static jint parse_vm_init_args(GrowableArrayCHeap<VMInitArgsGroup, mtArguments>* all_args);
+   static jint parse_each_vm_init_arg(const JavaVMInitArgs* args, JVMFlagOrigin origin);
+   static jint finalize_vm_init_args();
+   static bool is_bad_option(const JavaVMOption* option, jboolean ignore, const char* option_type);
+diff --git a/src/java.base/share/classes/jdk/internal/misc/CDS.java b/src/java.base/share/classes/jdk/internal/misc/CDS.java
+index 2d8046a75eb..72b8479de9a 100644
+--- a/src/java.base/share/classes/jdk/internal/misc/CDS.java
++++ b/src/java.base/share/classes/jdk/internal/misc/CDS.java
+@@ -506,4 +506,47 @@ public class CDS {
+             return defineClass(name, bytes, 0, bytes.length);
+         }
+     }
++
++    /**
++     * This class is used only by native JVM code to spawn a child JVM process to assemble
++     * the AOT cache. <code>args[]</code> are passed in the <code>JAVA_TOOL_OPTIONS</code>
++     * environment variable.
++     */
++    private static class ProcessLauncher {
++        static int execWithJavaToolOptions(String javaLauncher, String args[]) throws IOException, InterruptedException {
++            ProcessBuilder pb = new ProcessBuilder().inheritIO().command(javaLauncher);
++            StringBuilder sb = new StringBuilder();
++
++            // Encode the args as described in
++            // https://docs.oracle.com/en/java/javase/24/docs/specs/jvmti.html#tooloptions
++            String prefix = "";
++            for (String arg : args) {
++                sb.append(prefix);
++
++                for (int i = 0; i < arg.length(); i++) {
++                    char c = arg.charAt(i);
++                    if (c == '"' || Character.isWhitespace(c)) {
++                        sb.append('\'');
++                        sb.append(c);
++                        sb.append('\'');
++                    } else if (c == '\'') {
++                        sb.append('"');
++                        sb.append(c);
++                        sb.append('"');
++                    } else {
++                        sb.append(c);
++                    }
++                }
++
++                prefix = " ";
++            }
++
++            Map<String, String> env = pb.environment();
++            env.put("JAVA_TOOL_OPTIONS", sb.toString());
++            env.remove("_JAVA_OPTIONS");
++            env.remove("CLASSPATH");
++            Process process = pb.start();
++            return process.waitFor();
++        }
++    }
+ }
+diff --git a/src/java.base/share/man/java.md b/src/java.base/share/man/java.md
+index 1dba3c6ba54..bb010e6e1c7 100644
+--- a/src/java.base/share/man/java.md
++++ b/src/java.base/share/man/java.md
+@@ -4000,8 +4000,8 @@ partially or completely disabled, leading to lower performance.
+   can be used, but the "archived module graph" feature will be disabled. This can lead to increased
+   start-up time.
+ 
+-To diagnose problems with the above options, you can add `-Xlog:cds` to the application's VM
+-arguments. For example, if `--add-modules jdk.jconcole` was specified during archive creation
++To diagnose problems with the AOT options, you can add `-Xlog:aot` to the application's VM
++arguments. For example, if `--add-modules jdk.jconsole` was specified during archive creation
+ and `--add-modules jdk.incubator.vector` is specified during runtime, the following messages will
+ be logged:
+ 
+@@ -4050,31 +4050,66 @@ The deployment of the AOT cache is divided into three phases:
+ 
+ The AOT cache can be used with the following command-line options:
+ 
+-`-XX:AOTCache:=`*cachefile*
++`-XX:AOTCache=`*cachefile*
+ :   Specifies the location of the AOT cache. The standard extension for *cachefile* is `.aot`.
+-    If `-XX:AOTCache` is specified but `-XX:AOTMode` is not specified,
+-    then `AOTMode` will be given the value of `auto`.
++    This option cannot be used together with `-XX:AOTCacheOutput`.
+ 
+-`-XX:AOTConfiguration:=`*configfile*
++    This option is compatible with `AOTMode` settings of `on`, `create`, or `auto` (the default).
++    The *cachefile* is read in AOT modes `on` and `auto`, and is ignored by mode `off`.
++    The *cachefile* is written by AOT mode `create`.  In that case, this option is
++    equivalent to `-XX:AOTCacheOutput=`*cachefile*.
++
++`-XX:AOTCacheOutput=`*cachefile*
++:   Specifies the location of the AOT cache to write. The standard extension for *cachefile* is `.aot`.
++    This option cannot be used together with `-XX:AOTCache`.
++
++    This option is compatible with `AOTMode` settings of `record`, `create`, or `auto` (the default).
++
++`-XX:AOTConfiguration=`*configfile*
+ :   Specifies the AOT Configuration file for the JVM to write to or read from.
+-    This option can be used only with `-XX:AOTMode=record` and `-XX:AOTMode=create`.
+     The standard extension for *configfile* is `.aotconfig`.
+ 
+-`-XX:+AOTMode:=`*mode*
+-:   *mode* must be one of the following: `off`, `record`, `create`, `auto`, or `on`.
++    This option is compatible with `AOTMode` settings of `record`, `create`, or `auto` (the default).
++    The *configfile* is read by AOT mode `create`, and written by the other applicable modes.
++    If the AOT mode is `auto`, then `AOTCacheOutput` must also be present.
+ 
+--   `off`: no AOT cache is used.
++`-XX:AOTMode=`*mode*
++:   Specifies the AOT Mode for this run.
++    *mode* must be one of the following: `auto`, `off`, `record`, `create`, or `on`.
+ 
+--   `record`: Execute the application in the Training phase.
+-    `-XX:AOTConfiguration=`*configfile* must be specified. The JVM gathers
+-     statistical data and stores them into *configfile*.
++-   `auto`: This AOT mode is the default, and takes effect if no `-XX:AOTMode` option
++    is present.  It automatically sets the AOT mode to `record`, `on`, or `off`, as follows:
++     - If `-XX:AOTCacheOutput=`*cachefile* is specified, the AOT mode is changed to `record`
++       (a training run, with a subsequent `create` operation).
++     - Otherwise, if an AOT cache can be loaded, the AOT mode is changed to `on` (a production run).
++     - Otherwise, the AOT mode is changed to `off` (a production run with no AOT cache).
+ 
+--   `create`: Perform the Assembly phase. `-XX:AOTConfiguration=`*configfile*
+-     and `-XX:AOTCache=`*cachefile*  must be specified. The JVM reads the statistical
+-     data from *configfile* and writes the optimization artifacts into *cachefile*.
++-   `off`: No AOT cache is used.
++    Other AOT command line options are ignored.
++
++-   `record`: Execute the application in the training phase.
++     At least one of `-XX:AOTConfiguration=`*configfile* and/or
++     `-XX:AOTCacheOutput=`*cachefile* must be specified.
++     If `-XX:AOTConfiguration=`*configfile* is specified, the JVM gathers
++     statistical data and stores them into *configfile*.
++     If `-XX:AOTConfiguration=`*configfile* is not specified, the JVM uses
++     a temporary file name, which may be the string `AOTCacheOutput+".config"`,
++     or else a fresh implementation-dependent temporary file name.
++     If `-XX:AOTCacheOutput=`*cachefile* is specified, a second JVM process is launched
++     to perform the Assembly phase to write the optimization artifacts into *cachefile*.
++
++     Extra JVM options can be passed to the second JVM process using the environment
++     variable `JDK_AOT_VM_OPTIONS`, with the same format as the environment variable
++     `JAVA_TOOL_OPTIONS`, which is
++     [defined by JVMTI](https://docs.oracle.com/en/java/javase/24/docs/specs/jvmti.html#tooloptions).
++
++-   `create`: Perform the Assembly phase. `-XX:AOTConfiguration=`*configfile* must be
++     specified.
++     The JVM reads history and statistics
++     from *configfile* and writes the optimization artifacts into *cachefile*.
+      Note that the application itself is not executed in this phase.
+ 
+--   `auto` or `on`: These modes should be used in the Production phase.
++-   `on`: Execute the application in the Production phase.
+      If `-XX:AOTCache=`*cachefile* is specified, the JVM tries to
+      load *cachefile* as the AOT cache. Otherwise, the JVM tries to load
+      a *default CDS archive* from the JDK installation directory as the AOT cache.
+@@ -4091,14 +4126,14 @@ The AOT cache can be used with the following command-line options:
+        Since the AOT cache is an optimization feature, there's no guarantee that it will be
+        compatible with all possible JVM options. See [JEP 483](https://openjdk.org/jeps/483),
+        section **Consistency of training and subsequent runs** for a representative
+-       list of scenarios that may be incompatible with the AOT cache for JDK 24.
++       list of scenarios that may be incompatible with the AOT cache.
+ 
+        These scenarios usually involve arbitrary modification of classes for diagnostic
+        purposes and are typically not relevant for production environments.
+ 
+      When the AOT cache fails to load:
+ 
+-     - If `AOTMode` is `auto`, the JVM will continue execution without using the
++     - If `AOTMode` was originally `auto`, the JVM will continue execution without using the
+        AOT cache. This is the recommended mode for production environments, especially
+        when you may not have complete control of the command-line (e.g., your
+        application's launch script may allow users to inject options to the command-line).
+@@ -4108,7 +4143,7 @@ The AOT cache can be used with the following command-line options:
+      - If `AOTMode` is `on`, the JVM will print an error message and exit immediately. This
+        mode should be used only as a "fail-fast" debugging aid to check if your command-line
+        options are compatible with the AOT cache. An alternative is to run your application with
+-       `-XX:AOTMode=auto -Xlog:cds` to see if the AOT cache can be used or not.
++       `-XX:AOTMode=auto -Xlog:aot` to see if the AOT cache can be used or not.
+ 
+ `-XX:+AOTClassLinking`
+ :   If this option is enabled, the JVM will perform more advanced optimizations (such
+@@ -4125,6 +4160,16 @@ The AOT cache can be used with the following command-line options:
+     When `-XX:AOTMode` *is not used* in the command-line,  `AOTClassLinking` is disabled by
+     default to provide full compatibility with traditional CDS options such as `-Xshare:dump.
+ 
++The first occurrence of the special sequence `%p` in `*configfile* and `*cachefile* is replaced
++with the process ID of the JVM process launched in the command-line, and likewise the
++first occurrence of `%t` is replace by the JVM's startup timestamp.
++(After replacement there must be no further occurrences of `%p` or `%t`, to prevent
++problems with sub-processes.)  For example:
++
++>   `java -XX:AOTConfiguration=foo%p.aotconfig -XX:AOTCacheOutput=foo%p.aot -cp foo.jar Foo`
++
++will create two files: `foopid123.aotconfig` and `foopid123.aot`, where `123` is the
++process ID of the JVM that has executed the application `Foo`.
+ 
+ ## Performance Tuning Examples
+ 
+diff --git a/test/hotspot/jtreg/TEST.groups b/test/hotspot/jtreg/TEST.groups
+index 4e1d7601191..2fa0862a186 100644
+--- a/test/hotspot/jtreg/TEST.groups
++++ b/test/hotspot/jtreg/TEST.groups
+@@ -416,6 +416,7 @@ hotspot_appcds_dynamic = \
+  -runtime/cds/appcds/aotCache \
+  -runtime/cds/appcds/aotClassLinking \
+  -runtime/cds/appcds/aotCode \
++ -runtime/cds/appcds/aotFlags \
+  -runtime/cds/appcds/applications \
+  -runtime/cds/appcds/cacheObject \
+  -runtime/cds/appcds/complexURI \
+@@ -517,6 +518,7 @@ hotspot_aot_classlinking = \
+  -runtime/cds/appcds/aotCache \
+  -runtime/cds/appcds/aotClassLinking \
+  -runtime/cds/appcds/aotCode \
++ -runtime/cds/appcds/aotFlags \
+  -runtime/cds/appcds/BadBSM.java \
+  -runtime/cds/appcds/cacheObject/ArchivedIntegerCacheTest.java \
+  -runtime/cds/appcds/cacheObject/ArchivedModuleCompareTest.java \
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/UseAppCDS_Test.java b/test/hotspot/jtreg/runtime/cds/appcds/UseAppCDS_Test.java
+deleted file mode 100644
+index 8a35ff52450..00000000000
+--- a/test/hotspot/jtreg/runtime/cds/appcds/UseAppCDS_Test.java
++++ /dev/null
+@@ -1,30 +0,0 @@
+-/*
+- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+- *
+- * This code is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 only, as
+- * published by the Free Software Foundation.
+- *
+- * This code is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+- * version 2 for more details (a copy is included in the LICENSE file that
+- * accompanied this code).
+- *
+- * You should have received a copy of the GNU General Public License version
+- * 2 along with this work; if not, write to the Free Software Foundation,
+- * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+- *
+- * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+- * or visit www.oracle.com if you need additional information or have any
+- * questions.
+- *
+- */
+-public class UseAppCDS_Test {
+-    // args are from UseAppCDS:
+-    // args[0] = TEST_OUT
+-    public static void main(String[] args) {
+-        System.out.println(args[0]);
+-    }
+-}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotCache/SpecialCacheNames.java b/test/hotspot/jtreg/runtime/cds/appcds/aotCache/SpecialCacheNames.java
+new file mode 100644
+index 00000000000..89aa9e441a4
+--- /dev/null
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotCache/SpecialCacheNames.java
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ *
++ */
++
++/*
++ * @test
++ * @summary Use special characters in the name of the cache file specified by -XX:AOTCacheOutput
++ *          Make sure these characters are passed to the child JVM process that assembles the cache.
++ * @requires vm.cds.supports.aot.class.linking
++ * @comment work around JDK-8345635
++ * @requires !vm.jvmci.enabled
++ * @library /test/lib
++ * @build SpecialCacheNames
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar app.jar MyTestApp
++ * @run driver SpecialCacheNames AOT --one-step-training
++ */
++
++import java.io.File;
++import jdk.test.lib.cds.CDSAppTester;
++import jdk.test.lib.helpers.ClassFileInstaller;
++import jdk.test.lib.Platform;
++import jdk.test.lib.process.OutputAnalyzer;
++
++public class SpecialCacheNames {
++    static final String appJar = ClassFileInstaller.getJarPath("app.jar");
++    static final String mainClass = "MyTestApp";
++
++    public static void main(String[] args) throws Exception {
++        test("with spaces", args);
++        test("single'quote", args);
++        if (!Platform.isWindows()) {
++            // This seems to be a limitation of ProcessBuilder on Windows that has problem passing
++            // double quote or unicode characters to a child process. As a result, we can't
++            // even pass these parameters to the training run JVM.
++            test("double\"quote", args);
++            test("unicode\u202fspace", args); // Narrow No-Break Space
++            test("unicode\u6587", args); // CJK unifed ideographs "wen" = "script"
++        }
++    }
++
++    static void test(String name, String[] args) throws Exception {
++        String archiveName = name + (args[0].equals("LEYDEN") ? ".cds" : ".aot");
++
++        System.out.println("============================= Testing with AOT cache name: {{" + archiveName + "}}");
++        new Tester(name, archiveName).run(args);
++    }
++
++    static class Tester extends CDSAppTester {
++        String archiveName;
++        public Tester(String name, String archiveName) {
++            super(name);
++            this.archiveName = archiveName;
++        }
++
++        @Override
++        public String classpath(RunMode runMode) {
++            return appJar;
++        }
++
++        @Override
++        public String[] vmArgs(RunMode runMode) {
++            // A space character in a training run vmarg should not break this vmarg into two.
++            return new String[] { "-Dmy.test.prop=space -XX:FooBar" };
++        }
++
++        @Override
++        public String[] appCommandLine(RunMode runMode) {
++            return new String[] {
++                mainClass,
++            };
++        }
++
++        @Override
++        public void checkExecution(OutputAnalyzer out, RunMode runMode) {
++            if (runMode.isProductionRun()) {
++                File f = new File(archiveName);
++                if (f.exists()) {
++                    System.out.println("Found Archive {{" + archiveName + "}}");
++                } else {
++                    throw new RuntimeException("Archive {{" + archiveName + "}} does not exist");
++                }
++            }
++
++            if (runMode.isApplicationExecuted()) {
++                out.shouldContain("Hello World");
++            }
++        }
++    }
++}
++
++class MyTestApp {
++    public static void main(String args[]) {
++        String s = System.getProperty("my.test.prop");
++        if (!"space -XX:FooBar".equals(s)) {
++            throw new RuntimeException("Expected \"space -XX:FooBar\" but got \"" + s + "\"");
++        }
++
++        System.out.println("Hello World");
++    }
++}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/MethodHandleTest.java b/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/MethodHandleTest.java
+index 6bef9e12e95..f7a26a39db1 100644
+--- a/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/MethodHandleTest.java
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/MethodHandleTest.java
+@@ -35,7 +35,7 @@
+  *             MethodHandleTestApp MethodHandleTestApp$A MethodHandleTestApp$B
+  *             UnsupportedBSMs UnsupportedBSMs$MyEnum
+  *             ObjectMethodsTest ObjectMethodsTest$C
+- * @run driver MethodHandleTest AOT
++ * @run driver MethodHandleTest AOT --two-step-training
+  */
+ 
+ import java.io.Serializable;
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/WeakReferenceTest.java b/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/WeakReferenceTest.java
+index e7360a6877c..ae5cd5b3429 100644
+--- a/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/WeakReferenceTest.java
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotClassLinking/WeakReferenceTest.java
+@@ -34,7 +34,7 @@
+  * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar weakref.jar
+  *             WeakReferenceTestApp WeakReferenceTestApp$Inner ShouldNotBeAOTInited ShouldNotBeArchived SharedQueue
+  *             WeakReferenceTestBadApp1 WeakReferenceTestBadApp2
+- * @run driver WeakReferenceTest AOT
++ * @run driver WeakReferenceTest AOT --two-step-training
+  */
+ 
+ import java.lang.ref.WeakReference;
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotCode/AOTCodeFlags.java b/test/hotspot/jtreg/runtime/cds/appcds/aotCode/AOTCodeFlags.java
+index 0e70638b8d4..761c2c5382d 100644
+--- a/test/hotspot/jtreg/runtime/cds/appcds/aotCode/AOTCodeFlags.java
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotCode/AOTCodeFlags.java
+@@ -53,7 +53,7 @@ public class AOTCodeFlags {
+         // Run only 2 modes (0 - no AOT code, 1 - AOT adapters) until JDK-8357398 is fixed
+         for (int mode = 0; mode < 2; mode++) {
+             t.setTestMode(mode);
+-            t.run(new String[] {"AOT"});
++            t.run(new String[] {"AOT", "--two-step-training"});
+         }
+     }
+     static class Tester extends CDSAppTester {
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/AOTFlags.java b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/AOTFlags.java
+similarity index 69%
+rename from test/hotspot/jtreg/runtime/cds/appcds/AOTFlags.java
+rename to test/hotspot/jtreg/runtime/cds/appcds/aotFlags/AOTFlags.java
+index b760b288808..44957f5d2ed 100644
+--- a/test/hotspot/jtreg/runtime/cds/appcds/AOTFlags.java
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/AOTFlags.java
+@@ -156,6 +156,107 @@ public class AOTFlags {
+         out.shouldContain("Opened AOT cache hello.aot.");
+         out.shouldContain("Hello World");
+         out.shouldHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        printTestCase("Training run with -XX:-AOTClassLinking, but assembly run with -XX:+AOTClassLinking");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:-AOTClassLinking",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldHaveExitValue(0);
++
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:+AOTClassLinking",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=" + aotCacheFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar);
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        out.shouldContain("Writing AOTCache file:");
++        out.shouldMatch("aot.*hello[.]aot");
++        out.shouldHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        printTestCase("One step training run (JEP-514");
++
++        // Set all AOTMode/AOTCacheOutput/AOTConfiguration
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldHaveExitValue(0);
++
++        // Set AOTCacheOutput/AOTConfiguration only; Ergo for: AOTMode=record
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldHaveExitValue(0);
++
++        // Set AOTCacheOutput/AOTConfiguration/AOTMode=auto; Ergo changes: AOTMode=record
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=auto",
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldHaveExitValue(0);
++
++        // Set AOTCacheOutput only; Ergo for: AOTMode=record, AOTConfiguration=<temp>
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("Temporary AOTConfiguration recorded: " + aotCacheFile + ".config");
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldHaveExitValue(0);
++
++        // Set AOTCacheOutput/AOTMode=auto only; Ergo for: AOTMode=record, AOTConfiguration=<temp>
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=auto",
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("Temporary AOTConfiguration recorded: " + aotCacheFile + ".config");
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldHaveExitValue(0);
++
++        // Quoating of space characters in child JVM process
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-Dmy.prop=My string -Xshare:off here", // -Xshare:off should not be treated as a single VM opt for the child JVM
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldMatch("Picked up JAVA_TOOL_OPTIONS:.* -Dmy.prop=My' 'string' '-Xshare:off' 'here");
++        out.shouldHaveExitValue(0);
+     }
+ 
+     static void negativeTests() throws Exception {
+@@ -183,30 +284,41 @@ public class AOTFlags {
+         out.shouldNotHaveExitValue(0);
+ 
+         //----------------------------------------------------------------------
+-        printTestCase("Use AOTConfiguration without AOTMode");
++        printTestCase("Use AOTConfiguration without AOTMode/AOTCacheOutput");
+         pb = ProcessTools.createLimitedTestJavaProcessBuilder(
+             "-XX:AOTConfiguration=" + aotConfigFile,
+             "-cp", appJar, helloClass);
+ 
+         out = CDSTestUtils.executeAndLog(pb, "neg");
+-        out.shouldContain("AOTConfiguration can only be used with -XX:AOTMode=record or -XX:AOTMode=create");
++        out.shouldContain("AOTConfiguration can only be used with when AOTMode is record or create (selected AOTMode = auto)");
+         out.shouldNotHaveExitValue(0);
+ 
+         //----------------------------------------------------------------------
+-        printTestCase("Use AOTMode without AOTConfiguration");
++        printTestCase("Use AOTConfiguration with AOTMode=on");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=on",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "neg");
++        out.shouldContain("AOTConfiguration can only be used with when AOTMode is record or create (selected AOTMode = on)");
++        out.shouldNotHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        printTestCase("Use AOTMode without AOTCacheOutput or AOTConfiguration");
+         pb = ProcessTools.createLimitedTestJavaProcessBuilder(
+             "-XX:AOTMode=record",
+             "-cp", appJar, helloClass);
+ 
+         out = CDSTestUtils.executeAndLog(pb, "neg");
+-        out.shouldContain("-XX:AOTMode=record cannot be used without setting AOTConfiguration");
++        out.shouldContain("At least one of AOTCacheOutput and AOTConfiguration must be specified when using -XX:AOTMode=record");
+ 
+         pb = ProcessTools.createLimitedTestJavaProcessBuilder(
+             "-XX:AOTMode=create",
+             "-cp", appJar, helloClass);
+ 
+         out = CDSTestUtils.executeAndLog(pb, "neg");
+-        out.shouldContain("-XX:AOTMode=create cannot be used without setting AOTConfiguration");
++        out.shouldContain("AOTConfiguration must be specified when using -XX:AOTMode=create");
+         out.shouldNotHaveExitValue(0);
+ 
+         //----------------------------------------------------------------------
+@@ -232,14 +344,27 @@ public class AOTFlags {
+         out.shouldNotHaveExitValue(0);
+ 
+         //----------------------------------------------------------------------
+-        printTestCase("AOTCache not specified with -XX:AOTMode=create");
++        printTestCase("AOTCache/AOTCacheOutput not specified with -XX:AOTMode=create");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "neg");
++        out.shouldContain("AOTCache or AOTCacheOutput must be specified when using -XX:AOTMode=create");
++        out.shouldNotHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        printTestCase("AOTCache and AOTCacheOutput have different values");
+         pb = ProcessTools.createLimitedTestJavaProcessBuilder(
+             "-XX:AOTMode=create",
+             "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=aaa",
++            "-XX:AOTCacheOutput=aaa",
+             "-cp", appJar, helloClass);
+ 
+         out = CDSTestUtils.executeAndLog(pb, "neg");
+-        out.shouldContain("AOTCache must be specified when using -XX:AOTMode=create");
++        out.shouldContain("Only one of AOTCache or AOTCacheOutput can be specified");
+         out.shouldNotHaveExitValue(0);
+ 
+         //----------------------------------------------------------------------
+@@ -372,7 +497,7 @@ public class AOTFlags {
+ 
+     static int testNum = 0;
+     static void printTestCase(String s) {
+-        System.out.println("vvvvvvv TEST CASE " + testNum + ": " + s + " starts here vvvvvvv");
++        System.out.println("vvvvvvv TEST CASE " + testNum + ": " + s + ": starts here vvvvvvv");
+         testNum++;
+     }
+ }
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/FileNameSubstitution.java b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/FileNameSubstitution.java
+new file mode 100644
+index 00000000000..23b82b124d9
+--- /dev/null
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/FileNameSubstitution.java
+@@ -0,0 +1,207 @@
++/*
++ * Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ *
++ */
++
++/*
++ * @test
++ * @summary substitution of %p/%t in AOTCache/AOTCacheOutput/AOTConfiguration
++ * @requires vm.cds
++ * @requires vm.flagless
++ * @library /test/lib /test/hotspot/jtreg/runtime/cds/appcds/test-classes
++ * @build Hello
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar hello.jar Hello
++ * @run driver FileNameSubstitution
++ */
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import jdk.test.lib.cds.CDSTestUtils;
++import jdk.test.lib.helpers.ClassFileInstaller;
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++
++public class FileNameSubstitution {
++    static String appJar = ClassFileInstaller.getJarPath("hello.jar");
++    static String helloClass = "Hello";
++
++    public static void main(String[] args) throws Exception {
++        positiveTests();
++        negativeTests();
++    }
++
++    static void positiveTests() throws Exception {
++        ProcessBuilder pb;
++        OutputAnalyzer out;
++        String aotCacheFile;
++        String aotConfigFile;
++
++        //----------------------------------------------------------------------
++        printTestCase("AOTConfiguration (two-command training)");
++        removeOutputFiles();
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=test-%p.aotconfig",
++            "-Xlog:os",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("Hello World");
++        aotConfigFile = find_pid_substituted_file(out, "test-", ".aotconfig");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldHaveExitValue(0);
++
++        // "create" with AOTCache
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=test-%p.aot",
++            "-Xlog:os",
++            "-cp", appJar);
++
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        aotCacheFile = find_pid_substituted_file(out, "test-", ".aot");
++        out.shouldContain("AOTCache creation is complete: " + aotCacheFile);
++        out.shouldHaveExitValue(0);
++
++        // "create" with AOTCacheOutput
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCacheOutput=test-%p.aot",
++            "-Xlog:os",
++            "-cp", appJar);
++
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        aotCacheFile = find_pid_substituted_file(out, "test-", ".aot");
++        out.shouldContain("AOTCache creation is complete: " + aotCacheFile);
++        out.shouldHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        printTestCase("AOTConfiguration/AOTCache (single-command training)");
++        removeOutputFiles();
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=test-%p.aotconfig",
++            "-XX:AOTCacheOutput=test-%p.aot",
++            "-Xlog:os",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("Hello World");
++        aotConfigFile = find_pid_substituted_file(out, "test-", ".aotconfig");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        aotCacheFile = find_pid_substituted_file(out, "test-", ".aot");
++        out.shouldContain("AOTCache creation is complete: " + aotCacheFile);
++        out.shouldHaveExitValue(0);
++
++
++        // The implementation of %t is exactly the same as %p, so just test one case
++        //----------------------------------------------------------------------
++        printTestCase("AOTConfiguration (two-command training) -- %t");
++        removeOutputFiles();
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=test-%t.aotconfig",
++            "-Xlog:os",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: test-20"); // This should work for the nest 70 years or so ...
++        out.shouldHaveExitValue(0);
++    }
++
++    static void negativeTests() throws Exception {
++        ProcessBuilder pb;
++        OutputAnalyzer out;
++
++        //----------------------------------------------------------------------
++        printTestCase("Cannot use %p twice");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=test-%p%p.aotconfig",
++            "-Xlog:os",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("AOTConfiguration cannot contain more than one %p");
++        out.shouldHaveExitValue(1);
++
++        //----------------------------------------------------------------------
++        printTestCase("Cannot use %t twice");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=test-%t%t.aotconfig",
++            "-Xlog:os",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("AOTConfiguration cannot contain more than one %t");
++        out.shouldHaveExitValue(1);
++    }
++
++    static void removeOutputFiles() {
++        removeOutputFiles(".aot");
++        removeOutputFiles(".aotconfig");
++    }
++
++    static void removeOutputFiles(String suffix) {
++        File dir = new File(".");
++        for (File f : dir.listFiles()) {
++            if (f.getName().endsWith(suffix)) {
++                f.delete();
++            }
++        }
++    }
++
++    static String find_pid_substituted_file(OutputAnalyzer out, String prefix, String suffix) {
++        String stdout = out.getStdout();
++        Pattern pattern = Pattern.compile("Initialized VM with process ID ([0-9]+)");
++        Matcher matcher = pattern.matcher(stdout);
++
++        if (!matcher.find()) {
++            throw new RuntimeException("Cannot find pid");
++        }
++        // For single-command training, pid will be from -Xlog of the first process (the training process).
++        // %p should not be substituted with the pid of the second process (the assembly process).
++        String pid = matcher.group(1);
++        String fileName = prefix + "pid" + pid + suffix;
++        File file = new File(fileName);
++        if (!file.exists()) {
++            throw new RuntimeException("Expected file doesn't exist: " + fileName);
++        }
++        if (!file.isFile()) {
++            throw new RuntimeException("Expected to be a file: " + fileName);
++        }
++        return fileName;
++    }
++
++    static int testNum = 0;
++    static void printTestCase(String s) {
++        System.out.println("vvvvvvv TEST CASE " + testNum + ": " + s + ": starts here vvvvvvv");
++        testNum++;
++    }
++}
+diff --git a/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/JDK_AOT_VM_OPTIONS.java b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/JDK_AOT_VM_OPTIONS.java
+new file mode 100644
+index 00000000000..e7ac72b4d38
+--- /dev/null
++++ b/test/hotspot/jtreg/runtime/cds/appcds/aotFlags/JDK_AOT_VM_OPTIONS.java
+@@ -0,0 +1,139 @@
++/*
++ * Copyright (c) 2025, Oracle and/or its affiliates. All rights reserved.
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
++ *
++ * This code is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 only, as
++ * published by the Free Software Foundation.
++ *
++ * This code is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * version 2 for more details (a copy is included in the LICENSE file that
++ * accompanied this code).
++ *
++ * You should have received a copy of the GNU General Public License version
++ * 2 along with this work; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
++ * or visit www.oracle.com if you need additional information or have any
++ * questions.
++ *
++ */
++
++/*
++ * @test
++ * @summary JDK_AOT_VM_OPTIONS environment variable
++ * @requires vm.cds
++ * @requires vm.flagless
++ * @library /test/lib /test/hotspot/jtreg/runtime/cds/appcds/test-classes
++ * @build Hello
++ * @run driver jdk.test.lib.helpers.ClassFileInstaller -jar hello.jar Hello
++ * @run driver JDK_AOT_VM_OPTIONS
++ */
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import jdk.test.lib.cds.CDSTestUtils;
++import jdk.test.lib.helpers.ClassFileInstaller;
++import jdk.test.lib.process.OutputAnalyzer;
++import jdk.test.lib.process.ProcessTools;
++
++public class JDK_AOT_VM_OPTIONS {
++    static String appJar = ClassFileInstaller.getJarPath("hello.jar");
++    static String aotConfigFile = "hello.aotconfig";
++    static String aotCacheFile = "hello.aot";
++    static String helloClass = "Hello";
++
++    public static void main(String[] args) throws Exception {
++        ProcessBuilder pb;
++        OutputAnalyzer out;
++
++        //----------------------------------------------------------------------
++        printTestCase("JDK_AOT_VM_OPTIONS (single-command training)");
++
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTCacheOutput=" + aotCacheFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++        // The "-Xshare:off" below should be treated as part of a property value and not
++        // a VM option by itself
++        pb.environment().put("JDK_AOT_VM_OPTIONS", "-Dsome.option='foo -Xshare:off ' -Xmx512m -XX:-AOTClassLinking");
++        out = CDSTestUtils.executeAndLog(pb, "ontstep-train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTCache creation is complete: hello.aot");
++        out.shouldContain("Picked up JDK_AOT_VM_OPTIONS: -Dsome.option='foo -Xshare:off '");
++        checkAOTClassLinkingDisabled(out);
++
++        //----------------------------------------------------------------------
++        printTestCase("JDK_AOT_VM_OPTIONS (two-command training)");
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=record",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-Xlog:aot=debug",
++            "-cp", appJar, helloClass);
++
++        out = CDSTestUtils.executeAndLog(pb, "train");
++        out.shouldContain("Hello World");
++        out.shouldContain("AOTConfiguration recorded: " + aotConfigFile);
++        out.shouldHaveExitValue(0);
++
++        //----------------------------------------------------------------------
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=" + aotCacheFile,
++            "-Xlog:aot",
++            "-cp", appJar);
++        pb.environment().put("JDK_AOT_VM_OPTIONS", "-XX:-AOTClassLinking");
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        out.shouldContain("Picked up JDK_AOT_VM_OPTIONS:");
++        checkAOTClassLinkingDisabled(out);
++
++        //----------------------------------------------------------------------
++        printTestCase("JDK_AOT_VM_OPTIONS (with AOTMode specified in -XX:VMOptionsFile)");
++        String optionsFile = "opts.txt";
++        Files.writeString(Path.of(optionsFile), "-XX:AOTMode=create");
++
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:VMOptionsFile=" + optionsFile,
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=" + aotCacheFile,
++            "-Xlog:aot",
++            "-cp", appJar);
++        pb.environment().put("JDK_AOT_VM_OPTIONS", "-XX:-AOTClassLinking");
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        out.shouldContain("Picked up JDK_AOT_VM_OPTIONS:");
++        checkAOTClassLinkingDisabled(out);
++
++        //----------------------------------------------------------------------
++        printTestCase("Using -XX:VMOptionsFile inside JDK_AOT_VM_OPTIONS)");
++        Files.writeString(Path.of(optionsFile), "-XX:-AOTClassLinking");
++
++        pb = ProcessTools.createLimitedTestJavaProcessBuilder(
++            "-XX:AOTMode=create",
++            "-XX:AOTConfiguration=" + aotConfigFile,
++            "-XX:AOTCache=" + aotCacheFile,
++            "-Xlog:aot",
++            "-cp", appJar);
++        pb.environment().put("JDK_AOT_VM_OPTIONS", "-XX:VMOptionsFile="  + optionsFile);
++        out = CDSTestUtils.executeAndLog(pb, "asm");
++        out.shouldContain("Picked up JDK_AOT_VM_OPTIONS:");
++        checkAOTClassLinkingDisabled(out);
++    }
++
++    static void checkAOTClassLinkingDisabled(OutputAnalyzer out) {
++        out.shouldMatch("aot-linked =[ ]+0,"); // -XX:-AOTClassLinking should take effect
++        out.shouldNotMatch("aot-linked =[ ]+[1-9]");
++        out.shouldHaveExitValue(0);
++    }
++
++    static int testNum = 0;
++    static void printTestCase(String s) {
++        System.out.println("vvvvvvv TEST CASE " + testNum + ": " + s + ": starts here vvvvvvv");
++        testNum++;
++    }
++}
+diff --git a/test/lib/jdk/test/lib/cds/CDSAppTester.java b/test/lib/jdk/test/lib/cds/CDSAppTester.java
+index edda9d45efa..7e98b57cb83 100644
+--- a/test/lib/jdk/test/lib/cds/CDSAppTester.java
++++ b/test/lib/jdk/test/lib/cds/CDSAppTester.java
+@@ -35,7 +35,12 @@ import jtreg.SkippedException;
+  * This is a base class used for testing CDS functionalities with complex applications.
+  * You can define the application by overridding the vmArgs(), classpath() and appCommandLine()
+  * methods. Application-specific validation checks can be implemented with checkExecution().
+-*/
++ *
++ * The AOT workflow runs with one-step training by default. For debugging purposes, run
++ * jtreg with -vmoption:-DCDSAppTester.two.step.training=true. This will run -XX:AOTMode=record
++ * and -XX:AOTMode=record in two separate processes that you can rerun easily inside a debugger.
++ * Also, the log files are easier to read.
++ */
+ abstract public class CDSAppTester {
+     private final String name;
+     private final String classListFile;
+@@ -51,7 +56,15 @@ abstract public class CDSAppTester {
+     private final String tempBaseArchiveFile;
+     private int numProductionRuns = 0;
+     private String whiteBoxJar = null;
+-
++    private boolean inOneStepTraining = false;
++
++    /**
++     * All files created in the CDS/AOT workflow will be name + extension. E.g.
++     * - name.aot
++     * - name.aotconfig
++     * - name.classlist
++     * - name.jsa
++     */
+     public CDSAppTester(String name) {
+         if (CDSTestUtils.DYNAMIC_DUMP) {
+             throw new SkippedException("Tests based on CDSAppTester should be excluded when -Dtest.dynamic.cds.archive is specified");
+@@ -59,26 +72,32 @@ abstract public class CDSAppTester {
+ 
+         this.name = name;
+         classListFile = name() + ".classlist";
+-        classListFileLog = classListFile + ".log";
++        classListFileLog = logFileName(classListFile);
+         aotConfigurationFile = name() + ".aotconfig";
+-        aotConfigurationFileLog = aotConfigurationFile + ".log";
++        aotConfigurationFileLog = logFileName(aotConfigurationFile);
+         staticArchiveFile = name() + ".static.jsa";
+-        staticArchiveFileLog = staticArchiveFile + ".log";
++        staticArchiveFileLog = logFileName(staticArchiveFile);
+         aotCacheFile = name() + ".aot";
+-        aotCacheFileLog = aotCacheFile + ".log";
++        aotCacheFileLog = logFileName(aotCacheFile);;
+         dynamicArchiveFile = name() + ".dynamic.jsa";
+-        dynamicArchiveFileLog = dynamicArchiveFile + ".log";
++        dynamicArchiveFileLog = logFileName(dynamicArchiveFile);
+         tempBaseArchiveFile = name() + ".temp-base.jsa";
+     }
+ 
+     private String productionRunLog() {
+         if (numProductionRuns == 0) {
+-            return name() + ".production.log";
++            return logFileName(name() + ".production");
+         } else {
+-            return name() + ".production." + numProductionRuns + ".log";
++            return logFileName(name() + ".production." + numProductionRuns);
+         }
+     }
+ 
++    private static String logFileName(String file) {
++        file = file.replace("\"", "%22");
++        file = file.replace("'", "%27");
++        return file + ".log";
++    }
++
+     private enum Workflow {
+         STATIC,        // classic -Xshare:dump workflow
+         DYNAMIC,       // classic -XX:ArchiveClassesAtExit
+@@ -168,12 +187,11 @@ abstract public class CDSAppTester {
+     }
+ 
+     private String logToFile(String logFile, String... logTags) {
+-        StringBuilder sb = new StringBuilder("-Xlog:");
+-        String prefix = "";
++        StringBuilder sb = new StringBuilder("-Xlog:arguments");
++        String prefix = ",";
+         for (String tag : logTags) {
+             sb.append(prefix);
+             sb.append(tag);
+-            prefix = ",";
+         }
+         sb.append(":file=" + logFile + "::filesize=0");
+         return sb.toString();
+@@ -250,6 +268,22 @@ abstract public class CDSAppTester {
+         return executeAndCheck(cmdLine, runMode, aotConfigurationFile, aotConfigurationFileLog);
+     }
+ 
++    private OutputAnalyzer createAOTCacheOneStep() throws Exception {
++        RunMode runMode = RunMode.TRAINING;
++        String[] cmdLine = StringArrayUtils.concat(vmArgs(runMode),
++                                                   "-XX:AOTMode=record",
++                                                   "-XX:AOTCacheOutput=" + aotCacheFile,
++                                                   logToFile(aotCacheFileLog,
++                                                             "class+load=debug",
++                                                             "cds=debug",
++                                                             "cds+class=debug"));
++        cmdLine = addCommonVMArgs(runMode, cmdLine);
++        cmdLine = StringArrayUtils.concat(cmdLine, appCommandLine(runMode));
++        OutputAnalyzer out =  executeAndCheck(cmdLine, runMode, aotCacheFile, aotCacheFileLog);
++        listOutputFile(aotCacheFileLog + ".0"); // the log file for the training run
++        return out;
++    }
++
+     private OutputAnalyzer createClassList() throws Exception {
+         RunMode runMode = RunMode.TRAINING;
+         String[] cmdLine = StringArrayUtils.concat(vmArgs(runMode),
+@@ -396,14 +430,14 @@ abstract public class CDSAppTester {
+     }
+ 
+     public void run(String... args) throws Exception {
+-        String err = "Must have exactly one command line argument of the following: ";
++        String err = "Must have at least one command line argument of the following: ";
+         String prefix = "";
+         for (Workflow wf : Workflow.values()) {
+             err += prefix;
+             err += wf;
+             prefix = ", ";
+         }
+-        if (args.length != 1) {
++        if (args.length < 1) {
+             throw new RuntimeException(err);
+         } else {
+             if (args[0].equals("STATIC")) {
+@@ -411,7 +445,7 @@ abstract public class CDSAppTester {
+             } else if (args[0].equals("DYNAMIC")) {
+                 runDynamicWorkflow();
+             } else if (args[0].equals("AOT")) {
+-                runAOTWorkflow();
++                runAOTWorkflow(args);
+             } else {
+                 throw new RuntimeException(err);
+             }
+@@ -432,10 +466,37 @@ abstract public class CDSAppTester {
+     }
+ 
+     // See JEP 483
+-    public void runAOTWorkflow() throws Exception {
++    public void runAOTWorkflow(String... args) throws Exception {
+         this.workflow = Workflow.AOT;
+-        recordAOTConfiguration();
+-        createAOTCache();
++        boolean oneStepTraining = true; // by default use onestep trainning
++
++        if (System.getProperty("CDSAppTester.two.step.training") != null) {
++            oneStepTraining = false;
++        }
++
++        if (args.length > 1) {
++            // Tests such as test/hotspot/jtreg/runtime/cds/appcds/aotCache/SpecialCacheNames.java
++            // use --one-step-training or --two-step-training to force a certain training workflow.
++            if (args[1].equals("--one-step-training")) {
++                oneStepTraining = true;
++            } else if (args[1].equals("--two-step-training")) {
++                oneStepTraining = false;
++            } else {
++                throw new RuntimeException("Unknown option: " + args[1]);
++            }
++        }
++
++        if (oneStepTraining) {
++            try {
++                inOneStepTraining = true;
++                createAOTCacheOneStep();
++            } finally {
++                inOneStepTraining = false;
++            }
++        } else {
++            recordAOTConfiguration();
++            createAOTCache();
++        }
+         productionRun();
+     }
+ 
+diff --git a/test/setup_aot/TestSetupAOT.java b/test/setup_aot/TestSetupAOT.java
+index e078279e716..a46bd6e66c7 100644
+--- a/test/setup_aot/TestSetupAOT.java
++++ b/test/setup_aot/TestSetupAOT.java
+@@ -41,7 +41,12 @@ import static java.util.stream.Collectors.*;
+ // This program is executed by make/RunTests.gmk to support running HotSpot tests
+ // in the "AOT mode", for example:
+ //
+-//     make test JTREG=AOT_JDK=true TEST=open/test/hotspot/jtreg/runtime/invokedynamic
++//     make test JTREG=AOT_JDK=onestep TEST=open/test/hotspot/jtreg/runtime/invokedynamic
++//     make test JTREG=AOT_JDK=twostep TEST=open/test/hotspot/jtreg/runtime/invokedynamic
++//
++// The onestep and twostep options specify whether the AOT cache is created with
++// a single JVM command (java -XX:AOTMode=record -XX:AOTCacheOutput=jdk.aotcache ...) or
++// two JVM commands (java -XX:AOTMode=record ...; java -XX:AOTMode=create -XX:AOTCache=jdk.aotcache ...)
+ //
+ // All JDK classes touched by this program will be stored into a customized AOT cache.
+ // This is a larger set of classes than those stored in the JDK's default CDS archive.

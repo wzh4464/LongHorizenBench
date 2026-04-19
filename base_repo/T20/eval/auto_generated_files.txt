@@ -1,0 +1,15 @@
+Include/internal/pycore_ast.h
+Include/internal/pycore_ast_state.h
+Include/internal/pycore_global_objects_fini_generated.h
+Include/internal/pycore_global_strings.h
+Include/internal/pycore_intrinsics.h
+Include/internal/pycore_opcode.h
+Include/internal/pycore_runtime_init_generated.h
+Include/internal/pycore_unicodeobject_generated.h
+Include/opcode.h
+Lib/keyword.py
+Modules/Setup.stdlib.in
+Parser/parser.c
+Python/Python-ast.c
+Python/generated_cases.c.h
+Python/opcode_metadata.h

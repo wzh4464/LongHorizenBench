@@ -1,0 +1,74 @@
+diff --git a/mindspeed/core/fusions/fused_moe_permute.py b/mindspeed/core/fusions/fused_moe_permute.py
+index fa1fb83..3f78a7e 100644
+--- a/mindspeed/core/fusions/fused_moe_permute.py
++++ b/mindspeed/core/fusions/fused_moe_permute.py
+@@ -11,12 +11,7 @@ from megatron.core.transformer.moe.moe_utils import unpermute as megatron_unperm
+ from megatron.core import parallel_state, tensor_parallel
+ from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
+ from mindspeed.te.pytorch.permutation import MoePermuteMaskMap, MoeUnpermuteMaskMap
+-
+-try:
+-    import triton
+-    _HAS_TRITON = True
+-except ImportError:
+-    _HAS_TRITON = False
++from mindspeed.utils import has_triton
+ 
+ 
+ def convert_tensors_to_fp32_if_needed(
+@@ -109,7 +104,7 @@ def moe_alltoall_token_dispatcher_init_wrapper(fn):
+             self, num_local_experts, local_expert_indices, config
+     ) -> None:
+         fn(self, num_local_experts, local_expert_indices, config)
+-        if _HAS_TRITON and self.config.moe_permute_fusion:
++        if has_triton() and self.config.moe_permute_fusion:
+             self.permute_idx_device = torch.device("npu") 
+         else:
+             # Since fused_sort_chunks_by_index is not currently supported, set self.permute_idx_device to None
+diff --git a/mindspeed/core/transformer/moe/moe_feature/overlap/token_dispatcher.py b/mindspeed/core/transformer/moe/moe_feature/overlap/token_dispatcher.py
+index 54858cd..c46de80 100644
+--- a/mindspeed/core/transformer/moe/moe_feature/overlap/token_dispatcher.py
++++ b/mindspeed/core/transformer/moe/moe_feature/overlap/token_dispatcher.py
+@@ -32,6 +32,8 @@ from mindspeed.core.transformer.moe.moe_feature.overlap.comm_utils import (
+     async_alltoall_with_backward,
+     async_reduce_scatter
+     )
++from mindspeed.utils import has_triton
++
+ 
+ """ We use the following notation throughout this file:
+      H: hidden size
+@@ -208,7 +210,9 @@ class MoEAlltoAllSeqOverLapDispatcher:
+         def alltoall_token_permutation2(global_input_tokens, global_probs, permute1_probs_handle=None):
+             # Permutation 2: Sort tokens by local expert.
+             if self.num_local_experts > 1:
+-                if self.config.moe_permute_fusion:
++                if self.config.moe_permute_fusion and has_triton():
++                    if permute1_probs_handle:
++                        permute1_probs_handle.wait()
+                     global_input_tokens, global_probs = sort_chunks_by_idxs(
+                         global_input_tokens,
+                         self.num_global_tokens_per_local_expert_cpu.ravel(),
+diff --git a/mindspeed/utils.py b/mindspeed/utils.py
+index 3c19d02..af11f25 100644
+--- a/mindspeed/utils.py
++++ b/mindspeed/utils.py
+@@ -40,6 +40,18 @@ _POSITION_IDS = None
+ _REARRANGE_IDX_TENSOR = None
+ _KV_INDEX = None
+ _Q_INDEX = None
++_HAS_TRITON = None
++
++
++def has_triton():
++    global _HAS_TRITON
++    if _HAS_TRITON is None:
++        try:
++            import triton
++            _HAS_TRITON = True
++        except ImportError:
++            _HAS_TRITON = False
++    return _HAS_TRITON
+ 
+ 
+ def generate_rearrange_idx_tensor(tp_y_cp_size):

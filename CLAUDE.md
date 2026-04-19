@@ -4,14 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-An evaluation benchmark for an ASE 2026 Industry Showcase paper, measuring how well LLM-based coding agents implement real features from industrial codebases (Huawei CANN, MindSpeed, torch_npu) and open-source projects (Kubernetes). There is no buildable application — this repo contains evaluation infrastructure, experiment data, and the LaTeX manuscript.
+An evaluation benchmark for an ASE 2026 Industry Showcase paper, measuring how well LLM-based coding agents implement real features from industrial codebases (Huawei CANN, MindSpeed, torch_npu) and open-source projects (Kubernetes, Kafka, Airflow, etc.). There is no buildable application — this repo contains evaluation infrastructure, experiment data, and the LaTeX manuscript.
 
-**Key finding**: 17.6% overall PASS rate across 119 experiments. Best config: Codex gpt-5.4 (37.5% PASS); worst: MiniMax (0% PASS).
+**62 tasks total**: 12 original (C1-C5, M1-M3, K1-K4) + 50 CapBench (T01-T50) from 15 OSS projects.
 
 ## Key Documents
 
-- `GUIDE.md` — authoritative technical reference (task registry with commit SHAs, sanitization protocol, full evaluation pipeline)
-- `experiment/README.md` — experiment directory layout and how to view results
+- `GUIDE.md` — authoritative technical reference (task registry with commit SHAs, sanitization protocol, full evaluation pipeline, scoring rubric, anti-cheating audit details)
+- `docs/PROJECT_KNOWLEDGE.md` — project context, layout, workflow ground rules, current state of base_repo
+- `docs/CAPBENCH_CLASSIFICATION_TODO.md` — HW/AG classification work order for 41 unclassified CapBench tasks
 - `experiment_plan.md` — frozen experiment design matrix
 - `paper2/` — LaTeX manuscript (`paper2/main.tex` + `paper2/sections/*.tex`)
 
@@ -27,18 +28,39 @@ python3 experiment/build_scores_csv.py
 # Run anti-cheating audit over experiment logs
 python3 experiment/audit_cheating.py
 
-# Check batch runner status
-bash experiment/run_codex_all.sh --status
-bash experiment/run_minimax_all.sh --status
+# Run a single Codex experiment (uses base_repo tasks)
+bash experiment/run_codex_experiment.sh
 
-# Run evaluation for a single task
-bash experiment/run_codex_all.sh --task C1
+# Batch run: Codex (all 62 tasks × 2 prompts)
+bash experiment/run_batch.sh batch1_experiments.txt [parallel_count]
+
+# Batch run: Claude Code
+bash experiment/run_claude_batch.sh [parallel] [limit]
+
+# Batch run: Cursor
+bash experiment/run_cursor_batch.sh
+
+# Batch evaluation (opencode + minimax evaluator)
+bash experiment/run_eval_batch.sh [parallel]
+bash experiment/run_eval_codex.sh
+
+# Docker-isolated experiment run
+bash experiment/run_isolated_batch.sh [parallel]
+
+# Monitor running experiments
+bash experiment/monitor_experiments.sh
+
+# Diagnose a Claude session (detect brainstorming traps, unanswered questions)
+python3 experiment/diagnose_session.py <experiment_dir>
+
+# Check for GT pre-application contamination bug
+bash experiment/check_gt_preapplied.sh
+
+# Validate HW/AG classification files
+python3 scripts/verify_classification.py
 
 # Build paper PDF
 cd paper2 && pdflatex main && bibtex main && pdflatex main && pdflatex main
-
-# Create sanitized experiment repo from source
-bash experiment/sanitize_repo.sh <source_repo> <dest_dir> <parent_commit> <gt_commit>
 
 # Build CapBench task directories from capbench_sampled.csv
 python3 _build_capbench_tasks.py
@@ -47,62 +69,61 @@ python3 _build_capbench_tasks.py
 ## Repository Structure
 
 ```
+base_repo/{task_id}/               # 62 canonical task definitions (sanitized)
+├── repo/                          # Git checkout at parent commit (remotes stripped, GT unreachable)
+├── prompts/{long,short}.md        # Task prompts (short = summary, long = design hints)
+└── eval/
+    ├── gt_diff.patch              # Ground truth diff
+    ├── gt_files.txt               # All files changed in GT
+    ├── handwritten_files.txt      # HW subset (human-authored, gates PASS/FAIL)
+    └── auto_generated_files.txt   # AG subset (protobuf, lockfiles, snapshots — informational only)
+
 experiment/
-├── {prefix}-{task}-{config}-{prompt}/  # 108+ experiment repos (each is a git repo)
-├── eval_results/{task}-{config}-{prompt}/  # Eval output per experiment
-│   ├── eval_report.md, coverage.json, ground_truth.diff, generated.diff
-│   ├── gt_files.txt, gen_files.txt
-├── prompts/                           # 24 prompt files ({task}-{short,long}.md)
-├── all_scores.csv                     # Unified results (129 rows), rebuilt by build_scores_csv.py
-├── build_scores_csv.py                # Parses eval_report.md → CSV
-├── audit_cheating.py                  # Scans logs for GT leakage (cherry-pick, web, etc.)
-├── run_codex_all.sh                   # Batch runner: Codex (12-way parallel)
-├── run_minimax_all.sh                 # Batch runner: MiniMax
-├── sanitize_repo.sh                   # Canonical repo sanitization script
-├── bin/gh                             # Fake gh binary (blocks API access during experiments)
-base_repo/{task_id}/                   # Canonical task repos (sanitized)
-├── repo/                              # Git repo at parent commit
-├── eval/                              # handwritten_files.txt, auto_generated_files.txt
-├── prompts/                           # Task prompts
-source_repos/                          # Full clones of upstream repos (for building tasks)
-paper2/                                # LaTeX manuscript
+├── {task}-{config}-{prompt}[-{date}]/  # Per-run experiment repos (each is a git repo)
+├── eval_results/{task}-{config}-{prompt}/  # Eval output (eval_report.md, coverage.json, diffs)
+├── prompts/                       # Legacy prompt files ({task}-{short,long}.md)
+├── all_scores.csv                 # Unified results, rebuilt by build_scores_csv.py
+├── bin/gh                         # Fake gh binary (blocks GitHub API during experiments)
+├── run_batch.sh                   # Codex batch runner
+├── run_claude_batch.sh            # Claude Code batch runner
+├── run_cursor_batch.sh            # Cursor batch runner
+├── run_eval_batch.sh              # Evaluation batch runner
+├── run_isolated_batch.sh          # Docker-isolated runner
+└── *.py                           # audit_cheating, build_scores_csv, diagnose_session
+
+source_repos/                      # Full clones of upstream repos (for building tasks)
+paper2/                            # LaTeX manuscript
   main.tex, sections/*.tex, references.bib
 ```
 
-## Task Registry (12 tasks)
+## Task Registry
 
-| ID | Repo | Complexity | Lang | GT Files | HW Files |
-|----|------|-----------|------|----------|----------|
-| C1 | cann-ops-adv | Low | C++ | 1 | 1 |
-| C2 | cann-ops | Low | C++ | 4 | 4 |
-| C3 | torch_npu | Medium | Python | 9 | 9 |
-| C4 | cann-ops | Medium | C++ | 24 | 24 |
-| C5 | cann-ops | High | C++ | 27 | 25 |
-| M1 | MindSpeed | Low | Python | 3 | 3 |
-| M2 | MindSpeed | Medium | Python | 6 | 6 |
-| M3 | MindSpeed | High | Python | 10 | 10 |
-| K1 | kubernetes | Low | Go | 13 | 13 |
-| K2 | kubernetes | Medium | Go | 35 | 12 |
-| K3 | kubernetes | Medium | Go | 49 | 13 |
-| K4 | kubernetes | High | Go | 98 | 58 |
+| ID Range | Repo | Complexity | Lang | Count |
+|----------|------|-----------|------|-------|
+| C1-C5 | cann-ops / cann-ops-adv / torch_npu | Low-High | C++/Python | 5 |
+| M1-M3 | MindSpeed | Low-High | Python | 3 |
+| K1-K4 | kubernetes | Low-High | Go | 4 |
+| T01-T50 | 15 OSS repos (Kafka, CPython, Airflow, K8s, etc.) | Mixed | Java/Python/Go | 50 |
+
+Full task details (commit SHAs, GT lines, file counts) are in `GUIDE.md` §2.
 
 ## Agent Configurations
 
 | Config | Agent | Model | Notes |
 |--------|-------|-------|-------|
-| A1 | Claude Code | Sonnet 4.6 | No harness, legacy naming (no config suffix) |
-| A2 | Claude Code | Opus 4.6 | No harness |
-| A3 | Claude Code | Opus 4.6 | + Loops harness (syntax/structure validation) |
-| codex | Codex CLI | gpt-5.4 (o3) | No harness |
-| minimax/opencode | OpenCode | MiniMax M2.5 | No harness |
+| A1 | Claude Code | Sonnet 4.6 | Legacy naming (no config suffix) |
+| A2 | Claude Code | Opus 4.6 | Standard |
+| A3 | Claude Code | Opus 4.6 | + Loops harness (syntax/structure validation, up to 3 rounds) |
+| codex | Codex CLI | gpt-5.4 | `codex exec --full-auto`, web_search disabled |
+| minimax/opencode | OpenCode | MiniMax M2.5 | Via OpenRouter |
 
 ## Experiment Naming
 
-Pattern: `{prefix}-{task}-{config}-{prompt}` e.g. `cann-ops-C4-A2-long`
+**Current pattern**: `{task}-{config}-{prompt}-{date}` e.g. `C4-codex-gpt-5_4-long-2026-04-12`
 
-Prefix mapping: C1 → `cann-ops-adv`, C2/C4/C5 → `cann-ops`, C3 → `torch_npu`, M1-M3 → `MindSpeed`, K1-K4 → `kubernetes`
+**Legacy pattern**: `{prefix}-{task}-{config}-{prompt}` e.g. `cann-ops-C4-A2-long`
 
-Legacy A1 repos use older naming without config suffix: `{prefix}-{task}-{prompt}`
+Legacy prefix mapping: C1 → `cann-ops-adv`, C2/C4/C5 → `cann-ops`, C3 → `torch_npu`, M1-M3 → `MindSpeed`, K1-K4 → `kubernetes`. A1 repos omit the config suffix entirely.
 
 ## Scoring
 
@@ -113,17 +134,46 @@ Three dimensions (0-5 each):
 
 **Verdict rules**: PASS = A≥4 AND B≥4 AND C≥3; FAIL = A≤1 OR destructive; PARTIAL = otherwise.
 
+### HW/AG File Classification (Critical for Scoring)
+
+Each task's `gt_files.txt` is split into **handwritten** (HW) and **auto-generated** (AG) files. Only HW files gate the PASS/FAIL verdict. AG files (protobuf stubs, lockfiles, `zz_generated_*`, snapshots) are noted but don't lower scores.
+
+- The split lives in `base_repo/<task>/eval/{handwritten,auto_generated}_files.txt`
+- If `handwritten_files.txt == gt_files.txt` and `auto_generated_files.txt` is empty, the task is **unclassified** — scoring will be inflated
+- 12 original tasks + 9 CapBench tasks are classified; 41 CapBench tasks remain unclassified (see `docs/CAPBENCH_CLASSIFICATION_TODO.md`)
+
 ## Experiment Repo Sanitization (Critical)
 
-All experiment repos must have GT commit unreachable. The `experiment/sanitize_repo.sh` script handles this:
-1. Clone source → checkout parent commit (detached HEAD)
-2. Remove `origin` remote, delete all branches/tags pointing to future commits
-3. `git reflog expire --all && git gc --prune=now --aggressive`
-4. Verify: `git cat-file -e <GT_SHA>` must fail
-5. Block `gh` CLI via `experiment/bin/gh` fake binary on PATH
+All experiment repos must have GT commit unreachable. Two methods:
+
+1. **C/M repos**: Clone with history up to parent, remove branches/tags/remotes pointing beyond, `git gc --prune=now`. Verify: `git cat-file -e <GT_SHA>` must fail.
+2. **K repos**: `git archive` parent into a fresh single-commit repo (no history at all).
 
 **Why**: gpt-5.4 cherry-picked the GT commit from full git history on unsanitized K4 (98/98 file coverage). All repos were rebuilt after discovery.
 
+Additional measures: `experiment/bin/gh` fake binary on PATH blocks `gh pr view`; prompt preamble forbids GitHub API access.
+
+## Local Skills
+
+This repo vendors evaluation skills in `.claude/skills/` and `.codex/skills/`:
+
+| Skill | Purpose |
+|-------|---------|
+| `diff-eval-local` | Score agent output against GT diff + handwritten file list |
+| `diff-eval-claude` | Batch eval using Claude Code agent team |
+| `diff-eval-codex` | Batch eval using Codex CLI |
+| `diff-eval-opencode` | Batch eval using OpenCode CLI |
+| `run-benchmark` | Parallel 4-agent benchmark run (Claude/Cursor/Codex/OpenCode) |
+| `run-k-benchmark` | Multi-agent team for parallel benchmark execution |
+
+## Coding Conventions
+
+- Python: 4-space indent, `snake_case`, `UPPER_SNAKE_CASE` for constants. Manage all Python with `uv`.
+- Bash: `#!/bin/bash`, `set -euo pipefail` when failure handling matters.
+- Prefer additive edits to scripts and docs. Do not hand-edit generated files in `eval_results/`.
+- Experiment timeout: always use 7200s for all agent runs (3600s caused M2-short timeout).
+- Always use `2>&1` when capturing agent output to merge stderr (fixes 0-byte JSONL capture).
+
 ## CapBench Extension
 
-`capbench_sampled.csv` defines additional benchmark tasks from open-source repos. `_build_capbench_tasks.py` builds `base_repo/` entries from `source_repos/` clones. Each task gets: `repo/` (sanitized git), `eval/` (GT diff, file lists), `prompts/` (short + long).
+`capbench_sampled.csv` (50 rows) defines benchmark tasks from 15 OSS repos (Kafka, CPython, Airflow, K8s, etc.). `_build_capbench_tasks.py` builds `base_repo/T{01-50}/` entries from `source_repos/` clones. Each task gets: `repo/` (sanitized git), `eval/` (GT diff, file lists), `prompts/` (short + long).

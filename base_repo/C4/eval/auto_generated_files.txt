@@ -1,0 +1,5 @@
+src/contrib/math/exp/docs/.gitkeep
+src/contrib/math/exp/examples/.gitkeep
+src/contrib/math/exp/opp_kernel_aicpu/.gitkeep
+src/contrib/math/exp/tests/st/.gitkeep
+src/contrib/math/exp/tests/ut/.gitkeep

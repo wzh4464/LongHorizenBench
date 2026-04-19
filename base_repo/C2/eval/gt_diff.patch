@@ -1,0 +1,107 @@
+diff --git a/src/norm/add_layer_norm/op_kernel/add_layer_norm_base.h b/src/norm/add_layer_norm/op_kernel/add_layer_norm_base.h
+index 8daede29..cdeaf49a 100644
+--- a/src/norm/add_layer_norm/op_kernel/add_layer_norm_base.h
++++ b/src/norm/add_layer_norm/op_kernel/add_layer_norm_base.h
+@@ -103,29 +103,8 @@ __aicore__ inline float ReduceSumFP32(const LocalTensor<float> &src_local, int32
+     assert(count <= MAX_REPEAT_TIMES * elementNumPerRep);
+ #endif
+     float value = 0.0;
+-#if __CCE_AICORE__ == 220
+-    if (g_coreType == AIV) {
+-        if (likely(repeatTimes > 0)) {
+-            AscendCUtils::SetMask<float>(elementNumPerRep);
+-            ReduceSum(src_local, src_local, src_local, repeatTimes);
+-            SetFlag<HardEvent::V_S>(EVENT_ID0);
+-            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+-            uint64_t acc_val = GetAccVal();
+-            value = *reinterpret_cast<float *>(&acc_val);
+-        }
+-        if (unlikely(tailCount != 0)) {
+-            AscendCUtils::SetMask<float>(tailCount);
+-            ReduceSum(src_local[bodyCount], src_local[bodyCount], src_local[bodyCount], 1);
+-            SetFlag<HardEvent::V_S>(EVENT_ID0);
+-            WaitFlag<HardEvent::V_S>(EVENT_ID0);
+-            uint64_t acc_val = GetAccVal();
+-            value += *reinterpret_cast<float *>(&acc_val);
+-        }
+-    }
+-#else
+     ReduceSum(src_local, src_local, src_local, count);
+     value = src_local.GetValue(0);
+-#endif
+     return value;
+ }
+ 
+diff --git a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_single_read.h b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_single_read.h
+index 20c38a4d..c8f359fa 100644
+--- a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_single_read.h
++++ b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_single_read.h
+@@ -31,6 +31,7 @@ constexpr int32_t CONSTANT_EIGHT = 8;
+ constexpr int32_t MAX_REPEAT_STRIDE = 255;
+ constexpr int32_t TMP_BUFFER_SIZE_0 = 16;
+ constexpr int32_t TMP_BUFFER_SIZE_1 = 128;
++constexpr int32_t COUNT_NUM = 64;
+ 
+ template <typename T, typename U, bool isDeterministic>
+ class LayerNormGradV3SingleRead {
+@@ -575,7 +576,8 @@ private:
+         AscendCUtils::SetMaskCount<float>();
+         SetVectorMask<float>(0, tilingData->colAlignV);
+         for (int64_t i = 0; i < curRowsNum; i++) {
+-            ReduceSum(src[i * tilingData->colAlignV], src[i * tilingData->colAlignV], src[i * tilingData->colAlignV], 1);
++            ReduceSum(src[i * tilingData->colAlignV], src[i * tilingData->colAlignV],
++                src[i * tilingData->colAlignV], COUNT_NUM);
+             PipeBarrier<PIPE_V>();
+             event_t eventVS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+             SetFlag<HardEvent::V_S>(eventVS);
+diff --git a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_transpose.h b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_transpose.h
+index cb7327ef..09fe9476 100644
+--- a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_transpose.h
++++ b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_transpose.h
+@@ -455,7 +455,8 @@ private:
+         AscendCUtils::SetMaskCount<float>();
+         SetVectorMask<float>(0, colLineElements);
+         for (int64_t i = 0; i < col; i++) {
+-            ReduceSum(srcTensor[i * colLineElements], srcTensor[i * colLineElements], srcTensor[i * colLineElements], 1);
++            ReduceSum(srcTensor[i * colLineElements], srcTensor[i * colLineElements],
++                srcTensor[i * colLineElements], COUNT_NUM);
+             PipeBarrier<PIPE_V>();
+             event_t eventVS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+             SetFlag<HardEvent::V_S>(eventVS);
+@@ -934,6 +935,7 @@ private:
+     constexpr static uint32_t B16_BLOCK_ALIGN_NUM = 16;
+     constexpr static uint32_t TWO_NUM = 2;
+     constexpr static uint16_t SYNC_AIV_ONLY_ALL = 14;
++    constexpr static uint32_t COUNT_NUM = 64;
+ 
+     TPipe pipe;
+     TQue<QuePosition::VECIN, 1> inQueueDy;
+diff --git a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_workspace.h b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_workspace.h
+index f32a52d7..90004766 100644
+--- a/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_workspace.h
++++ b/src/norm/layer_norm_grad_v3/op_kernel/layer_norm_grad_v3_workspace.h
+@@ -21,6 +21,7 @@
+ 
+ namespace LayerNormGradV3 {
+ using namespace AscendC;
++
+ template <typename T, typename U, bool isDeterministic>
+ class LayerNormGradV3Workspace {
+ public:
+@@ -232,7 +233,7 @@ public:
+     {
+         AscendCUtils::SetMaskCount<float>();
+         SetVectorMask<float>(0, reduceNum);
+-        ReduceSum(src, src, src, 1);
++        ReduceSum(src, src, src, COUNT_NUM);
+         event_t eventVS = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_S));
+         SetFlag<HardEvent::V_S>(eventVS);
+         WaitFlag<HardEvent::V_S>(eventVS);
+@@ -370,6 +371,7 @@ public:
+ private:
+     constexpr static int64_t WORKSPACE_NUM = 4;
+     constexpr static uint16_t SYNC_AIV_ONLY_ALL = 14;
++    constexpr static uint32_t COUNT_NUM = 64;
+ 
+     TPipe pipe;
+ 

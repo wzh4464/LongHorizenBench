@@ -1,0 +1,1303 @@
+diff --git a/docs/features/compress-dense.md b/docs/features/compress-dense.md
+deleted file mode 100644
+index b3d2a5c..0000000
+--- a/docs/features/compress-dense.md
++++ /dev/null
+@@ -1,113 +0,0 @@
+-# compress-dense
+-
+-## 背景与挑战
+-
+-当训练使能不同PP并行策略时，pp_stage=0的情况下，多个warmup阶段所保存的激活值会导致首节点与尾节点内存不均衡。
+-
+-当存在减小内存的需求时，可以针对首节点dense层激活值进行压缩，以达到节省内存的目的。
+-
+-## 解决方案
+-
+-激活值在训练过程中属于高频使用的内存对象，前向产生反向释放，并且不同的并行策略会导致激活值的生命周期产生复杂的变化，因此需要合理并安全的设计可异步的无损压缩方案。通过使能compress-dense的特性，可以利用多流异步的方案实现对大量Dense-层激活值小代价的压缩，具体方法如下图所示：
+-
+-![Alt text](../../sources/images/compress_dense.png)
+-
+-## 使用方法
+-
+-当需要对Dense层MLP产生的激活值进行重计算时候，可通过在训练参数中增加`--compress-dense level1` 或者 `--compress-dense level0` 来使能特性，其中：
+-
+-- `--compress-dense level0` 只进行Vector压缩，节省空间较少，但是带来较小的性能开销。
+-- `--compress-dense level1` 在进行Vector压缩的同时，将部分结果swap到CPU上，节省空间较多，但是带来较大的性能开销。
+-
+-因此，建议在使用该特性时根据matmul的可掩盖时长来适当选择。
+-
+-
+-### 更一般的情况
+-
+-事实上，针对任意激活值都可以使用我们的多流异步的方法进行压缩，以达到较小代价便可节省激活值内存的目的。前提是需要找到适合做多流掩盖的计算块，比如大颗粒的矩阵乘（针对tensor的压缩仅用到aicore中的vector计算单元），或者未掩盖的通信部分。并且需要存在重复多层的情况，以便进行层级错位的压缩和解压缩。我们的方法也被抽象为3个步骤，在代码合适的地方加入三个步骤即可：
+-
+-```python
+-#1.Create an activation value compression management object and prepare a function for asynchronous compression.
+-self.ac = ActivationCompress(*args)
+-self.ac.compress_and_wait_decompress_async_for_previous_layer(x)
+-
+-#matmul operator
+-
+-#2.Prepare the asynchronous decompression function.
+-self.ac.decompress_and_wait_compress_async_for_previous_layer(x)
+-
+-#some operator
+-
+-#3.Record the forward and reverse sequence
+-self.ac.order_record(out)
+-
+-```
+-
+-以下是详细的使用示例：
+-
+-> **注：要使用激活值压缩特性，建议修改范围集中在某个forward内部， 这样可以尽量避免跨层耦合与绑定。**
+-
+-
+-
+-如下为一个简单模型的使用说明，假设我们希望对模型中第一个matmul产生的激活值进行无损压缩：
+-
+-定义一个简单三层神经网络 `SimpleModel`，其中每一层由`SimpleLayer`构成，每个Layer为 Linear + relu + Linear 模式。可以通过简单的四个步骤，使能我们的多流异步激活值压缩。
+-
+-第一步，在第一个Linear层之前，实例化一个`ActivationCompress`类并且调用`compress_and_wait_decompress_async_for_previous_layer` 函数，用于初始化compress tensor相关类以及开始压缩， 其中：
+-
+-- `train_args`：是一个训练中全局参数对象，如果是在Megatron训练框架下，直接传入 `get_args()` 即可。
+-- `"simplelayer_ctm"` ：是任意字符串，是对激活值压缩类的命名，推荐使用 "xx_ctm" 的模式。
+-
+-
+-第二步：在Liner层后，增加 `decompress_and_wait_compress_async_for_previous_layer` 函数，用于异步压缩的等待以及解压缩的触发, 接受的参数即为要压缩的对象(放在下一层压缩，因此不会影响当前层的计算)。
+-
+-第三步：插入 `order_record` 函数，用于记录压缩顺序。
+-
+-```python
+-class SimpleLayer(nn.Module):
+-
+-    def __init__(self, input_size, hidden_size, output_size):
+-        super(SimpleLayer, self).__init__()
+-        self.linear1 = nn.Linear(input_size, hidden_size)
+-        self.linear2 = nn.Linear(hidden_size, output_size)
+-    
+-    def forward(self, x):
+-        #1.Create an activation value compression management object and prepare a function for asynchronous compression.
+-        if not hasattr(self, "ac"):
+-            self.ac = ActivationCompress(train_args, "simplelayer_ctm")    
+-        self.ac.compress_and_wait_decompress_async_for_previous_layer(x)
+-        
+-        out = self.linear1(x)
+-        
+-        #2.Prepare the asynchronous decompression function.
+-        self.ac.decompress_and_wait_compress_async_for_previous_layer(out)
+-        
+-        out = F.relu(out)
+-        
+-        #3.Record the forward and reverse sequence
+-        self.ac.order_record(out)
+-        out = self.linear2(out)
+-        return out
+-
+-class SimpleModel(nn.Module):
+-
+-    def __init__(self, input_size=64, hidden_size=128, output_size=64):
+-        super(SimpleModel, self).__init__()
+-        self.input_size = input_size
+-        self.hidden_size = hidden_size
+-        self.output_size = output_size
+-        self.dense_layer = SimpleLayer(input_size, hidden_size, output_size)
+-        self.model = nn.Sequential(self.dense_layer, self.dense_layer, self.dense_layer)
+-
+-    def forward(self, x):
+-        out = self.model(x)
+-        return out
+-```
+-
+-可参考文件：`MindSpeed/tests_extend/unit_tests/features/compress_dense/test_compress_tensor.py`
+-
+-
+-## 注意事项 
+-
+-- 该特性匹配的 `CANN` 和 `torch_npu` 版本会在2025年第二季度发布版本。
+-- 当前和 `recompute_activation_function` 特性暂不兼容。
+diff --git a/docs/features/compress-tensor.md b/docs/features/compress-tensor.md
+new file mode 100644
+index 0000000..0fe57a7
+--- /dev/null
++++ b/docs/features/compress-tensor.md
+@@ -0,0 +1,46 @@
++# compress-activation
++
++## 背景与挑战
++
++随着序列长度增加激活值显存占比会逐渐增加，导致单卡峰值内存过高。
++
++因此我们开发了基于自研的昇腾无损压缩算子来压缩激活值占用内存，精度无损。当存在减小峰值内存的需求时，可以选择开启以下三个开关来开启内存压缩特性。
++- 特性一：`--compress-dense` 对MLP模块中第一个线性层所产生的激活值进行压缩。
++- 特性二：`--compress-activation` 对选定transformer layer所产生的激活值进行压缩。
++- 特性三：`--compress-optimizer` 对优化器的一/二阶动量进行压缩。
++
++## 解决方案
++- 特性一：
++记录首节点MLP执行顺序，对Dense层MLP模块产生的激活值使用多流异步的方式调用昇腾无损压缩算子进行内存压缩，由于该算子使用vector算力，能够和cube计算及通信做掩盖，压缩及解压缩过程本身基本不会导致性能劣化。具体方法如下图所示：
++![Alt text](../../sources/images/compress_dense.png)
++
++- 特性二：
++记录各卡transformer layer的执行顺序，对layer中产生的激活值做无损压缩。通过多流异步的方式调用昇腾无损压缩算子进行内存压缩，压缩算子使用vector算力，能够和cube计算及通信做掩盖，压缩及解压缩过程本身基本不会导致性能劣化。具体流程如下图所示：
++![compress_activation](../../sources/images/compress_activation.png)
++
++- 特性三：
++直接调用昇腾无损压缩算子对AdamW优化器的一/二阶动量进行未掩盖的压缩，会引入小幅度的性能劣化。
++
++## 使用场景
++
++训练内存不足的大模型训练场景。
++
++## 使用方法
++- 特性一：
++    `--compress-dense level0` 只进行Vector压缩，节省空间较少，带来极小的性能开销。
++    `--compress-dense level1` 在进行Vector压缩的同时，将部分结果swap到CPU上，节省空间较多，但是带来额外的性能开销。
++- 特性二：
++    `--compress-activation` 表示压缩哪些层产生的激活值，可配置为`1-3`或`1,2,3`，表示压缩1/2/3层产生的激活值，可配置为`1-3,5-8,10`表示压缩1/2/3/5/6/7/8/10层产生的激活值，也可配置为0表示压缩所有层，默认值为NULL。 
++- 特性三：
++    `--compress-optimizer` 是否压缩优化器的一/二阶动量，默认值为False。
++
++## 使用效果
++
++使用激活值压缩特性会降低峰值内存。使用优化器一/二阶动量压缩特性会因压缩/解压缩过程未掩盖而引入小幅度的额外性能劣化。在如llama，qwen等典型模型下，开启特性一/二平均内存收益在3%/7%。如：qwen3-8b模型在序列长度为8192，并行配置为PP4TP2CP1，开启特性二的情况下获得内存收益6.2%。
++
++
++
++## 使用约束
++
++- 特性二为特性一的迭代版本，两者不能同时开启。特性三可以与特性一或特性二同时开启。
++- 当前和 `recompute_activation_function` 特性暂不兼容。
+\ No newline at end of file
+diff --git a/mindspeed/core/memory/compress/adaptor.py b/mindspeed/core/memory/compress/adaptor.py
+new file mode 100644
+index 0000000..8c40b73
+--- /dev/null
++++ b/mindspeed/core/memory/compress/adaptor.py
+@@ -0,0 +1,99 @@
++# Copyright (c) 2025, Huawei Technologies Co., Ltd.  All rights reserved.
++
++import uuid
++from typing import Callable, List, Optional  # codecheck_ignore
++from functools import wraps, partial
++
++import torch
++from megatron.training import get_args
++
++from mindspeed.core.memory.compress.compress_optimizer import compress_optimizer_step_impl
++from mindspeed.core.memory.compress.compress_activation import CompressHook, GlobalContext, GlobalContextConfig
++
++
++def compress_optimizer_step(self, closure=None):
++    with torch.no_grad():
++        loss = compress_optimizer_step_impl(self, closure)
++    return loss
++
++
++def layer_forward_wrapper(forward) -> Callable:
++    """ Main enterence of adaptive activation compression.
++    """
++    @wraps(forward)
++    def wrapper(self, *args, **kwargs):
++        if self.layer_number not in get_args().compress_activation:
++            return forward(self, *args, **kwargs)
++        ctx = get_global_context()
++        ctx.statistic = get_statistic()
++        absolute_order = get_absolute_order(ctx)
++        if not hasattr(self, "layer_uuid"):
++            self.layer_uuid = uuid.uuid1()
++        order_layer_uuid = (self.layer_uuid, absolute_order)
++        ctx.pack_start(order_layer_uuid)
++        with CompressHook(order_layer_uuid, ctx):
++            result = forward(self, *args, **kwargs)
++        if result is None or result[0].grad_fn is None:
++            raise RuntimeError(
++                "Result is None or grad_fn is missing."
++                "Ensure the model is in training mode and gradients are enabled."
++            )
++        result[0].register_hook(partial(backward_start, order_layer_uuid))
++        return result
++    return wrapper
++
++
++def backward_start(order_layer_uuid, *unused) -> None:
++    get_global_context().unpack_start(order_layer_uuid)
++
++
++def get_global_context() -> GlobalContext:
++    args = get_args()
++    if not hasattr(args, "global_context"):
++        filter_funcs = [filter_func]
++        async_funcs = ["matmul", "allgather", "all2all"]
++        config = GlobalContextConfig(
++            get_moe_average_token_num(),
++            get_args().num_experts,
++            filter_funcs, 
++            async_funcs
++        )
++        setattr(args, "global_context", GlobalContext(config))
++    return args.global_context
++
++
++def get_statistic() -> int:
++    """ Determine whether each encoding requires re-statistical analysis of the PDF.
++    """
++    increment = get_args().curr_iteration - get_args().iteration
++    return increment <= 3 or increment % 100 == 0
++
++
++def get_moe_average_token_num() -> int:
++    """ Calculate the average number of tokens allocated per card 
++    for the MoE model based on configuration.
++    """
++    args = get_args()
++    return args.micro_batch_size * args.seq_length * args.tensor_model_parallel_size * args.moe_router_topk
++
++
++def get_absolute_order(ctx: GlobalContext) -> int:
++    is_first_step = (get_args().curr_iteration - get_args().iteration) == 0
++    return ctx.get_absolute_order(is_first_step)
++
++
++def filter_func(tensor: torch.Tensor) -> bool:
++    """ Exclude tensors that do not require compression.
++    """
++    if tensor.grad_fn is None:
++        return False
++    if tensor.dtype == torch.float32:
++        return False
++    if tensor.numel() == 0 or tensor.numel() % 64 != 0 or tensor.numel() < 32768:
++        return False
++    if tensor.storage().size() == 0 or tensor.storage_offset() != 0 \
++        or tensor.storage().size() != tensor.numel():
++        return False
++    if tensor.grad_fn and "CheckpointWithout" in str(tensor.grad_fn):
++        return False
++    return True
+diff --git a/mindspeed/core/memory/compress/compress_activation.py b/mindspeed/core/memory/compress/compress_activation.py
+new file mode 100644
+index 0000000..f5e2af9
+--- /dev/null
++++ b/mindspeed/core/memory/compress/compress_activation.py
+@@ -0,0 +1,429 @@
++# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
++
++from typing import Callable, List, Optional  # codecheck_ignore
++from collections import OrderedDict
++from dataclasses import dataclass, field
++from functools import wraps, partial
++from enum import Enum
++
++import torch
++import torch_npu
++
++from .utils import SimulationA2, ListNode, TensorState, TensorManager, ShareMemory
++
++
++@dataclass
++class GlobalContextConfig:
++    """ Global layer activation context config
++
++    Args:
++        filter_funcs: Function for filtering non-target activation values.
++        async_funcs: Names of operators that support asynchronous parallelism. (scalable)
++    """
++    moe_average_token_nums: int = 0
++    num_experts: int = 0
++    filter_funcs: List[Optional[Callable]] = field(default_factory=list)
++    async_funcs: List[Optional[str]] = field(default_factory=list)
++
++
++class ContextState(Enum):
++    """ Define the current context state.
++    """
++    FORWARD = "forward"
++    BACKWARD = "backward"
++
++
++class GlobalContext:
++    """ Global context for managing compressed tensors across layers in distributed training.
++    
++    Core Responsibilities:
++    - Manages lifecycle of compressed activations across model layers.
++    - Coordinates asynchronous compression/decompression during forward/backward passes.
++    - Handles shared memory allocation for tensor storage.
++    - Wraps critical operators (matmul/all2all/allgather) with compression logic.
++    """
++    def __init__(self, config: GlobalContextConfig) -> None:
++        self.config = config
++        self.simulation = SimulationA2()
++        self.layer_activation_managers = OrderedDict()
++        self.fwd_uuid_order = OrderedDict()
++        self.bwd_uuid_order = OrderedDict()
++        self.fwd_cur_layer_node = None
++        self.bwd_cur_layer_node = None
++        self.context_state = None
++        self.vice_stream = torch.cuda.Stream()
++        self.share_memorys = []
++        self.absolute_order = 0
++        self.lam_num = None
++        self.statistic = True
++        self.moe_average_token_nums = self.config.moe_average_token_nums
++        self._wrapper_async_func()
++
++    def get_absolute_order(self, is_first_step: bool) -> int:
++        """ Provide the absolute order ID of the current computation 
++        in the model forward pass.
++
++        Args:
++            is_first_step: Indicates whether the step is the first step.
++        """
++        if not is_first_step:
++            if self.lam_num is None:
++                self.lam_num = self.absolute_order
++        if self.lam_num is not None:
++            self.absolute_order = self.absolute_order % self.lam_num
++        self.absolute_order += 1
++        return self.absolute_order
++        
++    def filters(self, tensor) -> bool:
++        """ Based on `filter_funcs`, determine whether the tensor meets the criteria.
++
++        Args:
++            tensor: Tensor to be filtered.
++        """
++        result = True
++        for fn in self.config.filter_funcs:
++            result &= fn(tensor)
++        return result
++    
++    def push(self, order_layer_uuid, tensor) -> None:
++        """ Store the tensor captured by the hook 
++        in the layer management instance corresponding to the UUID.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++            tensor: Tensor to be saved.
++        """
++        if self.filters(tensor):
++            self.layer_activation_managers[order_layer_uuid].push(tensor)
++    
++    def pop(self, order_layer_uuid, tensor) -> None:
++        """ Release the activation tensor stored at the corresponding layer based on the UUID.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++            tensor: Tensor to be pop.
++        """
++        self.layer_activation_managers[order_layer_uuid].pop(tensor)
++
++    def pack_start(self, order_layer_uuid) -> None:
++        """ When entering the layer corresponding to the UUID, trigger the pre-operation.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++        """
++        self._order_forward(order_layer_uuid)
++        self._create_layer_activation_manager(order_layer_uuid)
++        self.context_state = ContextState.FORWARD
++
++    def unpack_start(self, order_layer_uuid) -> None:
++        """ When entering the layer backward pass 
++        corresponding to the UUID, trigger the pre-operation.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++        """
++        self._order_backward(order_layer_uuid)
++        self.layer_activation_managers[order_layer_uuid].pop_start()
++        self.context_state = ContextState.BACKWARD
++
++    def _order_forward(self, order_layer_uuid) -> None:
++        """ Adjust the pointer of `fwd_cur_layer_node` to point to the layer corresponding to the UUID; 
++        if it does not exist, create a layer node based on the relationship between the preceding and following nodes.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++        """
++        if order_layer_uuid in self.fwd_uuid_order:
++            self.fwd_cur_layer_node = self.fwd_uuid_order[order_layer_uuid]
++            return
++        self.fwd_uuid_order[order_layer_uuid] = ListNode(order_layer_uuid, self.fwd_cur_layer_node)
++        if self.fwd_cur_layer_node is not None:
++            self.fwd_cur_layer_node.set_next_layer_node(self.fwd_uuid_order[order_layer_uuid])
++        self.fwd_cur_layer_node = self.fwd_uuid_order[order_layer_uuid]
++
++    def _order_backward(self, order_layer_uuid) -> None:
++        """ Adjust the pointer of `bwd_cur_layer_node` to point to the layer corresponding to the UUID; 
++        if it does not exist, create a layer node based on the relationship between the following and preceding nodes.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++        """
++        if order_layer_uuid in self.bwd_uuid_order:
++            self.bwd_cur_layer_node = self.bwd_uuid_order[order_layer_uuid]
++            return
++        self.bwd_uuid_order[order_layer_uuid] = ListNode(order_layer_uuid, self.bwd_cur_layer_node)
++        if self.bwd_cur_layer_node is not None:
++            self.bwd_cur_layer_node.set_next_layer_node(self.bwd_uuid_order[order_layer_uuid])
++        self.bwd_cur_layer_node = self.bwd_uuid_order[order_layer_uuid]
++
++    def _create_layer_activation_manager(self, order_layer_uuid) -> None:
++        """ Create corresponding activation management instances for each layer.
++
++        Args:
++            order_layer_uuid: The UUID of the current layer.
++        """
++        if order_layer_uuid in self.layer_activation_managers:
++            self.layer_activation_managers[order_layer_uuid].push_start()
++            return
++        self.layer_activation_managers[order_layer_uuid] = LayerActivationManager(order_layer_uuid, self.vice_stream)
++        self.layer_activation_managers[order_layer_uuid].push_start()
++    
++    def _pack(self, estimated_time, done=False) -> None:
++        """ Start and end asynchronous compression tasks within the asynchronous operator wrapper.
++
++        Args:
++            estimated_time: The current estimated execution time of the asynchronous operator
++            done: Indicate whether the asynchronous operator has completed. Defaults to False.
++        """
++        order_layer_uuid = self.fwd_cur_layer_node.order_layer_uuid
++        need_pack_layer = self.fwd_uuid_order[order_layer_uuid].prev()
++        if need_pack_layer is None:
++            return
++        need_pack_layer_uuid = need_pack_layer.order_layer_uuid
++        lam = self.layer_activation_managers[need_pack_layer_uuid]
++        if done:
++            lam.pack_done()
++            return
++        plan_tensors = lam.plan(self.simulation.encode_max_numel(estimated_time))
++        shares = OrderedDict()
++        for pt in plan_tensors:
++            shares[pt] = self._get_sm(pt)
++        self.layer_activation_managers[need_pack_layer_uuid].pack(shares, self.statistic)
++
++    def _unpack(self, estimated_time, done=False) -> None:
++        """ Start and end asynchronous decompression tasks within the asynchronous operator wrapper.
++
++        Args:
++            estimated_time: The current estimated execution time of the asynchronous operator.
++            done: Indicate whether the asynchronous operator has completed. Defaults to False.
++        """
++        order_layer_uuid = self.bwd_cur_layer_node.order_layer_uuid
++        next_layer = self.bwd_uuid_order[order_layer_uuid].next()
++        if next_layer is None:
++            return
++        need_unpack_layer_uuid = self.bwd_uuid_order[order_layer_uuid].next().order_layer_uuid
++        lam = self.layer_activation_managers[need_unpack_layer_uuid]
++        if done:
++            lam.unpack_done()
++            return
++        plan_tensors = lam.plan(self.simulation.decode_max_numel(estimated_time), TensorState.COMPRESS)
++        self.layer_activation_managers[need_unpack_layer_uuid].unpack(plan_tensors)
++
++    def _apply(self, estimated_time, done=False) -> None:
++        """ Dispatch compression or decompression tasks based on the current context state.
++
++        Args:
++            estimated_time: The current estimated execution time of the asynchronous operator.
++            done: Indicate whether the asynchronous operator has completed. Defaults to False.
++        """
++        if self.context_state == ContextState.FORWARD:
++            self._pack(estimated_time, done)
++        elif self.context_state == ContextState.BACKWARD:
++            self._unpack(estimated_time, done)
++        else:
++            raise ValueError(f"Unexpected context state: {self.context_state}")
++
++    def _wrapper_async_func(self) -> None:
++        """ Perform wrapper operations based on the given names of asynchronous operators.
++        """
++        for fn in self.config.async_funcs:
++            if fn == "matmul":
++                torch.matmul = self._wrapper_apply(torch.matmul, fn)
++                torch.Tensor.matmul = self._wrapper_apply(torch.Tensor.matmul, fn)
++            elif fn == "allgather":
++                torch.distributed._all_gather_base = \
++                    self._wrapper_apply(torch.distributed._all_gather_base, fn)
++            elif fn == "all2all":
++                torch.distributed.all_to_all_single = \
++                    self._wrapper_apply(torch.distributed.all_to_all_single, fn)
++            else:
++                return
++
++    def estimate_time(self, fn_name, *args, **kwargs) -> float:
++        """ Estimate the execution duration based on the given asynchronous operator name and parameters.
++
++        Args:
++            fn_name: Asynchronous operator name.
++        """
++        return self.simulation.time_cost(fn_name, *args, **kwargs)
++
++    def _wrapper_apply(self, func: Callable, fn_name: str) -> Callable:
++        """ Apply lossless compression wrapper to all asynchronous functions.
++
++        Args:
++            func: Asynchronous function.
++            fn_name: Asynchronous function name.
++        """
++        def wrapper(*args, **kwargs):
++            if kwargs.get("async_op", False):
++                return func(*args, **kwargs)
++            self._apply(self.estimate_time(fn_name, *args, **kwargs))
++            try:
++                return func(*args, **kwargs)
++            finally:
++                self._apply(self.estimate_time(fn_name, *args, **kwargs), done=True)
++        return wrapper
++
++    def _get_sm(self, pt: torch.Tensor) -> ShareMemory:
++        """ Obtain shared memory through the size and type of tensor.
++        """
++        dtype = pt.dtype
++        numel = self._get_sm_target_numel(pt)
++        for sm in self.share_memorys:
++            if sm.can_be_used and numel == sm.numel and dtype == sm.dtype:
++                sm.can_be_used = False
++                return sm
++        sm = ShareMemory(numel, dtype)
++        sm.can_be_used = False
++        self.share_memorys.append(sm)
++        return sm
++
++    def _get_sm_target_numel(self, pt: torch.Tensor) -> int:
++        """
++        Distinguish between `MoE` and `Dense` layers to reduce the overhead caused by memory allocation.
++        """
++        moe_special_activation_grad_fns = ["NpuSwigluBackward", "GMMFunctionBackward", "CppFunction"]
++        if self.config.num_experts is not None:
++            if self.config.num_experts > 0:
++                for grad_fn in moe_special_activation_grad_fns:
++                    if grad_fn in str(pt.grad_fn):
++                        return pt.numel() // pt.shape[0] * self.moe_average_token_nums // pt.element_size()
++        return pt.numel() // pt.element_size()
++
++
++class LayerActivationManager:
++    """Manages activation tensors' lifecycle with stream-aware compression for a specific layer.
++    
++    Handles tensor compression/decompression during forward/backward passes with:
++    - Asynchronous stream operations (main stream vs compression stream)
++    - Memory sharing via ShareMemory objects
++    - State tracking for activation tensors
++    
++    Args:
++        order_layer_uuid: Unique identifier for layer execution ordering
++        vice_stream: Dedicated stream for compression operations
++    """
++    def __init__(self, order_layer_uuid, vice_stream: torch.cuda.Stream) -> None:
++        self.order_layer_uuid = order_layer_uuid
++        self.tensor_refs = {}
++        self.vice_stream = vice_stream
++        self.default_stream = torch.cuda.default_stream()
++        self.pack_tensors = None
++        self.unpack_tensors = None
++    
++    def push(self, tensor: torch.Tensor) -> None:
++        """ The activation tensor captured by the hook.
++        """
++        if tensor in self.tensor_refs:
++            return
++        self.tensor_refs[tensor] = TensorManager(tensor)
++    
++    def pop(self, tensor: torch.Tensor) -> None:
++        """ Release tensor reference.
++        """
++        if tensor in self.tensor_refs:
++            del self.tensor_refs[tensor]
++
++    def push_start(self) -> None:
++        """ Check all tensors reference is None.
++        """
++        if len(self.tensor_refs) != 0:
++            raise RuntimeError(f"Expected empty tensor_refs, but got {len(self.tensor_refs)}")
++
++    def pop_start(self) -> None:
++        """ Check for all tensors in current layer backward pass and recover it in time.
++        """
++        for ts in self.tensor_refs:
++            if self.tensor_refs[ts].state != TensorState.NORMAL:
++                self.tensor_refs[ts].recover()
++
++    def pack(self, shares: OrderedDict[torch.Tensor, ShareMemory], statistic: bool) -> None:
++        """ Allocate memory for the given tensor to be compressed 
++        and asynchronously initiate the compression task.
++        """
++        self.pack_tensors = [ts for ts in shares]
++        for ts in shares:
++            self.tensor_refs[ts].malloc(shares[ts], statistic)
++        self.vice_stream.wait_stream(self.default_stream)
++        with torch.cuda.stream(self.vice_stream):
++            for ts in shares:
++                self.tensor_refs[ts].encode()
++    
++    def pack_done(self) -> None:
++        """ Wait for the asynchronous compression task to complete 
++        and release the original activation.
++        """
++        self.default_stream.wait_stream(self.vice_stream)
++        for ts in self.pack_tensors:
++            self.tensor_refs[ts].encode_wait()
++        self.pack_tensors = None
++
++    def unpack(self, choices: List[torch.Tensor]) -> None:
++        """ Aasynchronously initiate the decompression task.
++        """
++        self.unpack_tensors = [ts for ts in choices]
++        for ts in choices:
++            self.tensor_refs[ts].pre_decode()
++        self.vice_stream.wait_stream(self.default_stream)
++        with torch.cuda.stream(self.vice_stream):
++            for ts in choices:
++                self.tensor_refs[ts].decode()
++
++    def unpack_done(self) -> None:
++        """ Wait for the asynchronous decompression task to complete 
++        and recover the original activation.
++        """
++        self.default_stream.wait_stream(self.vice_stream)
++        for ts in self.unpack_tensors:
++            self.tensor_refs[ts].release()
++        self.unpack_tensors = None
++
++    def plan(self, max_numel: int, filter_state=TensorState.NORMAL) -> None:
++        """ Select the tensor group to be compressed based on the given space constraints.
++        """
++        target_tensor = []
++        target_numel = 0
++        tensors = [ts for ts in self.tensor_refs if self.tensor_refs[ts].state == filter_state]
++        for ts in tensors:
++            target_numel += ts.numel()
++            if target_numel >= max_numel:
++                target_numel -= ts.numel()
++                continue
++            target_tensor.append(ts)
++        return target_tensor
++
++
++class CompressHook(torch.autograd.graph.saved_tensors_hooks):
++    """ Hook for managing tensor compression during autograd computation.
++
++    This hook implements pack/unpack logic to integrate with PyTorch's saved tensors
++    mechanism, enabling custom compression during the backward pass.
++    
++    Args:
++        order_layer_uuid: Unique identifier for the layer in execution order
++        ctx: Global context for managing compressed tensors across layers
++    """
++    def __init__(self, order_layer_uuid, ctx: GlobalContext) -> None:
++        self.global_ctx = ctx
++        self.order_layer_uuid = order_layer_uuid
++        self.output = None
++        super().__init__(self.pack_hook, self.unpack_hook)
++
++    def pack_hook(self, tensor: torch.Tensor) -> torch.Tensor:
++        """ All tensors stored in the computational graph will trigger this hook.
++
++        Args:
++            tensor: The tensor required for backward pass.
++        """
++        self.global_ctx.push(self.order_layer_uuid, tensor)
++        return tensor
++
++    def unpack_hook(self, packed: torch.Tensor) -> torch.Tensor:
++        """ All forward preserved activation tensors will trigger 
++        this hook when used in backward computation.
++
++        Args:
++            packed: The tensor required for backward pass.
++        """
++        self.global_ctx.pop(self.order_layer_uuid, packed)
++        return packed
+diff --git a/mindspeed/core/memory/compress/compress_optimizer.py b/mindspeed/core/memory/compress/compress_optimizer.py
+new file mode 100644
+index 0000000..a1e034d
+--- /dev/null
++++ b/mindspeed/core/memory/compress/compress_optimizer.py
+@@ -0,0 +1,174 @@
++# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
++# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
++
++from typing import List  # codecheck_ignore
++
++import torch
++import torch.distributed
++import torch_npu
++from torch import Tensor
++
++from .utils import TensorManager, ShareMemory
++
++
++class CompressTensor(TensorManager):
++    """ Class for managing first and second-order momentum 
++    compression and decompression states.
++    """
++    def __init__(self, like_tensor: torch.Tensor, compress_ratio: float = 0.5) -> None:
++        if compress_ratio < 0 or compress_ratio > 1:
++            raise ValueError
++        super().__init__(like_tensor, compress_ratio)
++        self.normal_init(like_tensor) # replace tensor
++        self.filter_condition = self.can_be_compress(like_tensor)
++        if self.filter_condition:
++            self.compress_init(like_tensor)
++        self.shape, self.dtype, self.device = like_tensor.shape, like_tensor.dtype, like_tensor.device
++    
++    def normal_init(self, like_tensor: torch.Tensor):
++        self.tensor = torch.zeros(like_tensor.shape, device=like_tensor.device, dtype=like_tensor.dtype)
++    
++    def compress_init(self, like_tensor: torch.Tensor):
++        var = ShareMemory(numel=like_tensor.numel() // 2, dtype=like_tensor.dtype)
++        var.can_be_used = False
++        self.malloc(var, statistic=True)
++        self.encode()
++
++    def encode_state(self):
++        self.encode()
++        self.tensor = None
++    
++    def decode_state(self):
++        self.tensor = torch.empty(self.shape, dtype=self.dtype, device=self.device)
++        self.decode()
++    
++    def recover(self):
++        if self.filter_condition:
++            self.decode_state()
++        return self.tensor
++    
++    def update(self, step):
++        if self.filter_condition:
++            self.encode_state()
++            self.adjust_pdf_statistic(step)
++    
++    def adjust_pdf_statistic(self, step):
++        if step < 3 or step % 100 == 0:
++            self.statistic = True
++        else:
++            self.statistic = False
++    
++    @staticmethod
++    def can_be_compress(tensor: torch.Tensor):
++        return tensor.numel() % 64 == 0 and tensor.numel() > 32768
++
++
++def compress_adamw_impl(params: List[Tensor],
++          grads: List[Tensor],
++          exp_avgs: List[CompressTensor],
++          exp_avg_sqs: List[CompressTensor],
++          max_exp_avg_sqs: List[Tensor],
++          step: int,
++          *,
++          amsgrad: bool,
++          beta1: float,
++          beta2: float,
++          lr: float,
++          weight_decay: float,
++          eps: float,
++          maximize: bool):
++    r"""Functional API that performs AdamW algorithm computation.
++    See :class:`~torch.optim.AdamW` for details.
++    """
++    for i, param in enumerate(params):
++        grad = grads[i]
++        exp_avg = exp_avgs[i].recover()
++        exp_avg_sq = exp_avg_sqs[i].recover()
++
++        # Perform stepweight decay; param.mul_(1 - lr * weight_decay)
++        bias_correction1 = beta1 ** (step - 1)
++        bias_correction2 = beta2 ** (step - 1)
++
++        param.data, exp_avg, exp_avg_sq = torch_npu.npu_apply_adam_w(
++            bias_correction1,
++            bias_correction2,
++            lr,
++            weight_decay,
++            beta1,
++            beta2,
++            eps,
++            grad,
++            None,
++            amsgrad,
++            maximize,
++            out=(param.data, exp_avg, exp_avg_sq)
++        )
++        exp_avgs[i].update(step)
++        exp_avg_sqs[i].update(step)
++
++
++def compress_optimizer_step_impl(self, closure=None):
++    loss = None
++    if closure is not None:
++        with torch.enable_grad():
++            loss = closure()
++
++    for group in self.param_groups:
++        params_with_grad = []
++        grads = []
++        exp_avgs = []
++        exp_avg_sqs = []
++        state_sums = []
++        max_exp_avg_sqs = []
++        state_steps = []
++        amsgrad = group['amsgrad']
++        beta1, beta2 = group['betas']
++
++        if 'step' in group:
++            group['step'] += 1
++        else:
++            group['step'] = 1
++
++        for p in group['params']:
++            if p.grad is None:
++                continue
++            params_with_grad.append(p)
++            if p.grad.is_sparse:
++                raise RuntimeError('AdamW does not support sparse gradients')
++            grads.append(p.grad)
++
++            state = self.state[p]
++
++            # State initialization
++            if len(state) == 0:
++                # Exponential moving average of gradient values
++                state['exp_avg'] = CompressTensor(p)
++                # Exponential moving average of squared gradient values
++                state['exp_avg_sq'] = CompressTensor(p, 0.4)
++                if amsgrad:
++                    # Maintains max of all exp. moving avg. of sq. grad. values
++                    state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
++
++            exp_avgs.append(state['exp_avg'])
++            exp_avg_sqs.append(state['exp_avg_sq'])
++
++            if amsgrad:
++                max_exp_avg_sqs.append(state['max_exp_avg_sq'])
++
++
++        compress_adamw_impl(params_with_grad,
++                grads,
++                exp_avgs,
++                exp_avg_sqs,
++                max_exp_avg_sqs,
++                group['step'],
++                amsgrad=amsgrad,
++                beta1=beta1,
++                beta2=beta2,
++                lr=group['lr'],
++                weight_decay=group['weight_decay'],
++                eps=group['eps'],
++                maximize=group['maximize'])
++
++
++    return loss
+diff --git a/mindspeed/core/memory/compress/utils.py b/mindspeed/core/memory/compress/utils.py
+new file mode 100644
+index 0000000..8975625
+--- /dev/null
++++ b/mindspeed/core/memory/compress/utils.py
+@@ -0,0 +1,297 @@
++# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
++
++from dataclasses import dataclass
++from typing import ClassVar, Dict  # codecheck_ignore
++from enum import Enum
++import math
++
++import torch
++import torch_npu
++
++
++class TensorState(Enum):
++    """ Define activation tensor status.
++    """
++    NORMAL = "normal"
++    COMPRESS = "compress"
++
++
++class ListNode:
++    """ Utilize the linked list data structure to record 
++    the dependencies between transformer layer computations.
++    """
++    def __init__(
++        self, 
++        order_layer_uuid, 
++        prev_layer_node=None, 
++        next_layer_node=None
++    ) -> None:
++        self.order_layer_uuid = order_layer_uuid
++        self.next_layer_node = next_layer_node
++        self.prev_layer_node = prev_layer_node
++    
++    def set_next_layer_node(self, next_layer_node) -> None:
++        self.next_layer_node = next_layer_node
++    
++    def next(self):
++        return self.next_layer_node
++    
++    def prev(self):
++        return self.prev_layer_node
++
++
++class ShareMemory:
++    """ Class for managing shared swap tensor and shared PDF tensor.
++    """
++    def __init__(self, numel: int, dtype: torch.dtype) -> None:
++        self.numel = numel
++        self.dtype = dtype
++        self.min_host_size = 2 * 1024 * 1024
++        device = torch.empty([], device=torch.cuda.current_device()).device
++        self.virtual_tensor = get_swap_tensor(numel, device, dtype)
++        self.can_be_used = True
++        self.pdf = torch.zeros(256, dtype=torch.int32, device=device)
++
++
++def get_swap_tensor(ts_numel: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
++    """ Return the swap tensor through the input attributes.
++
++    Args:
++        ts_numel: Swap tensor numel.
++        device: Swap tensor device.
++        dtype: Swap tensor dtype.
++
++    Returns:
++        swap_tensor: Return swap tensor.
++    """
++    if not hasattr(torch_npu, "empty_with_swapped_memory"): 
++        raise ModuleNotFoundError("PTA dose not support this func, please update to latest version.")
++    size = torch.Size([ts_numel])
++    swap_tensor = torch_npu.empty_with_swapped_memory(size, dtype=dtype, device=device)
++    swap_tensor.zero_()
++    return swap_tensor
++
++
++class TensorManager:
++    """ Manages tensor compression/decompression with NPU-accelerated operator npu_hans_encode/npu_hans_decode.
++
++    Core Responsibilities:
++        - Memory allocation for compressed representations
++        - State tracking for tensor lifecycle
++        - NPU hardware acceleration for encode/decode operations
++    """
++    def __init__(self, tensor: torch.Tensor, compress_ratio: float = 0.5) -> None:
++        self.tensor = tensor
++        self.fixed_numel = (math.ceil(tensor.numel() * compress_ratio) // tensor.element_size() + 1) // 2 * 2
++        self.mantissa_numel = tensor.numel() * (tensor.element_size() - 1) // self.tensor.element_size()
++        self.storage_size = self.tensor.numel() * self.tensor.element_size()
++        self.var = None
++        self.fixed = None
++        self.mantissa = None
++        self.state = TensorState.NORMAL
++        self.statistic = True
++
++    def malloc(self, var: ShareMemory, statistic: bool) -> None:
++        """ Allocate the required memory before executing the compression operator.
++
++        Args:
++            var: Share memory.
++        """
++        self.var = var
++        self.statistic = statistic
++        self.fixed = torch.zeros(
++            self.fixed_numel, dtype=self.tensor.dtype, device=self.tensor.device)
++        self.mantissa = torch.zeros(
++            self.mantissa_numel, dtype=self.tensor.dtype, device=self.tensor.device)
++
++    def encode(self) -> None:
++        """ Asynchronous execution of compression task.
++        """
++        self.var.pdf, self.mantissa, self.fixed, self.var.virtual_tensor = torch_npu.npu_hans_encode(\
++                        self.tensor, self.statistic, False, \
++                        out=(self.var.pdf, self.mantissa, self.fixed, self.var.virtual_tensor))
++
++    def encode_wait(self) -> None:
++        """ Wait for the asynchronous task to complete compression, 
++        then release the memory of the original activation values.
++        """
++        self.state = TensorState.COMPRESS
++        self.tensor.untyped_storage().resize_(0)
++
++    def pre_decode(self) -> None:
++        """ Reapply for activation memory before decompression task.
++        """
++        self.tensor.untyped_storage().resize_(self.storage_size)
++
++    def decode(self) -> None:
++        """ Asynchronous execution of decompression task.
++        """
++        self.tensor = torch_npu.npu_hans_decode(self.mantissa, \
++                    self.fixed, self.var.virtual_tensor, self.var.pdf, False, out=self.tensor)
++
++    def release(self) -> None:
++        """ After decompression, release all allocated memory.
++        """
++        if hasattr(self.var, "can_be_used"):
++            self.var.can_be_used = True
++        self.fixed = None
++        self.mantissa = None
++        self.var = None
++        self.state = TensorState.NORMAL
++
++    def recover(self) -> None:
++        """ Synchronize and restore all activation, and release any excess memory.
++        """
++        self.pre_decode()
++        self.decode()
++        self.release()
++    
++
++@dataclass
++class SimulationHyperParams:
++    """ Hyperparameters for Time-Consuming Theoretical Modeling.
++    """
++    allgather_throughput: Dict[str, float]
++    all2all_throughput: Dict[str, float]
++
++    TFLOPS: ClassVar[int] = 10**12
++    GIGABYTE: ClassVar[int] = 1024 ** 3
++    MAX_BANDWIDTH: ClassVar[int] = 1000 * GIGABYTE
++    encode_throughput: float = 100.0 * GIGABYTE
++    decode_throughput: float = 111.0 * GIGABYTE
++    cube_tflops: float = 280.0 * TFLOPS 
++
++
++class SimulationBase:
++    """ Used for modeling various asynchronous operators.
++    """
++    def __init__(self, simulation_config: SimulationHyperParams) -> None:
++        self.simulation_config = simulation_config
++
++    def time_cost(self, op_name: str, *args, **kwargs) -> float:
++        if op_name == "matmul":
++            return self._matmul(*args, **kwargs) 
++        elif op_name == "all2all":
++            return self._all2all(*args, **kwargs)
++        elif op_name == "allgather":
++            return self._allgather(*args, **kwargs)
++        else:
++            return 0
++            
++    def _matmul(self, *args, **kwargs) -> float:
++        """ Matmul time cost.
++        """
++        output_shape = infer_matmul_shape(args[0], args[1])
++        total_flop = 2 * args[0].shape[-1]
++        for dim in output_shape:
++            total_flop *= dim
++        return total_flop / self.simulation_config.cube_tflops
++
++    def _all2all(self, *args, **kwargs) -> float:
++        """ All2All time cost.
++        """
++        if not kwargs.get("group", False):
++            return 0
++        group_size = torch.distributed.get_world_size(kwargs["group"])
++        simulation_bandwidth = self.simulation_config.all2all_throughput.get(
++            str(group_size), self.simulation_config.MAX_BANDWIDTH)
++        return args[0].numel() * args[0].element_size() / simulation_bandwidth
++
++    def _allgather(self, *args, **kwargs) -> float:
++        """ AllGather time cost.
++        """            
++        if not kwargs.get("group", False):
++            return 0
++        group_size = torch.distributed.get_world_size(kwargs["group"])
++        simulation_bandwidth = self.simulation_config.allgather_throughput.get(
++            str(group_size), self.simulation_config.MAX_BANDWIDTH)
++        return args[0].numel() * args[0].element_size() / simulation_bandwidth
++
++    def _reducescatter(self, *args, **kwargs) -> float:
++        raise NotImplementedError
++    
++    def encode_max_numel(self, estimated_time) -> int:
++        return int(self.simulation_config.encode_throughput * estimated_time / 2)
++    
++    def decode_max_numel(self, estimated_time) -> int:
++        return int(self.simulation_config.decode_throughput * estimated_time / 2)
++
++
++class SimulationA2(SimulationBase):
++    def __init__(self):
++        cfg = SimulationHyperParams(
++            allgather_throughput={
++                "2": 36 * SimulationHyperParams.GIGABYTE,
++                "4": 73 * SimulationHyperParams.GIGABYTE,
++                "8": 147 * SimulationHyperParams.GIGABYTE,
++                "16": 138 * SimulationHyperParams.GIGABYTE,
++            },
++            all2all_throughput={
++                "2": 37 * SimulationHyperParams.GIGABYTE,
++                "4": 69 * SimulationHyperParams.GIGABYTE,
++                "8": 119 * SimulationHyperParams.GIGABYTE,
++                "16": 40.1 * SimulationHyperParams.GIGABYTE,
++                "32": 30.2 * SimulationHyperParams.GIGABYTE,
++                "64": 27.0 * SimulationHyperParams.GIGABYTE,
++            }
++        )
++        super().__init__(cfg)
++
++
++class SimulationA3(SimulationBase):
++    def __init__(self):
++        cfg = SimulationHyperParams(
++            allgather_throughput={
++                "2": 350.0 * SimulationHyperParams.GIGABYTE,
++                "4": 324.9 * SimulationHyperParams.GIGABYTE,
++                "8": 298.8 * SimulationHyperParams.GIGABYTE,
++                "16": 283.6 * SimulationHyperParams.GIGABYTE,
++            },
++            all2all_throughput={
++                "2": 0 * SimulationHyperParams.GIGABYTE,
++                "4": 229.4 * SimulationHyperParams.GIGABYTE,
++                "8": 173.9 * SimulationHyperParams.GIGABYTE,
++                "16": 154.0 * SimulationHyperParams.GIGABYTE,
++                "32": 143.9 * SimulationHyperParams.GIGABYTE,
++                "64": 137.3 * SimulationHyperParams.GIGABYTE,
++            }
++        )
++        super().__init__(cfg)
++
++
++def infer_matmul_shape(A: torch.Tensor, B: torch.Tensor):
++    a_shape = list(A.shape)
++    b_shape = list(B.shape)
++
++    a_was_1d = False
++    b_was_1d = False
++
++    if A.dim() == 1:
++        a_shape = [1, a_shape[0]]
++        a_was_1d = True
++    if B.dim() == 1:
++        b_shape = [b_shape[0], 1]
++        b_was_1d = True
++
++    if a_shape[-1] != b_shape[-2]:
++        raise ValueError(f"Incompatible shapes: {A.shape} @ {B.shape}")
++
++    batch_a = a_shape[:-2]
++    batch_b = b_shape[:-2]
++    try:
++        broadcast_batch = torch.broadcast_shapes(tuple(batch_a), tuple(batch_b))
++    except RuntimeError as e:
++        raise ValueError(f"Cannot broadcast batch dimensions: {batch_a} vs {batch_b}") from e
++
++    m = a_shape[-2]
++    n = b_shape[-1]
++
++    out_shape = list(broadcast_batch) + [m, n]
++    if a_was_1d and b_was_1d:
++        return tuple(out_shape[:-2])  # scalar output
++    elif a_was_1d:
++        return tuple(out_shape[:-2] + [n])
++    elif b_was_1d:
++        return tuple(out_shape[:-2] + [m])
++    else:
++        return tuple(out_shape)
+diff --git a/mindspeed/features_manager/__init__.py b/mindspeed/features_manager/__init__.py
+index c76d863..dcaef00 100644
+--- a/mindspeed/features_manager/__init__.py
++++ b/mindspeed/features_manager/__init__.py
+@@ -83,6 +83,7 @@ from mindspeed.features_manager.distributed.reset_bucket_group_order_feature imp
+ from mindspeed.features_manager.custom_fsdp.custom_fsdp_feature import CustomFSDPFeature
+ from mindspeed.features_manager.tensor_parallel.tp_2d import TP2dFeature
+ from mindspeed.features_manager.compress_dense.compress_dense import AnsCompressTensorFeature
++from mindspeed.features_manager.compress.compress import CompressActivationFeature, CompressOptimizerFeature
+ from mindspeed.features_manager.disable_gloo_group.disable_gloo_group_feature import DisableGlooGroupFeature
+ 
+ from mindspeed.features_manager.memory.swap_attention import SwapAttentionFeature
+@@ -285,6 +286,13 @@ def add_compress_dense_features(features_list: List[MindSpeedFeature]):
+     ])
+ 
+ 
++def add_compress_memory_feature(features_list: List[MindSpeedFeature]):
++    features_list.extend([
++        CompressActivationFeature(),
++        CompressOptimizerFeature()
++    ])
++
++
+ def add_disable_gloo_group_feature(features_list: List[MindSpeedFeature]):
+     features_list.extend([
+         DisableGlooGroupFeature()
+@@ -336,6 +344,7 @@ def create_features_list():
+     add_reuse_param_features(features_list)
+     add_swap_manage_features(features_list)
+     add_compress_dense_features(features_list)
++    add_compress_memory_feature(features_list)
+     add_disable_gloo_group_feature(features_list)
+     add_swap_optimizer_feature(features_list)
+     add_transformer_features(features_list)
+diff --git a/mindspeed/features_manager/compress/__init__.py b/mindspeed/features_manager/compress/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/mindspeed/features_manager/compress/compress.py b/mindspeed/features_manager/compress/compress.py
+new file mode 100644
+index 0000000..1b5be3e
+--- /dev/null
++++ b/mindspeed/features_manager/compress/compress.py
+@@ -0,0 +1,61 @@
++# Copyright (c) 2025, Huawei Technologies Co., Ltd.  All rights reserved.
++
++from argparse import ArgumentParser
++
++import torch
++
++from mindspeed.features_manager.feature import MindSpeedFeature
++
++
++class CompressActivationFeature(MindSpeedFeature):
++    def __init__(self):
++        super().__init__('compress-activation', 2)
++
++    def register_args(self, parser: ArgumentParser):
++        group = parser.add_argument_group(title=self.feature_name)
++        group.add_argument('--compress-activation', type=str, default='',
++                           help='Compress activation in each layer.')
++
++    def validate_args(self, args):
++        if args.compress_activation != "":
++            if args.compress_activation == '0':
++                args.compress_activation = list(range(1, args.num_layers + 1))
++            else:
++                compress_layers = []
++                layer_args = args.compress_activation.split(',')
++                for elem in layer_args:
++                    if '-' in elem:
++                        start, end = map(int, elem.split('-'))
++                        compress_layers.extend(range(start, end + 1))
++                    else:
++                        compress_layers.append(int(elem))
++                args.compress_activation = compress_layers
++
++    def register_patches(self, patch_manager, args):
++        from mindspeed.core.memory.compress.adaptor import layer_forward_wrapper
++        if getattr(args, "compress_activation", False):
++            patch_manager.register_patch('megatron.core.transformer.TransformerLayer.forward', layer_forward_wrapper)
++
++
++class CompressOptimizerFeature(MindSpeedFeature):
++    def __init__(self):
++        super().__init__('compress-optimizer', 2)
++
++    def register_args(self, parser: ArgumentParser):
++        group = parser.add_argument_group(title=self.feature_name)
++        group.add_argument('--compress-optimizer', action='store_true', default=False,
++                       help='Compress optimizer states.')
++
++    def validate_args(self, args):
++        if args.compress_optimizer != "disable":
++            import torch_npu
++            if not hasattr(torch_npu, "npu_hans_encode") or not hasattr(torch_npu, "npu_hans_decode") \
++                or not hasattr(torch_npu, "empty_with_swapped_memory"):
++                raise AssertionError("`--compress-optimizer` is invalid, please update the latest PTA version.")
++            self.incompatible_check(args, "fused_ema_adamw")
++
++    def register_patches(self, patch_manager, args):
++        from mindspeed.core.memory.compress.adaptor import compress_optimizer_step
++        if getattr(args, "compress_optimizer", False):
++            patch_manager.register_patch('mindspeed.optimizer.adamw.AdamW.step', compress_optimizer_step)
++            patch_manager.register_patch('mindspeed.core.optimizer.adamw.AdamW.step', compress_optimizer_step)
+diff --git a/sources/images/compress_activation_coloured.png b/sources/images/compress_activation_coloured.png
+new file mode 100644
+index 0000000..8c99e49
+Binary files /dev/null and b/sources/images/compress_activation_coloured.png differ

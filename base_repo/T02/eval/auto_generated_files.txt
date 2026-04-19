@@ -1,0 +1,7 @@
+Include/Python-ast.h
+Include/internal/pycore_ast.h
+Include/opcode.h
+Lib/keyword.py
+Parser/parser.c
+Python/Python-ast.c
+Python/importlib_external.h

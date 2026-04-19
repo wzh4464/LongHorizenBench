@@ -1,0 +1,1413 @@
+diff --git a/src/contrib/math/exp/CMakeLists.txt b/src/contrib/math/exp/CMakeLists.txt
+new file mode 100644
+index 00000000..e1023b89
+--- /dev/null
++++ b/src/contrib/math/exp/CMakeLists.txt
+@@ -0,0 +1,25 @@
++add_ops_compile_options(
++        OP_NAME Exp
++        OPTIONS --cce-auto-sync=on
++                -Wno-deprecated-declarations
++                -Werror
++)
++
++target_sources(op_host_aclnn PRIVATE
++op_host/exp.cpp
++)
++
++target_sources(optiling PRIVATE
++        op_host/exp.cpp
++)
++
++target_include_directories(optiling PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}/op_host
++)
++
++target_sources(opsproto PRIVATE
++         op_host/exp.cpp
++)
++
++install(FILES op_kernel/exp.cpp
++        DESTINATION ${ASCEND_IMPL_OUT_DIR}/dynamic)
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/README.md b/src/contrib/math/exp/README.md
+new file mode 100644
+index 00000000..e3017b62
+--- /dev/null
++++ b/src/contrib/math/exp/README.md
+@@ -0,0 +1,60 @@
++## Exp自定义算子样例说明 
++本样例通过`Ascend C`编程语言实现了`Exp`算子。
++
++### 算子描述
++`Exp`算子将数据进行开方并取倒数运算。
++
++
++
++### 支持的产品型号
++本样例支持如下产品型号：
++- Atlas A2 训练系列产品
++- Atlas 800I A2推理产品
++
++### 目录结构介绍
++```
++├── docs                        // 算子文档目录
++├── example                     // 调用示例目录
++├── framework                   // 第三方框架适配目录
++├── op_host                     // host目录
++├── op_kernel                   // kernel目录
++├── opp_kernel_aicpu            // aicpu目录
++└── tests                       // 测试用例目录
++```
++
++### 环境要求
++编译运行此样例前，请参考[《CANN软件安装指南》](https://hiascend.com/document/redirect/CannCommunityInstSoftware)完成开发运行环境的部署。
++
++### 算子包编译部署
++  - 进入到仓库目录
++
++    ```bash
++    cd ${git_clone_path}/cann-ops
++    ```
++
++  - 执行编译
++
++    ```bash
++    bash build.sh
++    ```
++
++  - 部署算子包
++
++    ```bash
++    bash build_out/CANN-custom_ops-<cann_version>-linux.<arch>.run
++    ```
++
++### 算子调用
++<table>
++    <th>目录</th><th>描述</th>
++    <tr>
++        <td><a href="./examples/AclNNInvocationNaive"> AclNNInvocationNaive</td><td>通过aclnn调用的方式调用Exp算子。</td>
++    </tr>
++</table>
++
++
++
++## 更新说明
++| 时间 | 更新事项 |
++|----|------|
++| 2025/03/29 | 新增本readme |
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/docs/.gitkeep b/src/contrib/math/exp/docs/.gitkeep
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/contrib/math/exp/docs/Exp.md b/src/contrib/math/exp/docs/Exp.md
+new file mode 100644
+index 00000000..e4490a2c
+--- /dev/null
++++ b/src/contrib/math/exp/docs/Exp.md
+@@ -0,0 +1,83 @@
++声明：本文使用[Creative Commons License version 4.0](https://creativecommons.org/licenses/by/4.0/legalcode)许可协议，转载、引用或修改等操作请遵循此许可协议。
++
++# Exp
++
++## 支持的产品型号
++
++- Atlas A2 训练系列产品
++- Atlas 800I A2推理产品
++
++产品形态详细说明请参见[昇腾产品形态说明](https://www.hiascend.com/document/redirect/CannCommunityProductForm)。
++
++## 功能描述
++
++- 算子功能：该Exp 算子提供指数函数的计算功能。其主要功能是计算给定数值的自然指数幂，即(e^x\)。
++
++- 在数学和工程领域中，自然指数运算具有广泛且关键的应用：
++
++  - 在概率论与统计学中，常用于描述正态分布、指数分布等概率模型；
++  - 在信号处理中，可用于求解微分方程、处理衰减或增长信号；
++  - 在机器学习中，是 softmax 函数、激活函数（如指数线性单元 ELU）的核心组成部分；
++  - 在物理模拟中，可用于刻画放射性衰变、种群增长等自然过程。
++  - Exp 算子能够高效处理批量数值的自然指数计算，支持整数、浮点数等多种数值类型的输入，且在实现中通常会针对边界情况（如极大或极小输入值）进行优化，以保证计算的准确性和稳定性。
++
++- 计算公式：
++
++  $$
++  y = e^x
++  $$
++
++## 实现原理
++
++调用`Ascend C`的`API`接口Exp、`Muls`和Adds进行实现。对于16位的数据类型将其通过`Cast`接口转换为32位浮点数进行计算。
++
++
++## 算子执行接口
++
++每个算子分为两段式接口，必须先调用“aclnnExpGetWorkspaceSize”接口获取计算所需workspace大小以及包含了算子计算流程的执行器，再调用“aclnnExp”接口执行计算。
++
++* `aclnnStatus aclnnExpGetWorkspaceSize(const aclTensor *x, const aclTensor *out, uint64_t workspaceSize, aclOpExecutor **executor)`
++* `aclnnStatus aclnnExp(void *workspace, int64_t workspaceSize, aclOpExecutor **executor, aclrtStream stream)`
++
++**说明**：
++
++- 算子执行接口对外屏蔽了算子内部实现逻辑以及不同代际NPU的差异，且开发者无需编译算子，实现了算子的精简调用。
++- 若开发者不使用算子执行接口的调用算子，也可以定义基于Ascend IR的算子描述文件，通过ATC工具编译获得算子om文件，然后加载模型文件执行算子，详细调用方法可参见《应用开发指南》的[单算子调用 > 单算子模型执行](https://hiascend.com/document/redirect/CannCommunityCppOpcall)章节。
++
++### aclnnExpGetWorkspaceSize
++
++- **参数说明：**
++
++  - x（aclTensor\*，计算输入）：必选参数，Device侧的aclTensor，公式中的输入x，数据类型支持FLOAT16、BFLOAT16、FLOAT32，数据格式支持ND,NCHW,NHWC。
++  - y（aclTensor\*，计算输出）：Device侧的aclTensor，公式中的输出y，数据类型支持FLOAT16、BFLOAT16、FLOAT32，数据格式支持ND,NCHW,NHWC，输出维度与x一致。
++  - workspaceSize（uint64\_t\*，出参）：返回用户需要在Device侧申请的workspace大小。
++  - executor（aclOpExecutor\*\*，出参）：返回op执行器，包含了算子计算流程。
++- **返回值：**
++
++  返回aclnnStatus状态码，具体参见[aclnn返回码](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha003/apiref/aolapi/context/common/aclnn%E8%BF%94%E5%9B%9E%E7%A0%81_fuse.md)。
++
++  ```
++  第一段接口完成入参校验，若出现以下错误码，则对应原因为：
++  - 返回161001（ACLNN_ERR_PARAM_NULLPTR）：如果传入参数是必选输入，输出或者必选属性，且是空指针，则返回161001。
++  - 返回161002（ACLNN_ERR_PARAM_INVALID）：x、out的数据类型和数据格式不在支持的范围内。
++  ```
++
++### aclnnExp
++
++- **参数说明：**
++
++  - workspace（void\*，入参）：在Device侧申请的workspace内存起址。
++  - workspaceSize（uint64\_t，入参）：在Device侧申请的workspace大小，由第一段接口aclnnRsqrtGetWorkspaceSize获取。
++  - executor（aclOpExecutor\*，入参）：op执行器，包含了算子计算流程。
++  - stream（aclrtStream，入参）：指定执行任务的AscendCL stream流。
++- **返回值：**
++
++  返回aclnnStatus状态码，具体参见[aclnn返回码](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha003/apiref/aolapi/context/common/aclnn%E8%BF%94%E5%9B%9E%E7%A0%81_fuse.md)。
++
++## 约束与限制
++
++- x，y的数据类型支持FLOAT16，FLOAT32，BFLOAT16，数据格式只支持ND
++
++## 
++
++详见[Reciprocal自定义算子样例说明算子调用章节](../README.md#算子调用)
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/examples/.gitkeep b/src/contrib/math/exp/examples/.gitkeep
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/CMakeLists.txt b/src/contrib/math/exp/examples/AclNNInvocationNaive/CMakeLists.txt
+new file mode 100644
+index 00000000..ddee4c27
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/CMakeLists.txt
+@@ -0,0 +1,60 @@
++# CMake lowest version requirement
++cmake_minimum_required(VERSION 3.5.1)
++
++# project information
++project(acl_execute_exp)
++
++# Compile options
++add_compile_options(-std=c++11)
++
++set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "./")
++
++set(INC_PATH $ENV{DDK_PATH})
++
++if (NOT DEFINED ENV{DDK_PATH})
++    set(INC_PATH "/usr/local/Ascend/ascend-toolkit/latest")
++    message(STATUS "set default INC_PATH: ${INC_PATH}")
++else ()
++    message(STATUS "env INC_PATH: ${INC_PATH}")
++endif()
++
++set(CUST_PKG_PATH "${INC_PATH}/opp/vendors/customize/op_api")
++
++set(LIB_PATH $ENV{NPU_HOST_LIB})
++
++# Dynamic libraries in the stub directory can only be used for compilation
++if (NOT DEFINED ENV{NPU_HOST_LIB})
++    set(LIB_PATH "/usr/local/Ascend/ascend-toolkit/latest/acllib/lib64/stub/")
++    set(LIB_PATH1 "/usr/local/Ascend/ascend-toolkit/latest/atc/lib64/stub/")
++    message(STATUS "set default LIB_PATH: ${LIB_PATH}")
++else ()
++    message(STATUS "env LIB_PATH: ${LIB_PATH}")
++endif()
++
++# Header path
++include_directories(
++    ${INC_PATH}/runtime/include
++    ${INC_PATH}/atc/include
++    ${CUST_PKG_PATH}/include
++)
++
++# add host lib path
++link_directories(
++    ${LIB_PATH}
++    ${LIB_PATH1}
++    ${CUST_PKG_PATH}/lib
++)
++
++add_executable(execute_exp_op
++    main.cpp
++)
++
++target_link_libraries(execute_exp_op
++    ascendcl
++    cust_opapi
++    acl_op_compiler
++    nnopbase
++    stdc++
++)
++
++install(TARGETS execute_exp_op DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/README.md b/src/contrib/math/exp/examples/AclNNInvocationNaive/README.md
+new file mode 100644
+index 00000000..4f3b69c0
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/README.md
+@@ -0,0 +1,62 @@
++## 概述
++
++通过aclnn调用的方式调用Exp算子。
++
++## 目录结构介绍
++``` 
++├── AclNNInvocationNaive
++│   ├── CMakeLists.txt      // 编译规则文件
++│   ├── gen_data.py         // 算子期望数据生成脚本
++│   ├── main.cpp            // 单算子调用应用的入口
++│   ├── run.sh              // 编译运行算子的脚本
++│   └── verify_result.py    // 计算结果精度比对脚本
++```
++## 代码实现介绍
++完成自定义算子的开发部署后，可以通过单算子调用的方式来验证单算子的功能。main.cpp代码为单算子API执行方式。单算子API执行是基于C语言的API执行算子，无需提供单算子描述文件进行离线模型的转换，直接调用单算子API接口。    
++
++自定义算子编译部署后，会自动生成单算子API，可以直接在应用程序中调用。算子API的形式一般定义为“两段式接口”，形如：
++   ```cpp    
++   aclnnStatus aclnnExpGetWorkspaceSize(const aclTensor *x, const aclTensor *y, uint64_t workspaceSize, aclOpExecutor **executor);
++   aclnnStatus aclnnExp(void *workspace, int64_t workspaceSize, aclOpExecutor **executor, aclrtStream stream);
++   ```
++其中aclnnExpGetWorkspaceSize为第一段接口，主要用于计算本次API调用计算过程中需要多少的workspace内存。获取到本次API计算需要的workspace大小之后，按照workspaceSize大小申请Device侧内存，然后调用第二段接口aclnnSqrt执行计算。具体参考[AscendCL单算子调用](https://hiascend.com/document/redirect/CannCommunityAscendCInVorkSingleOp)>单算子API执行 章节。
++
++## 运行样例算子
++  **请确保已根据算子包编译部署步骤完成本算子的编译部署动作。**
++
++  - 进入样例代码所在路径
++  
++    ```bash
++    cd ${git_clone_path}/cann-ops/src/contrib/math/exp/examples/AclNNInvocationNaive
++    ```
++  
++  - 环境变量配置
++    
++    需要设置环境变量，以arm为例
++    
++    ```bash
++    export DDK_PATH=/usr/local/Ascend/ascend-toolkit/latest
++    export NPU_HOST_LIB=/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/devlib
++    ```
++  - 样例执行
++    
++    样例执行过程中会自动生成测试数据，然后编译与运行aclnn样例，最后打印运行结果。
++    
++    ```bash
++    mkdir -p build
++    cd build
++    cmake .. && make
++    ./execute_sqrt_op
++    ```
++    
++    用户亦可参考run.sh脚本进行编译与运行。
++    
++    ```bash
++    bash run.sh
++    ```
++
++## 更新说明
++
++| 时间       | 更新事项     |
++| ---------- | ------------ |
++| 2025/03/29 | 新增本readme |
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/gen_data.py b/src/contrib/math/exp/examples/AclNNInvocationNaive/gen_data.py
+new file mode 100644
+index 00000000..733e9495
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/gen_data.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/python3
++# -*- coding:utf-8 -*-
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ==========================================================================================================
++
++import math
++import os
++import numpy as np
++
++
++def exp(x, scale: float = 1.0, shift: float = 0.0, base: float = -1.0):
++    exponent = x * scale + shift
++    epsilon = 1e-15
++    if abs(base - (-1.0)) > epsilon:
++        base = math.log(base)
++        print(f"base,scale,shift: {base,scale,shift}")
++        exponent *= base  
++    print(f"exponent: {exponent}")
++
++    return np.exp(exponent)
++
++
++def gen_golden_data_simple():
++    dtype = np.float16
++    output_shape = [10, 10]
++    input_x = np.random.uniform(1, 4, output_shape).astype(dtype)
++    golden = exp(input_x, 2.0, 1.0, 2.0).astype(dtype)
++    os.system("mkdir -p input")
++    os.system("mkdir -p output")
++    input_x.tofile("./input/input_x.bin")
++    golden.tofile("./output/golden.bin")
++
++if __name__ == "__main__":
++    gen_golden_data_simple()
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/main.cpp b/src/contrib/math/exp/examples/AclNNInvocationNaive/main.cpp
+new file mode 100644
+index 00000000..b301be4a
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/main.cpp
+@@ -0,0 +1,238 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++#include <algorithm>
++#include <cstdint>
++#include <iostream>
++#include <vector>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fstream>
++#include <fcntl.h>
++
++#include "acl/acl.h"
++#include "aclnn_exp.h"
++
++#define SUCCESS 0
++#define FAILED 1
++
++#define INFO_LOG(fmt, args...) fprintf(stdout, "[INFO]  " fmt "\n", ##args)
++#define WARN_LOG(fmt, args...) fprintf(stdout, "[WARN]  " fmt "\n", ##args)
++#define ERROR_LOG(fmt, args...) fprintf(stderr, "[ERROR]  " fmt "\n", ##args)
++
++#define CHECK_RET(cond, return_expr) \
++    do                               \
++    {                                \
++        if (!(cond))                 \
++        {                            \
++            return_expr;             \
++        }                            \
++    } while (0)
++
++#define LOG_PRINT(message, ...)         \
++    do                                  \
++    {                                   \
++        printf(message, ##__VA_ARGS__); \
++    } while (0)
++
++bool ReadFile(const std::string &filePath, size_t fileSize, void *buffer, size_t bufferSize)
++{
++    struct stat sBuf;
++    int fileStatus = stat(filePath.data(), &sBuf);
++    if (fileStatus == -1)
++    {
++        ERROR_LOG("failed to get file %s", filePath.c_str());
++        return false;
++    }
++    if (S_ISREG(sBuf.st_mode) == 0)
++    {
++        ERROR_LOG("%s is not a file, please enter a file", filePath.c_str());
++        return false;
++    }
++
++    std::ifstream file;
++    file.open(filePath, std::ios::binary);
++    if (!file.is_open())
++    {
++        ERROR_LOG("Open file failed. path = %s", filePath.c_str());
++        return false;
++    }
++
++    std::filebuf *buf = file.rdbuf();
++    size_t size = buf->pubseekoff(0, std::ios::end, std::ios::in);
++    if (size == 0)
++    {
++        ERROR_LOG("file size is 0");
++        file.close();
++        return false;
++    }
++    if (size > bufferSize)
++    {
++        ERROR_LOG("file size is larger than buffer size");
++        file.close();
++        return false;
++    }
++    buf->pubseekpos(0, std::ios::in);
++    buf->sgetn(static_cast<char *>(buffer), size);
++    fileSize = size;
++    file.close();
++    return true;
++}
++
++bool WriteFile(const std::string &filePath, const void *buffer, size_t size)
++{
++    if (buffer == nullptr)
++    {
++        ERROR_LOG("Write file failed. buffer is nullptr");
++        return false;
++    }
++
++    int fd = open(filePath.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWRITE);
++    if (fd < 0)
++    {
++        ERROR_LOG("Open file failed. path = %s", filePath.c_str());
++        return false;
++    }
++
++    auto writeSize = write(fd, buffer, size);
++    (void)close(fd);
++    if (writeSize != size)
++    {
++        ERROR_LOG("Write file Failed.");
++        return false;
++    }
++
++    return true;
++}
++
++int64_t GetShapeSize(const std::vector<int64_t> &shape)
++{
++    int64_t shapeSize = 1;
++    for (auto i : shape)
++    {
++        shapeSize *= i;
++    }
++    return shapeSize;
++}
++
++int Init(int32_t deviceId, aclrtStream *stream)
++{
++    // 固定写法，acl初始化
++    auto ret = aclInit(nullptr);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclInit failed. ERROR: %d\n", ret); return FAILED);
++    ret = aclrtSetDevice(deviceId);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSetDevice failed. ERROR: %d\n", ret); return FAILED);
++    ret = aclrtCreateStream(stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtCreateStream failed. ERROR: %d\n", ret); return FAILED);
++
++    return SUCCESS;
++}
++
++template <typename T>
++int CreateAclTensor(const std::vector<T> &hostData, const std::vector<int64_t> &shape, void **deviceAddr,
++                    aclDataType dataType, aclTensor **tensor)
++{
++    auto size = GetShapeSize(shape) * sizeof(T);
++    // 调用aclrtMalloc申请device侧内存
++    auto ret = aclrtMalloc(deviceAddr, size, ACL_MEM_MALLOC_HUGE_FIRST);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMalloc failed. ERROR: %d\n", ret); return FAILED);
++
++    // 调用aclrtMemcpy将host侧数据拷贝到device侧内存上
++    ret = aclrtMemcpy(*deviceAddr, size, hostData.data(), size, ACL_MEMCPY_HOST_TO_DEVICE);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtMemcpy failed. ERROR: %d\n", ret); return FAILED);
++
++    // 调用aclCreateTensor接口创建aclTensor
++    *tensor = aclCreateTensor(shape.data(), shape.size(), dataType, nullptr, 0, aclFormat::ACL_FORMAT_ND, shape.data(),
++                              shape.size(), *deviceAddr);
++    return SUCCESS;
++}
++
++int main(int argc, char **argv)
++{
++    // 1. （固定写法）device/stream初始化, 参考acl对外接口列表
++    // 根据自己的实际device填写deviceId
++    int32_t deviceId = 0;
++    aclrtStream stream;
++    auto ret = Init(deviceId, &stream);
++    CHECK_RET(ret == 0, LOG_PRINT("Init acl failed. ERROR: %d\n", ret); return FAILED);
++
++    // 2. 构造输入与输出，需要根据API的接口自定义构造
++    std::vector<int64_t> inputXShape = {10, 10};
++    std::vector<int64_t> outputYShape = {10, 10};
++    void *inputXDeviceAddr = nullptr;
++    void *outputYDeviceAddr = nullptr;
++    aclTensor *inputX = nullptr;
++    aclTensor *outputY = nullptr;
++    size_t inputXShapeSize_1 = inputXShape[0] * inputXShape[1];
++    size_t outputYShapeSize_1 = inputXShape[0] * inputXShape[1];
++    size_t dataType = 2;
++    std::vector<aclFloat16> inputXHostData(inputXShape[0] * inputXShape[1]);
++    std::vector<aclFloat16> outputYHostData(outputYShape[0] * outputYShape[1]);
++
++    size_t fileSize = 0;
++    void **input1 = (void **)(&inputXHostData);
++    // 读取数据
++    ReadFile("../input/input_x.bin", fileSize, *input1, inputXShapeSize_1 * dataType);
++    INFO_LOG("Set input success");
++    // 创建inputX aclTensor
++    ret = CreateAclTensor(inputXHostData, inputXShape, &inputXDeviceAddr, aclDataType::ACL_FLOAT16, &inputX);
++    CHECK_RET(ret == ACL_SUCCESS, return FAILED);
++    // 创建outputY aclTensor
++    ret = CreateAclTensor(outputYHostData, outputYShape, &outputYDeviceAddr, aclDataType::ACL_FLOAT16, &outputY);
++    CHECK_RET(ret == ACL_SUCCESS, return FAILED);
++
++    // 3. 调用CANN自定义算子库API
++    uint64_t workspaceSize = 0;
++    aclOpExecutor *executor;
++    // 计算workspace大小并申请内存
++    ret = aclnnExpGetWorkspaceSize(inputX, 2.0f, 2.0f, 1.0f, outputY, &workspaceSize, &executor);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnExpGetWorkspaceSize failed. ERROR: %d\n", ret); return FAILED);
++    void *workspaceAddr = nullptr;
++    if (workspaceSize > 0)
++    {
++        ret = aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);
++        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("allocate workspace failed. ERROR: %d\n", ret); return FAILED;);
++    }
++    // 执行算子
++    ret = aclnnExp(workspaceAddr, workspaceSize, executor, stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclnnExp failed. ERROR: %d\n", ret); return FAILED);
++
++    // 4. （固定写法）同步等待任务执行结束
++    ret = aclrtSynchronizeStream(stream);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return FAILED);
++
++    // 5. 获取输出的值，将device侧内存上的结果拷贝至host侧，需要根据具体API的接口定义修改
++    auto size = GetShapeSize(outputYShape);
++    std::vector<aclFloat16> resultData(size, 0);
++    ret = aclrtMemcpy(resultData.data(), resultData.size() * sizeof(resultData[0]), outputYDeviceAddr,
++                      size * sizeof(aclFloat16), ACL_MEMCPY_DEVICE_TO_HOST);
++    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy result from device to host failed. ERROR: %d\n", ret); return FAILED);
++    void **output1 = (void **)(&resultData);
++    // 写出数据
++    WriteFile("../output/output_y.bin", *output1, outputYShapeSize_1 * dataType);
++    INFO_LOG("Write output success");
++
++    // 6. 释放aclTensor，需要根据具体API的接口定义修改
++    aclDestroyTensor(inputX);
++    aclDestroyTensor(outputY);
++
++    // 7. 释放device资源，需要根据具体API的接口定义修改
++    aclrtFree(inputXDeviceAddr);
++    aclrtFree(outputYDeviceAddr);
++    if (workspaceSize > 0)
++    {
++        aclrtFree(workspaceAddr);
++    }
++    aclrtDestroyStream(stream);
++    aclrtResetDevice(deviceId);
++    aclFinalize();
++
++    return SUCCESS;
++}
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/run.sh b/src/contrib/math/exp/examples/AclNNInvocationNaive/run.sh
+new file mode 100644
+index 00000000..2d3dbed6
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/run.sh
+@@ -0,0 +1,52 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ===========================================================================================================
++if [ -n "$ASCEND_INSTALL_PATH" ]; then
++    _ASCEND_INSTALL_PATH=$ASCEND_INSTALL_PATH
++elif [ -n "$ASCEND_HOME_PATH" ]; then
++    _ASCEND_INSTALL_PATH=$ASCEND_HOME_PATH
++else
++    if [ -d "$HOME/Ascend/ascend-toolkit/latest" ]; then
++        _ASCEND_INSTALL_PATH=$HOME/Ascend/ascend-toolkit/latest
++    else
++        _ASCEND_INSTALL_PATH=/usr/local/Ascend/ascend-toolkit/latest
++    fi
++fi
++source $_ASCEND_INSTALL_PATH/bin/setenv.bash
++export DDK_PATH=$_ASCEND_INSTALL_PATH
++export NPU_HOST_LIB=$_ASCEND_INSTALL_PATH/lib64
++
++rm -rf $HOME/ascend/log/*
++rm ./input/*.bin
++rm ./output/*.bin
++
++python3 gen_data.py
++
++if [ $? -ne 0 ]; then
++    echo "ERROR: generate input data failed!"
++    return 1
++fi
++echo "INFO: generate input data success!"
++set -e
++rm -rf build
++mkdir -p build
++cmake -B build
++cmake --build build -j
++(
++    cd build
++    ./execute_exp_op
++)
++ret=`python3 verify_result.py output/output_y.bin output/golden.bin`
++echo $ret
++if [ "x$ret" == "xtest pass" ]; then
++    echo ""
++    echo "#####################################"
++    echo "INFO: you have passed the Precision!"
++    echo "#####################################"
++    echo ""
++fi
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/examples/AclNNInvocationNaive/verify_result.py b/src/contrib/math/exp/examples/AclNNInvocationNaive/verify_result.py
+new file mode 100644
+index 00000000..6330e69c
+--- /dev/null
++++ b/src/contrib/math/exp/examples/AclNNInvocationNaive/verify_result.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/python3
++# -*- coding:utf-8 -*-
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ==========================================================================================================
++
++import os
++import sys
++import numpy as np
++
++LOSS = 1e-3 
++MINIMUM = 10e-10
++
++def verify_result(real_result, golden):
++    real_result = np.fromfile(real_result, dtype=np.float16) 
++    golden = np.fromfile(golden, dtype=np.float16) 
++    result = np.abs(real_result - golden) 
++    deno = np.maximum(np.abs(real_result), np.abs(golden))  
++    result_atol = np.less_equal(result, LOSS) 
++    result_rtol = np.less_equal(result / np.add(deno, MINIMUM), LOSS) 
++    if not result_rtol.all() and not result_atol.all():
++        if np.sum(result_rtol == False) > real_result.size * LOSS and \
++           np.sum(result_atol == False) > real_result.size * LOSS: 
++            print("[ERROR] result error")
++            return False
++    print("test pass")
++    return True
++
++if __name__ == '__main__':
++    verify_result(sys.argv[1], sys.argv[2])
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/framework/CMakeLists.txt b/src/contrib/math/exp/framework/CMakeLists.txt
+new file mode 100644
+index 00000000..b6be9b49
+--- /dev/null
++++ b/src/contrib/math/exp/framework/CMakeLists.txt
+@@ -0,0 +1,11 @@
++if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/mindspore")
++    if(EXISTS  "${CMAKE_CURRENT_SOURCE_DIR}/caffe_plugin")
++        add_subdirectory(caffe_plugin)
++    endif()
++    if(EXISTS  "${CMAKE_CURRENT_SOURCE_DIR}/tf_plugin")
++        add_subdirectory(tf_plugin)
++    endif()
++    if(EXISTS  "${CMAKE_CURRENT_SOURCE_DIR}/onnx_plugin")
++        add_subdirectory(onnx_plugin)
++    endif()
++endif()
+diff --git a/src/contrib/math/exp/framework/tf_plugin/CMakeLists.txt b/src/contrib/math/exp/framework/tf_plugin/CMakeLists.txt
+new file mode 100644
+index 00000000..a6aba5c2
+--- /dev/null
++++ b/src/contrib/math/exp/framework/tf_plugin/CMakeLists.txt
+@@ -0,0 +1,14 @@
++
++aux_source_directory(${CMAKE_CURRENT_SOURCE_DIR} plugin_srcs)
++add_library(cust_tf_parsers SHARED ${plugin_srcs})
++target_compile_definitions(cust_tf_parsers PRIVATE google=ascend_private)
++if(ENABLE_CROSS_COMPILE)
++    target_link_directories(cust_tf_parsers PRIVATE
++                            ${CMAKE_COMPILE_COMPILER_LIBRARY}
++                            ${CMAKE_COMPILE_RUNTIME_LIBRARY}
++    )
++endif()
++target_link_libraries(cust_tf_parsers PRIVATE intf_pub graph)
++install(TARGETS cust_tf_parsers
++        LIBRARY DESTINATION packages/vendors/${vendor_name}/framework/tensorflow
++)
+diff --git a/src/contrib/math/exp/framework/tf_plugin/tensorflow_exp_plugin.cc b/src/contrib/math/exp/framework/tf_plugin/tensorflow_exp_plugin.cc
+new file mode 100644
+index 00000000..8f9f1604
+--- /dev/null
++++ b/src/contrib/math/exp/framework/tf_plugin/tensorflow_exp_plugin.cc
+@@ -0,0 +1,23 @@
++/* Copyright (C) 2020-2021. Huawei Technologies Co., Ltd. All
++rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the Apache License Version 2.0.
++ * You may not use this file except in compliance with the License.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * Apache License for more details at
++ * http://www.apache.org/licenses/LICENSE-2.0
++ */
++
++#include "register/register.h"
++
++namespace domi {
++// register op info to GE
++REGISTER_CUSTOM_OP("Exp")
++    .FrameworkType(TENSORFLOW)   // type: CAFFE, TENSORFLOW
++    .OriginOpType("Exp")      // name in tf module
++    .ParseParamsByOperatorFn(AutoMappingByOpFn);
++}  // namespace domi
+diff --git a/src/contrib/math/exp/op_host/exp.cpp b/src/contrib/math/exp/op_host/exp.cpp
+new file mode 100644
+index 00000000..5cd452f9
+--- /dev/null
++++ b/src/contrib/math/exp/op_host/exp.cpp
+@@ -0,0 +1,169 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/**
++ * @file exp.cpp
++ */
++
++#include <cmath>
++#include "exp_tiling.h"
++#include "register/op_def_registry.h"
++#include "graph/utils/type_utils.h"
++#include "tiling/platform/platform_ascendc.h"
++namespace optiling
++{
++    const uint64_t BLOCK_SIZE = 32;
++    const uint64_t BUFFER_NUM = 2;
++    static ge::graphStatus TilingFunc(gert::TilingContext *context)
++    {
++        ExpTilingData tiling;
++        uint64_t ubLength = 0;
++        uint64_t bigCoreDataNum = 0;
++        uint64_t bigCoreLoopNum = 0;
++        uint64_t bigCoreTailDataNum = 0;
++
++        auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
++        ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubLength);
++        auto coreNum = ascendcPlatform.GetCoreNum();
++    
++        uint64_t inputDataNum = context->GetInputShape(0)->GetStorageShape().GetShapeSize();
++        uint32_t dataTypeLength = 0;
++        ge::TypeUtils::GetDataTypeLength(context->GetInputDesc(0)->GetDataType(), dataTypeLength);
++        uint64_t inputLength = inputDataNum * dataTypeLength;
++        if (coreNum == 0 || BLOCK_SIZE == 0) 
++        {
++            return ge::GRAPH_FAILED;
++        } 
++        auto dt = context->GetInputTensor(0)->GetDataType();
++        uint64_t ubPartNum = (dt == ge:: DT_BF16) ? 3 : 2;
++        uint64_t ubPartLength = ubLength / ubPartNum / BUFFER_NUM;
++        // The number of 32B data blocks that can be used for each data. DOUBLE BUFFER is already counted here
++        uint64_t ubPartBlockNum = ubPartLength / BLOCK_SIZE;
++        uint64_t ubPartDataNum = (ubPartBlockNum * BLOCK_SIZE) / dataTypeLength;
++        uint64_t inputLengthAlign32 = (((inputLength + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE);
++   
++        if(ubPartDataNum >= inputDataNum)
++        {
++            coreNum=1;
++        }
++        else
++        {
++            // There is at least 32B of data on each core, satisfying several settings for several cores. The maximum number of audits is the actual number of audits
++            coreNum = (coreNum <  inputLengthAlign32 / BLOCK_SIZE) ? coreNum : inputLengthAlign32 / BLOCK_SIZE;
++        }
++        
++        uint64_t everyCoreInputBlockNum = inputLengthAlign32 / BLOCK_SIZE / coreNum;
++        uint64_t tailBlockNum = (inputLengthAlign32 / BLOCK_SIZE) % coreNum;
++        
++        // Small chunks are calculated and sliced several times using the number of data on each core
++        uint64_t smallCoreDataNum = everyCoreInputBlockNum * BLOCK_SIZE / dataTypeLength;
++        uint64_t smallCoreLoopNum = smallCoreDataNum / ubPartDataNum;
++        smallCoreLoopNum = (everyCoreInputBlockNum % ubPartBlockNum) == 0 ? smallCoreLoopNum : smallCoreLoopNum + 1;
++        // Tail block calculation for small chunks of data
++        uint64_t smallCoreTailDataNum = smallCoreDataNum - ubPartDataNum * (smallCoreLoopNum-1);
++        smallCoreTailDataNum = smallCoreTailDataNum == 0 ? ubPartDataNum : smallCoreTailDataNum;
++    
++        if(0 != tailBlockNum)
++        {
++            everyCoreInputBlockNum += 1;
++            bigCoreDataNum = everyCoreInputBlockNum * BLOCK_SIZE / dataTypeLength;
++            bigCoreLoopNum = bigCoreDataNum / ubPartDataNum;
++            bigCoreLoopNum = (everyCoreInputBlockNum % ubPartBlockNum) == 0 ? bigCoreLoopNum : bigCoreLoopNum + 1;
++            bigCoreTailDataNum = bigCoreDataNum - ubPartDataNum * (bigCoreLoopNum-1);
++            bigCoreTailDataNum = bigCoreTailDataNum == 0 ? ubPartDataNum : bigCoreTailDataNum;
++            context->SetTilingKey(1);
++        }
++        else
++        {
++            context->SetTilingKey(0);
++        }
++        
++        tiling.set_smallCoreDataNum(smallCoreDataNum);
++        tiling.set_bigCoreDataNum(bigCoreDataNum);
++        tiling.set_ubPartDataNum(ubPartDataNum);
++        tiling.set_smallCoreTailDataNum(smallCoreTailDataNum);
++        tiling.set_bigCoreTailDataNum(bigCoreTailDataNum);
++        tiling.set_smallCoreLoopNum(smallCoreLoopNum);
++        tiling.set_bigCoreLoopNum(bigCoreLoopNum);
++        tiling.set_tailBlockNum(tailBlockNum);
++        const gert::RuntimeAttrs *attrs = context->GetAttrs();
++        const float *base = attrs->GetAttrPointer<float>(0);
++        if (*base == -1.0f)
++        {
++            tiling.set_base(1.0f);
++        }
++        else if (*base > 0.0f)
++        {
++            tiling.set_base(log(*base));
++        }
++        else{
++            return ge::GRAPH_FAILED;
++        }
++        const float *scale = attrs->GetAttrPointer<float>(1);
++        tiling.set_scale(*scale);
++        const float *shift = attrs->GetAttrPointer<float>(2);
++        tiling.set_shift(*shift);
++        context->SetBlockDim(coreNum);
++        
++        tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
++        context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
++        size_t *currentWorkspace = context->GetWorkspaceSizes(1);
++        currentWorkspace[0] = 0;
++        return ge::GRAPH_SUCCESS;
++    }
++    }
++
++namespace ge {
++    static ge::graphStatus InferShape(gert::InferShapeContext* context)
++    {
++        const gert::Shape* x1_shape = context->GetInputShape(0);
++        gert::Shape* y_shape = context->GetOutputShape(0);
++        *y_shape = *x1_shape;
++        return GRAPH_SUCCESS;
++    }
++    static graphStatus InferDataType(gert::InferDataTypeContext* context)
++    {
++        const auto inputDataType = context->GetInputDataType(0);
++        context->SetOutputDataType(0, inputDataType);
++        return ge::GRAPH_SUCCESS;
++    }
++    }        
++
++
++namespace ops
++{
++    class Exp : public OpDef{
++    public:
++        explicit Exp(const char *name) : OpDef(name)
++        {
++            this->Input("x")
++                .ParamType(REQUIRED)
++                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_BF16})
++                .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++                .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++            this->Output("y")
++                .ParamType(REQUIRED)
++                .DataType({ge::DT_FLOAT16, ge::DT_FLOAT, ge::DT_BF16})
++                .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
++                .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND});
++            this->Attr("base").AttrType(OPTIONAL).Float(-1.0);
++            this->Attr("scale").AttrType(OPTIONAL).Float(1.0);
++            this->Attr("shift").AttrType(OPTIONAL).Float(0.0);
++
++            this->SetInferShape(ge::InferShape);
++
++            this->AICore()
++                .SetTiling(optiling::TilingFunc);
++            this->AICore().AddConfig("ascend910b");
++        }
++    };
++
++    OP_ADD(Exp);
++}
+diff --git a/src/contrib/math/exp/op_host/exp_tiling.h b/src/contrib/math/exp/op_host/exp_tiling.h
+new file mode 100644
+index 00000000..d8754885
+--- /dev/null
++++ b/src/contrib/math/exp/op_host/exp_tiling.h
+@@ -0,0 +1,36 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/**
++ * @file exp_tiling.h
++ */
++ 
++#ifndef EXP_TILING_H
++#define EXP_TILING_H
++#include "register/tilingdata_base.h"
++
++namespace optiling {
++BEGIN_TILING_DATA_DEF(ExpTilingData)
++  TILING_DATA_FIELD_DEF(uint64_t, smallCoreDataNum);
++  TILING_DATA_FIELD_DEF(uint64_t, bigCoreDataNum);
++  TILING_DATA_FIELD_DEF(uint64_t, ubPartDataNum);
++  TILING_DATA_FIELD_DEF(uint64_t, smallCoreTailDataNum);
++  TILING_DATA_FIELD_DEF(uint64_t, bigCoreTailDataNum);
++  TILING_DATA_FIELD_DEF(uint64_t, smallCoreLoopNum);
++  TILING_DATA_FIELD_DEF(uint64_t, bigCoreLoopNum);
++  TILING_DATA_FIELD_DEF(uint64_t, tailBlockNum);
++  TILING_DATA_FIELD_DEF(float, base);
++  TILING_DATA_FIELD_DEF(float, scale);
++  TILING_DATA_FIELD_DEF(float, shift);
++END_TILING_DATA_DEF;
++
++REGISTER_TILING_DATA_CLASS(Exp, ExpTilingData)
++}
++#endif // EXP_TILING_H
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/op_kernel/exp.cpp b/src/contrib/math/exp/op_kernel/exp.cpp
+new file mode 100644
+index 00000000..dee1516c
+--- /dev/null
++++ b/src/contrib/math/exp/op_kernel/exp.cpp
+@@ -0,0 +1,165 @@
++/**
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/**
++ * @file exp.cpp
++ */
++ 
++#include "kernel_operator.h"
++using namespace AscendC;
++#define GENERAL_OP_IMPL(templateClass,...)                                          \
++  do{                                                                               \
++      GET_TILING_DATA(tiling_data, tiling);                                         \
++      templateClass<__VA_ARGS__>op;                                                 \
++      op.Init(x, y, tiling_data.smallCoreDataNum,                                   \
++                tiling_data.bigCoreDataNum, tiling_data.bigCoreLoopNum,             \
++                tiling_data.smallCoreLoopNum, tiling_data.ubPartDataNum,            \
++                tiling_data.smallCoreTailDataNum, tiling_data.bigCoreTailDataNum,   \
++                tiling_data.tailBlockNum, tiling_data.base, tiling_data.scale, tiling_data.shift);                                          \
++      op.Process();                                                                 \
++  }while(0)
++constexpr int32_t BUFFER_NUM = 2;
++template<typename TYPE_X, typename TYPE_Y ,bool IsExistBigCore> class KernelExp {
++public:
++    __aicore__ inline KernelExp() {}
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y,  uint64_t smallCoreDataNum,
++                                uint64_t bigCoreDataNum, uint64_t bigCoreLoopNum, 
++                                uint64_t smallCoreLoopNum, uint64_t ubPartDataNum, 
++                                uint64_t smallCoreTailDataNum, uint64_t bigCoreTailDataNum, 
++                                uint64_t tailBlockNum, float base, float scale, float shift) 
++    {
++        ASSERT(AscendC::GetBlockNum() != 0 && "block dim can not be zero!");
++        uint64_t coreNum = AscendC::GetBlockIdx();
++        uint64_t globalBufferIndex = bigCoreDataNum * AscendC::GetBlockIdx();
++        this->ubPartDataNum = ubPartDataNum;
++        if constexpr (IsExistBigCore) 
++        {
++          if (coreNum < tailBlockNum) 
++          { 
++            this->coreDataNum = bigCoreDataNum;
++            this->tileNum = bigCoreLoopNum;
++            this->tailDataNum = bigCoreTailDataNum;
++          }
++          else 
++          { 
++            this->coreDataNum = smallCoreDataNum;
++            this->tileNum = smallCoreLoopNum;
++            this->tailDataNum = smallCoreTailDataNum;
++            globalBufferIndex -= (bigCoreDataNum - smallCoreDataNum) * (AscendC::GetBlockIdx() - tailBlockNum);
++          }
++        }
++        else
++        {
++          this->coreDataNum = smallCoreDataNum;
++          this->tileNum = smallCoreLoopNum;
++          this->tailDataNum = smallCoreTailDataNum;
++          globalBufferIndex = smallCoreDataNum * AscendC::GetBlockIdx();
++        }
++        this->base = base;
++        this->shift = shift;
++        this->scale = scale;
++        xGm.SetGlobalBuffer((__gm__ TYPE_X*)x + globalBufferIndex, this->coreDataNum);
++        yGm.SetGlobalBuffer((__gm__ TYPE_Y*)y + globalBufferIndex, this->coreDataNum);
++        pipe.InitBuffer(inQueueX, BUFFER_NUM, this->ubPartDataNum * sizeof(TYPE_X));
++        pipe.InitBuffer(outQueueY, BUFFER_NUM, this->ubPartDataNum * sizeof(TYPE_Y));
++        if constexpr (std::is_same_v<DTYPE_X, bfloat16_t>) 
++        {
++          pipe.InitBuffer(tmp1, this->ubPartDataNum * sizeof(float));
++        }
++    }
++    __aicore__ inline void Process()
++    {
++        int32_t loopCount = this->tileNum;
++        this->processDataNum = this->ubPartDataNum;
++        for (int32_t i = 0; i < loopCount-1; i++) 
++        {
++            CopyIn(i);
++            Compute(i);
++            CopyOut(i);
++        }
++        this->processDataNum = this->tailDataNum;
++        CopyIn(loopCount-1);
++        Compute(loopCount-1);
++        CopyOut(loopCount-1);
++    }
++
++private:
++    __aicore__ inline void CopyIn(int32_t progress)
++    {
++        AscendC::LocalTensor<TYPE_X> xLocal = inQueueX.AllocTensor<TYPE_X>();
++        DataCopy(xLocal, xGm[progress * this->ubPartDataNum], this->processDataNum);
++        inQueueX.EnQue(xLocal);
++    }
++    __aicore__ inline void Compute(int32_t progress)
++    {
++        AscendC::LocalTensor<TYPE_X> xLocal = inQueueX.DeQue<TYPE_X>();
++        AscendC::LocalTensor<TYPE_Y> yLocal = outQueueY.AllocTensor<TYPE_Y>();
++        if constexpr ( std::is_same_v< DTYPE_X, float32_t> || std::is_same_v<TYPE_X, float16_t>)
++        {   
++            Muls(yLocal, xLocal, (DTYPE_X)this->scale, this->processDataNum);
++            Adds(yLocal, yLocal, (DTYPE_X)this->shift, this->processDataNum);
++            Muls(yLocal, yLocal, (DTYPE_X)this->base, this->processDataNum);
++            Exp(yLocal, yLocal, this->processDataNum);
++        } 
++        else 
++        {
++            LocalTensor<float> xLocalFp32 = tmp1.Get<float>();
++            Cast(xLocalFp32, xLocal, RoundMode::CAST_NONE, this->processDataNum);
++            Muls(xLocalFp32, xLocalFp32, this->scale, this->processDataNum);
++            Adds(xLocalFp32, xLocalFp32, this->shift, this->processDataNum);
++            Muls(xLocalFp32, xLocalFp32, this->base, this->processDataNum);
++            Exp(xLocalFp32, xLocalFp32, this->processDataNum);
++            Cast(yLocal, xLocalFp32, RoundMode::CAST_RINT, this->processDataNum);
++        }
++        outQueueY.EnQue<TYPE_Y>(yLocal);
++        inQueueX.FreeTensor(xLocal);
++    }
++    __aicore__ inline void CopyOut(int32_t progress)
++    {
++        AscendC::LocalTensor<TYPE_Y> yLocal = outQueueY.DeQue<TYPE_Y>();
++        DataCopy(yGm[progress * this->ubPartDataNum], yLocal, this->processDataNum);
++        outQueueY.FreeTensor(yLocal);
++    }
++
++private:
++    AscendC::TPipe pipe;
++    AscendC::TQue<AscendC::QuePosition::VECIN, BUFFER_NUM> inQueueX;
++    AscendC::TQue<AscendC::QuePosition::VECOUT, BUFFER_NUM> outQueueY;
++    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmp1;
++    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmp2;
++    AscendC::GlobalTensor<TYPE_X> xGm;
++    AscendC::GlobalTensor<TYPE_Y> yGm;
++    uint64_t coreDataNum;
++    uint64_t tileNum;
++    uint64_t ubPartDataNum;
++    uint64_t tailDataNum;
++    uint64_t processDataNum;
++    float base;
++    float shift;
++    float scale;
++};
++extern "C" __global__ __aicore__ void exp(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
++{
++    if(TILING_KEY_IS(1))
++    {
++      GENERAL_OP_IMPL(KernelExp,DTYPE_X, DTYPE_Y, true);
++    }
++     else if(TILING_KEY_IS(0))
++    {
++      GENERAL_OP_IMPL(KernelExp,DTYPE_X, DTYPE_Y, false);
++    }
++}
++#ifndef ASCENDC_CPU_DEBUG
++void reciprocal_do(uint32_t blockDim, void* l2ctrl, void* stream, uint8_t* x, uint8_t* y,
++    uint8_t* workspace, uint8_t* tiling)
++{
++    reciprocal<<<blockDim, l2ctrl, stream>>>(x, y, workspace, tiling);
++}
++#endif
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/opp_kernel_aicpu/.gitkeep b/src/contrib/math/exp/opp_kernel_aicpu/.gitkeep
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/contrib/math/exp/tests/st/.gitkeep b/src/contrib/math/exp/tests/st/.gitkeep
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/src/contrib/math/exp/tests/st/Exp_case_alltype.json b/src/contrib/math/exp/tests/st/Exp_case_alltype.json
+new file mode 100644
+index 00000000..0d1ec5b9
+--- /dev/null
++++ b/src/contrib/math/exp/tests/st/Exp_case_alltype.json
+@@ -0,0 +1,61 @@
++[
++    {
++        "case_name": "Test_Exp_001",
++        "op": "Exp",
++        "calc_expect_func_file": "./test_exp.py:calc_expect_func",
++        "input_desc": [
++            {
++                "format": [
++                    "ND"
++                ],
++                "type": [
++                    "float",
++                    "float16",
++                    "bfloat16"
++                ],
++                "shape": [100],
++                "data_distribute": [
++                    "uniform"
++                ],
++                "value_range": [
++                    [
++                        0.1,
++                        1.0
++                    ]
++                ],
++                "name": "x"
++            }
++        ],
++        "output_desc": [
++            {
++                "format": [
++                    "ND"
++                ],
++                "type": [
++                    "float",
++                    "float16",
++                    "bfloat16"
++                ],
++                "shape": [100],
++                "name": "y"
++            }
++        ],
++        "attr": [
++            {
++                "name": "base",
++                "type": "float",
++                "value": 2.0
++            },
++            {
++                "name": "scale",
++                "type": "float",
++                "value": 1.0
++            },
++            {
++                "name": "shift",
++                "type": "float",
++                "value": 2.0
++            }
++        ]
++    }
++]
+\ No newline at end of file
+diff --git a/src/contrib/math/exp/tests/st/README.md b/src/contrib/math/exp/tests/st/README.md
+new file mode 100644
+index 00000000..7f19f635
+--- /dev/null
++++ b/src/contrib/math/exp/tests/st/README.md
+@@ -0,0 +1,51 @@
++## 目录结构介绍
++```
++├── msopst.ini                  // st测试配置文件 
++├── Exp_case_alltype.json     // 测试用例定义文件示例(8.0.RC3.alpha003版本生成)
++└── test_reciprocal.py               // 算子期望数据生成脚本
++```
++
++## ST测试介绍
++
++完成算子包部署后，可选择使用msOpST工具进行ST（System Test）测试，在真实的硬件环境中，对算子的输入输出进行测试，以验证算子的功能是否正确。
++
++测试用例通常包括各种不同类型的数据输入和预期输出，以及一些边界情况和异常情况的测试。通过ST测试，可以确保算子功能的正确性，并且能够在实际应用中正常运行。
++
++具体描述可参考[算子测试（msOpST）
++](https://www.hiascend.com/document/detail/zh/mindstudio/70RC3/ODtools/Operatordevelopmenttools/msopdev_16_0087.html)章节。
++
++## 执行测试用例
++  **请确保已根据算子包编译部署步骤完成本算子的编译部署动作。**
++
++  - 配置环境变量
++
++    ```bash
++    export DDK_PATH=${INSTALL_DIR}
++    export NPU_HOST_LIB=${INSTALL_DIR}/{arch-os}/devlib
++    ```
++
++  - 进入到测试用例目录
++
++    ```bash
++    cd ${git_clone_path}/cann-ops/src/contrib/math/Exp/tests/st
++    ```
++
++  - 根据执行机器的架构修改msopst.ini中的atc_singleop_advance_option和HOST_ARCH
++
++  - 查看Soc Version
++
++    ```bash
++    npu-smi info
++    ```
++    打印的表格中Name列即为Soc Version
++
++  - 执行测试用例
++
++    ```bash
++    ${INSTALL_DIR}/python/site-packages/bin/msopst run -i ./Reciprocal_case_alltype.json -soc {Soc Version} -out ./output -conf msopst.ini
++    ```
++
++## 更新说明
++| 时间 | 更新事项 |
++|----|------|
++| 2025/03/29 | 新增本readme |
+diff --git a/src/contrib/math/exp/tests/st/msopst.ini b/src/contrib/math/exp/tests/st/msopst.ini
+new file mode 100644
+index 00000000..810d0425
+--- /dev/null
++++ b/src/contrib/math/exp/tests/st/msopst.ini
+@@ -0,0 +1,57 @@
++################################################################################################
++##      only_gen_without_run      only_run_without_gen                功能                    ##
++##          False(默认)              False(默认)           既生成ST测试代码,又运行ST测试代码  ##
++##          True                     True/False            只生成ST测试代码,不运行ST测试代码  ##
++##          False                    True                  不生成ST测试代码,只运行ST测试代码  ##
++################################################################################################
++
++only_gen_without_run = False
++only_run_without_gen = False
++
++# performance_mode: ST运行是否获取性能数据，参数取值：
++#   False: ST运行不获取获取性能数据
++#   True : ST运行获取性能数据
++performance_mode = False
++
++# ASCEND_GLOBAL_LOG_LEVEL: 设置host日志级别环境变量，参数取值:
++#    0: 对应DEBUG级别
++#    1: 对应INFO级别
++#    2: 对应WARNING级别
++#    3: 对应ERROR级别(默认)
++#    4: 对应NULL级别，不输出日志
++ASCEND_GLOBAL_LOG_LEVEL = 3
++
++# ASCEND_SLOG_PRINT_TO_STDOUT: 日志屏幕打印控制。0: 屏幕不打印输出(默认); 1: 屏幕打印输出
++ASCEND_SLOG_PRINT_TO_STDOUT = 0
++
++# atc_singop_advance_option: 设置单算子模型转换高级选项
++# --log参数取值:
++#     debug: 输出debug/info/warning/error/event级别的运行信息
++#     info: 输出info/warning/error/event级别的运行信息
++#     warning: 输出warning/error/event级别的运行信息
++#     error: 输出error/event级别的运行信息(默认)
++#     null: 不输出日志信息
++# --precision_mode参数取值:
++#     force_fp16: 表示算子支持fp16和fp32时，强制选择fp16(默认)
++#     allow_fp32_to_fp16: 表示如果算子支持fp32，则保留原始精度fp32；如果不支持fp32，则选择fp16
++#     must_keep_origin_dtype: 表示保持原图精度
++#     allow_mix_precision: 表示混合精度模式
++# --host_env_os参数取值:
++#     linux: 表示设置操作系统类型为linux
++#     若模型编译环境的操作系统及其架构与模型运行环境不一致时，则需使用本参数设置模型运行环境的操作系统类型。
++#     如果不设置，则默认取模型编译环境的操作系统类型，即atc所在环境的操作系统类型。
++# --host_env_cpu参数取值:
++#     x86_64：表示设置操作系统架构为x86_64
++#     aarch64：表示设置操作系统架构为aarch64
++#     若模型编译环境的操作系统及其架构与模型运行环境不一致时，则需使用本参数设置模型运行环境的操作系统架构。
++#     如果不设置，则默认取模型编译环境的操作系统架构，即atc所在环境的操作系统架构。
++atc_singleop_advance_option = "--log=info --host_env_os=linux --host_env_cpu=aarch64 --precision_mode=must_keep_origin_dtype"
++
++# HOST_ARCH: ACL 执行机器的架构
++# x86_64 ：X86_64架构
++# aarch64 ： arm_64架构
++HOST_ARCH = "aarch64"
++
++# TOOL_CHAIN: c++编译器路径
++# g++ path ：g++工具链路径,以g++结尾
++TOOL_CHAIN = "/usr/bin/g++"
+diff --git a/src/contrib/math/exp/tests/st/test_exp.py b/src/contrib/math/exp/tests/st/test_exp.py
+new file mode 100644
+index 00000000..6d1e4cc5
+--- /dev/null
++++ b/src/contrib/math/exp/tests/st/test_exp.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/python3
++# coding=utf-8
++#
++# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++# This file is a part of the CANN Open Software.
++# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++# Please refer to the License for details. You may not use this file except in compliance with the License.
++# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++# See LICENSE in the root of the software repository for the full text of the License.
++# ======================================================================================================================
++import tensorflow as tf
++import numpy as np
++
++
++def exp_test(x, base, scale, shift): 
++    x = tf.convert_to_tensor(x)
++    y = x * scale + shift
++    if base != -1.0: 
++        if base < 0: 
++            return None
++        y *= math.log(base)
++    return y.numpy()
++
++
++def calc_expect_func(x, base=2.0, scale=1.0, shift=2.0): 
++    """
++    calc_expect_func
++    """
++    res = exp_test(x["x"], base, scale, shift)
++    return [res]
+diff --git a/src/contrib/math/exp/tests/ut/.gitkeep b/src/contrib/math/exp/tests/ut/.gitkeep
+new file mode 100644
+index 00000000..e69de29b

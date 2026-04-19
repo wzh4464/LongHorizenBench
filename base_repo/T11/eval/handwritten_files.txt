@@ -1,0 +1,17 @@
+src/compiler/commandLineParser.ts
+src/compiler/factory/emitHelpers.ts
+src/compiler/transformers/classFields.ts
+src/compiler/transformers/esDecorators.ts
+src/harness/evaluatorImpl.ts
+src/harness/fourslashInterfaceImpl.ts
+src/lib/decorators.d.ts
+src/lib/esnext.d.ts
+src/lib/esnext.decorators.d.ts
+src/lib/libs.json
+src/testRunner/tests.ts
+src/testRunner/unittests/evaluation/esDecoratorsMetadata.ts
+tests/cases/conformance/esDecorators/metadata/esDecoratorsMetadata1.ts
+tests/cases/conformance/esDecorators/metadata/esDecoratorsMetadata2.ts
+tests/cases/conformance/esDecorators/metadata/esDecoratorsMetadata3.ts
+tests/cases/conformance/esDecorators/metadata/esDecoratorsMetadata4.ts
+tests/cases/conformance/esDecorators/metadata/esDecoratorsMetadata5.ts

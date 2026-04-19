@@ -1,0 +1,12 @@
+src/compiler/checker.ts
+src/compiler/diagnosticMessages.json
+src/compiler/emitter.ts
+src/compiler/factory/nodeFactory.ts
+src/compiler/parser.ts
+src/compiler/scanner.ts
+src/compiler/types.ts
+src/compiler/visitorPublic.ts
+src/services/codefixes/convertLiteralTypeToMappedType.ts
+src/services/codefixes/convertToMappedObjectType.ts
+tests/cases/conformance/types/literal/templateLiteralTypes1.ts
+tests/cases/conformance/types/mapped/mappedTypeAsClauses.ts

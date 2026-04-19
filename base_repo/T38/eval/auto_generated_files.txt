@@ -1,0 +1,6 @@
+staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/config/apis/policyconfig/v1/zz_generated.conversion.go
+staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/config/apis/policyconfig/v1/zz_generated.deepcopy.go
+staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/config/apis/policyconfig/zz_generated.deepcopy.go
+staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/config/apis/webhookadmission/v1/zz_generated.conversion.go
+test/compatibility_lifecycle/reference/feature_list.md
+test/compatibility_lifecycle/reference/versioned_feature_list.yaml
