@@ -128,15 +128,15 @@ HOOK
 
 prompt_content="$(cat "$EXP_DIR/TASK_PROMPT.md")${CONSTRAINT_DIRECTIVE}"
 cd "$EXP_DIR"
-timeout 7200 claude \
+timeout 7200 claude-yunwu \
   --model opus --effort max \
   --dangerously-skip-permissions --permission-mode bypassPermissions \
-  --disallowedTools 'WebSearch,WebFetch' \
+  --disallowedTools 'WebSearch,WebFetch,Skill' \
   --print --output-format stream-json --verbose \
-  --no-session-persistence \
   "$prompt_content" \
   < /dev/null > claude_run.jsonl 2>&1 || true
 # 注意：2>&1 是必须的，否则 JSONL 捕获为 0B
+# 使用 claude-yunwu 而非 claude；禁用 Skill 防止调用 superpowers；保留 session（不加 --no-session-persistence）
 ```
 
 ### Cursor (config: cursor-composer2)

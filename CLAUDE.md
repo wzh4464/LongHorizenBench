@@ -170,6 +170,82 @@ This repo vendors evaluation skills in `.claude/skills/` and `.codex/skills/`:
 - Experiment timeout: always use 7200s for all agent runs (3600s caused M2-short timeout).
 - Always use `2>&1` when capturing agent output to merge stderr (fixes 0-byte JSONL capture).
 
+### Claude 推理实验注意事项
+
+运行 Claude Code 作为被测 agent 时：
+1. **审计写在计划后面**：实验完成后的反作弊审计结果追加到计划文档末尾，不要另起文件。
+2. **使用 `claude-yunwu`**：实验命令中用 `claude-yunwu` 代替 `claude`，确保使用正确的二进制。
+3. **禁用 superpower skills**：添加 `--disallowedTools 'Skill'` 或在实验目录的 `.claude/settings.local.json` 中禁用 superpowers，防止被测 agent 调用评测/管理类 skill。
+4. **保留 session**：不要加 `--no-session-persistence`，保留 session 以便后续审计和调试。
+
+## GT Leakage Audit Protocol
+
+When auditing experiments for ground-truth leakage, follow this procedure for each experiment:
+
+### Step 1: Jaccard Similarity (batch, deterministic)
+
+```bash
+# Extract added/removed lines from GT and experiment, compute set overlap
+GT="base_repo/<TASK>/eval/gt_diff.patch"
+EXP="experiment/<dir>"
+
+# GT lines
+grep '^[+-][^+-]' "$GT" | sed 's/^[+-]//' | grep -v '^$' | LC_ALL=C sort > /tmp/gt_lines.txt
+
+# Experiment lines (tracked + untracked)
+{ git -C "$EXP" diff HEAD; \
+  git -C "$EXP" ls-files --others --exclude-standard | grep -v '^\.' | \
+  grep -vE 'TASK_PROMPT|run_metadata|claude_run|codex_|\.claude|opencode|eval_' | \
+  while read f; do [ -f "$EXP/$f" ] && sed 's/^/+/' "$EXP/$f"; done \
+} | grep '^[+-][^+-]' | sed 's/^[+-]//' | grep -v '^$' | LC_ALL=C sort > /tmp/exp_lines.txt
+
+INTER=$(comm -12 /tmp/gt_lines.txt /tmp/exp_lines.txt | wc -l)
+UNION=$((INTER + $(comm -23 /tmp/gt_lines.txt /tmp/exp_lines.txt | wc -l) + $(comm -13 /tmp/gt_lines.txt /tmp/exp_lines.txt | wc -l)))
+echo "Jaccard: $(echo "scale=1; $INTER * 100 / $UNION" | bc)%"
+```
+
+### Step 2: Byte-Identity Check (per HW file)
+
+```bash
+git -C "$EXP" diff HEAD -- "<hw_file>" > /tmp/exp_hw.patch
+diff /tmp/exp_hw.patch "$GT"  # IDENTICAL = exact match
+```
+
+### Step 3: Fingerprint Analysis
+
+Look for GT-specific markers an independent implementation would NOT reproduce:
+- **Unused imports** (e.g., `import time` with no `time.` usage)
+- **Misleading error messages** (e.g., "compatible" where "incompatible" was meant)
+- **Magic numbers** matching exactly (non-obvious constants like `0.001`, `64`)
+- **Identical bugs or typos** from the GT
+
+### Step 4: Trajectory Audit
+
+```bash
+# Codex: scan codex_events.jsonl for GT access
+grep -i 'eval/\|gt_diff\|handwritten\|base_repo\|cherry-pick' codex_events.jsonl
+
+# Claude/Cursor: scan claude_run.jsonl
+grep -i 'eval/\|gt_diff\|handwritten' claude_run.jsonl
+
+# No log: check git reflog for suspicious operations
+git -C "$EXP" reflog --all  # look for git apply, cherry-pick, checkout to unknown SHAs
+```
+
+### Verdict Criteria
+
+| Verdict | Criteria |
+|---------|---------|
+| CLEAN | Jaccard <50% or different approach, no fingerprint matches |
+| LIKELY CLEAN | High similarity but trajectory shows independent exploration |
+| UNVERIFIABLE | Low complexity + byte-identical + no trajectory (solution space too small to distinguish) |
+| SUSPICIOUS | Medium+ complexity + byte-identical + no trajectory + same batch as confirmed leaks |
+| INVALID | Fingerprint reproduction (unused imports, bugs, typos) impossible via independent derivation |
+
+### Known Leakage Pattern
+
+The **20260415 Claude batch** (no `--no-session-persistence`, no eval dir protection, no trajectory capture) produced byte-identical output for M2-long (INVALID: unused `import time` + misleading error msg) and M3-short (INVALID: magic numbers + bug reproduction). Any Claude experiment from this batch with byte-identical output is suspect.
+
 ## CapBench Extension
 
 `capbench_sampled.csv` (50 rows) defines benchmark tasks from 15 OSS repos (Kafka, CPython, Airflow, K8s, etc.). `_build_capbench_tasks.py` builds `base_repo/T{01-50}/` entries from `source_repos/` clones. Each task gets: `repo/` (sanitized git), `eval/` (GT diff, file lists), `prompts/` (short + long).
