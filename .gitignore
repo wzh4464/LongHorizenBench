@@ -1,28 +1,8 @@
 # === Large data — managed by DVC / rsync, not git ===
 
-# Experiment run repos (each is a full git repo with agent output, ~200-300MB each)
-experiment/*-codex-*/
-experiment/*-claude-*/
-experiment/*-cursor-*/
-experiment/*-opencode-*/
-experiment/*-isolated/
-experiment/test-*/
-
-# Evaluation results (diffs, reports — rebuild with build_scores_csv.py)
-experiment/eval_results/
-
-# Batch run logs and ephemeral state
-experiment/*.log
-experiment/*.jsonl
-experiment/*.pid
-experiment/*_info.json
-experiment/*_summary.json
-
-# Base repo source checkouts (sanitized git repos, rebuild with sanitize_repo.sh)
-base_repo/*/repo/
-
-# Transient locked eval dirs (chmod 000 during runs, renamed from eval/)
-base_repo/*/eval.locked/
+# Benchmark workspaces
+experiment/
+base_repo/
 
 # Upstream full clones (rebuild with git clone)
 source_repos/
