@@ -1,0 +1,433 @@
+#!/bin/bash
+set -euo pipefail
+
+REPO_ROOT="/Users/zihanwu/Public/codes/huawei-eval"
+DIR_LIST="${DIR_LIST:-scripts/eval/all_dirs.txt}"
+MODEL="zhipuai-coding-plan/glm-5.1"
+REPORT_NAME="eval_report-opencode-glm-5.1.md"
+PARALLEL="${PARALLEL:-16}"
+TIMEOUT_SECONDS=600
+GT_DIFF_CHAR_LIMIT=50000
+
+TIMEOUT_BIN=""
+RUNNING_PIDS=()
+GLOBAL_STATUS=0
+
+ENV_FILE="$REPO_ROOT/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    log "ERROR: required command not found: $cmd"
+    exit 1
+  fi
+}
+
+parse_metadata() {
+  local metadata_path="$1"
+  python3 - "$metadata_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+task_id = data.get("task_id") or ""
+prompt_type = data.get("prompt_type") or ""
+sys.stdout.write(f"{task_id}\t{prompt_type}\n")
+PY
+}
+
+truncate_text_file() {
+  local file_path="$1"
+  local char_limit="$2"
+  python3 - "$file_path" "$char_limit" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+limit = int(sys.argv[2])
+text = path.read_text(encoding="utf-8", errors="ignore")
+
+if len(text) <= limit:
+    sys.stdout.write(text)
+else:
+    sys.stdout.write(text[:limit])
+    sys.stdout.write(f"\n\n[TRUNCATED after {limit} characters]\n")
+PY
+}
+
+count_lines() {
+  local file_path="$1"
+  if [[ -f "$file_path" ]]; then
+    wc -l < "$file_path" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+format_pct() {
+  local covered="$1"
+  local total="$2"
+  if [[ "$total" -eq 0 ]]; then
+    echo "N/A"
+  else
+    awk -v covered="$covered" -v total="$total" 'BEGIN { printf "%.1f", (covered * 100.0) / total }'
+  fi
+}
+
+emit_file_or_none() {
+  local file_path="$1"
+  if [[ -s "$file_path" ]]; then
+    cat "$file_path"
+  else
+    echo "(none)"
+  fi
+}
+
+collect_generated_files() {
+  local exp_dir="$1"
+  {
+    git -C "$exp_dir" diff HEAD --name-only
+    git -C "$exp_dir" ls-files --others --exclude-standard | grep -v '^\.' || true
+  } | LC_ALL=C sort -u
+}
+
+extract_gt_files() {
+  local gt_diff="$1"
+  LC_ALL=C awk '
+    /^diff --git / {
+      file = $0
+      sub(/^diff --git a\/[^ ]+ b\//, "", file)
+      print file
+    }
+  ' "$gt_diff" | LC_ALL=C sort -u
+}
+
+build_untracked_patch() {
+  local exp_dir="$1"
+  local rel_path
+
+  while IFS= read -r rel_path; do
+    [[ -f "$exp_dir/$rel_path" ]] || continue
+    (
+      cd "$exp_dir"
+      git diff --no-index -- /dev/null -- "$rel_path" || true
+    )
+  done < <(git -C "$exp_dir" ls-files --others --exclude-standard | grep -v '^\.' || true)
+}
+
+build_generated_patch() {
+  local exp_dir="$1"
+  git -C "$exp_dir" diff HEAD
+  build_untracked_patch "$exp_dir"
+}
+
+extract_patch_contexts() {
+  local patch_file="$1"
+  LC_ALL=C awk '
+    /^diff --git / {
+      file = $0
+      sub(/^diff --git a\/[^ ]+ b\//, "", file)
+      next
+    }
+    /^@@/ {
+      ctx = $0
+      sub(/^@@[^@]*@@[[:space:]]?/, "", ctx)
+      if (file != "" && ctx != "") {
+        print file " :: " ctx
+      }
+    }
+  ' "$patch_file" | LC_ALL=C sort -u
+}
+
+run_eval() {
+  local exp_dir="${1%/}"
+  local report_path="$exp_dir/$REPORT_NAME"
+  local metadata_path="$exp_dir/run_metadata.json"
+
+  if [[ ! -d "$exp_dir" ]]; then
+    log "ERROR: experiment dir does not exist: $exp_dir"
+    return 1
+  fi
+
+  if [[ -f "$report_path" ]]; then
+    log "SKIP: report already exists for $exp_dir"
+    return 0
+  fi
+
+  if [[ ! -f "$metadata_path" ]]; then
+    log "ERROR: missing run_metadata.json in $exp_dir"
+    return 1
+  fi
+
+  local task_id=""
+  local prompt_type=""
+  IFS=$'\t' read -r task_id prompt_type < <(parse_metadata "$metadata_path")
+
+  if [[ -z "$task_id" || -z "$prompt_type" ]]; then
+    log "ERROR: could not parse task_id/prompt_type from $metadata_path"
+    return 1
+  fi
+
+  local gt_diff="$REPO_ROOT/base_repo/$task_id/eval/gt_diff.patch"
+  local hw_files="$REPO_ROOT/base_repo/$task_id/eval/handwritten_files.txt"
+  local requirements_file="$REPO_ROOT/base_repo/$task_id/prompts/${task_id}-${prompt_type}.md"
+
+  if [[ ! -f "$gt_diff" ]]; then
+    log "ERROR: missing GT diff: $gt_diff"
+    return 1
+  fi
+  if [[ ! -f "$hw_files" ]]; then
+    log "ERROR: missing handwritten files list: $hw_files"
+    return 1
+  fi
+  if [[ ! -f "$requirements_file" ]]; then
+    log "ERROR: missing requirements prompt: $requirements_file"
+    return 1
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d /tmp/eval_t_opencode_batch.XXXXXX)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+
+  local hw_txt="$tmp_dir/hw.txt"
+  local gt_files_txt="$tmp_dir/gt_files.txt"
+  local gen_txt="$tmp_dir/gen.txt"
+  local covered_files_txt="$tmp_dir/covered_files.txt"
+  local missing_files_txt="$tmp_dir/missing_files.txt"
+  local extra_files_txt="$tmp_dir/extra_files.txt"
+  local generated_patch="$tmp_dir/generated.patch"
+  local gt_func_txt="$tmp_dir/gt_func.txt"
+  local gen_func_txt="$tmp_dir/gen_func.txt"
+  local gt_func_hw_txt="$tmp_dir/gt_func_hw.txt"
+  local gen_func_hw_txt="$tmp_dir/gen_func_hw.txt"
+  local covered_func_txt="$tmp_dir/covered_func.txt"
+  local missing_func_txt="$tmp_dir/missing_func.txt"
+  local prompt_path="$tmp_dir/eval_prompt.txt"
+
+  LC_ALL=C sort -u "$hw_files" > "$hw_txt"
+  extract_gt_files "$gt_diff" > "$gt_files_txt"
+  collect_generated_files "$exp_dir" > "$gen_txt"
+
+  LC_ALL=C comm -12 "$hw_txt" "$gen_txt" > "$covered_files_txt"
+  LC_ALL=C comm -23 "$hw_txt" "$gen_txt" > "$missing_files_txt"
+  LC_ALL=C comm -13 "$hw_txt" "$gen_txt" > "$extra_files_txt"
+
+  build_generated_patch "$exp_dir" > "$generated_patch"
+  extract_patch_contexts "$gt_diff" > "$gt_func_txt"
+  extract_patch_contexts "$generated_patch" > "$gen_func_txt"
+
+  LC_ALL=C awk -F ' :: ' 'NR == FNR { hw[$1] = 1; next } ($1 in hw) { print $0 }' "$hw_txt" "$gt_func_txt" > "$gt_func_hw_txt"
+  LC_ALL=C awk -F ' :: ' 'NR == FNR { hw[$1] = 1; next } ($1 in hw) { print $0 }' "$hw_txt" "$gen_func_txt" > "$gen_func_hw_txt"
+  LC_ALL=C comm -12 "$gt_func_hw_txt" "$gen_func_hw_txt" > "$covered_func_txt"
+  LC_ALL=C comm -23 "$gt_func_hw_txt" "$gen_func_hw_txt" > "$missing_func_txt"
+
+  local hw_total
+  local hw_covered
+  local hw_pct
+  local gt_func_total
+  local func_covered
+  local func_pct
+
+  hw_total="$(count_lines "$hw_txt")"
+  hw_covered="$(count_lines "$covered_files_txt")"
+  hw_pct="$(format_pct "$hw_covered" "$hw_total")"
+
+  gt_func_total="$(count_lines "$gt_func_hw_txt")"
+  func_covered="$(count_lines "$covered_func_txt")"
+  func_pct="$(format_pct "$func_covered" "$gt_func_total")"
+
+  local coverage_path="$tmp_dir/coverage_summary.txt"
+  {
+    echo "## Pre-computed Deterministic Coverage"
+    echo "### HW File Coverage: $hw_covered/$hw_total = $hw_pct%"
+    echo "### Function Coverage: $func_covered/$gt_func_total = $func_pct%"
+    echo ""
+    echo "### Handwritten Files"
+    emit_file_or_none "$hw_txt"
+    echo ""
+    echo "### Covered HW Files"
+    emit_file_or_none "$covered_files_txt"
+    echo ""
+    echo "### Missing HW Files"
+    emit_file_or_none "$missing_files_txt"
+    echo ""
+    echo "### Covered Functions"
+    emit_file_or_none "$covered_func_txt"
+    echo ""
+    echo "### Missing Functions"
+    emit_file_or_none "$missing_func_txt"
+  } > "$coverage_path"
+
+  cat > "$prompt_path" <<EOF
+You are evaluating a coding-agent experiment repository against the ground-truth patch and the task requirements.
+
+Experiment metadata:
+- Experiment dir: $exp_dir
+- Task ID: $task_id
+- Prompt type: $prompt_type
+- Output report path: $report_path
+
+## File Paths (read these yourself as needed)
+- GT diff: $gt_diff
+- Requirements/prompt: $requirements_file
+- Pre-computed coverage summary: $coverage_path
+- Generated patch (tracked + untracked): $generated_patch
+- HW file list: $hw_files
+
+## Instructions
+1. Read the coverage summary file first — use those numbers verbatim in your report.
+2. Read the requirements file to understand the task.
+3. Explore the GT diff and generated patch strategically:
+   - Check file sizes first (wc -c)
+   - For large diffs, read only sections for covered HW files rather than the entire file
+   - Use grep/sed to extract specific file sections from diffs
+4. Compare the experiment's approach against the GT for each covered HW file.
+5. Score using integers only (A/B/C each 0-5):
+   - A. Functional Correctness: Does the code correctly implement the required behavior?
+   - B. Completeness: Are all essential HW-file changes covered?
+   - C. Behavioral Equivalence: Semantic equivalence to GT (not textual similarity)
+6. Apply verdict rules exactly:
+   - PASS = A>=4 AND B>=4 AND C>=3
+   - FAIL = A<=1 OR (A+B+C)<=5
+   - PARTIAL = otherwise
+7. Write report to: $report_path
+
+## Required Report Format
+\`\`\`markdown
+## Evaluation Report
+**Evaluator**: OpenCode (GLM-5.1)
+### Summary
+### Verdict: [PASS / PARTIAL / FAIL]
+### Scores
+- **A. Functional Correctness**: [X]/5 — [justification]
+- **B. Completeness**: [X]/5 — [justification]
+- **C. Behavioral Equivalence**: [X]/5 — [justification]
+### Deterministic Coverage
+#### HW File Coverage: $hw_covered/$hw_total = $hw_pct%
+#### Function Coverage: $func_covered/$gt_func_total = $func_pct%
+### Analysis
+### Confidence: [0.0-1.0]
+\`\`\`
+EOF
+
+  local prompt_content
+  prompt_content="$(<"$prompt_path")"
+
+  printf '%s' '{"mcp": {}}' > "$exp_dir/opencode.json"
+
+  log "START: $task_id/$prompt_type :: $exp_dir"
+  (
+    cd "$exp_dir"
+    opencode run --model "$MODEL" --dangerously-skip-permissions --pure --format json "$prompt_content" < /dev/null > /dev/null 2>&1
+  )
+
+  if [[ -f "$report_path" ]]; then
+    log "DONE: $task_id/$prompt_type :: $report_path"
+  else
+    log "ERROR: OpenCode exited without producing $report_path"
+    return 1
+  fi
+}
+
+wait_for_slot() {
+  local next_pids=()
+  local pid
+  local freed_slot
+
+  while [[ "${#RUNNING_PIDS[@]}" -ge "$PARALLEL" ]]; do
+    next_pids=()
+    freed_slot=0
+
+    for pid in "${RUNNING_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        next_pids+=("$pid")
+      else
+        if ! wait "$pid"; then
+          GLOBAL_STATUS=1
+        fi
+        freed_slot=1
+      fi
+    done
+
+    RUNNING_PIDS=("${next_pids[@]}")
+    if [[ "$freed_slot" -eq 0 ]]; then
+      sleep 1
+    fi
+  done
+}
+
+wait_for_all() {
+  local pid
+  for pid in "${RUNNING_PIDS[@]}"; do
+    if ! wait "$pid"; then
+      GLOBAL_STATUS=1
+    fi
+  done
+  RUNNING_PIDS=()
+}
+
+main() {
+  require_cmd git
+  require_cmd python3
+  require_cmd opencode
+
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN="gtimeout"
+  else
+    log "ERROR: neither timeout nor gtimeout is available"
+    exit 1
+  fi
+
+  if [[ ! -f "$DIR_LIST" ]]; then
+    log "ERROR: missing directory list: $DIR_LIST"
+    exit 1
+  fi
+
+  local total
+  total="$(grep -cEv '^[[:space:]]*($|#)' "$DIR_LIST" || true)"
+  log "Batch start: total_dirs=$total parallel=$PARALLEL model=$MODEL"
+
+  local exp_dir
+  local queued=0
+
+  while IFS= read -r exp_dir || [[ -n "$exp_dir" ]]; do
+    if [[ -z "${exp_dir//[[:space:]]/}" ]]; then
+      continue
+    fi
+    if [[ "$exp_dir" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    queued=$((queued + 1))
+    log "QUEUE: [$queued/$total] $exp_dir"
+
+    run_eval "$exp_dir" &
+    RUNNING_PIDS+=("$!")
+    wait_for_slot
+  done < "$DIR_LIST"
+
+  wait_for_all
+
+  if [[ "$GLOBAL_STATUS" -ne 0 ]]; then
+    log "Batch finished with failures"
+    exit 1
+  fi
+
+  log "Batch finished successfully"
+}
+
+main "$@"
