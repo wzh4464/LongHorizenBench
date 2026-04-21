@@ -21,6 +21,9 @@ experiment/*_summary.json
 # Base repo source checkouts (sanitized git repos, rebuild with sanitize_repo.sh)
 base_repo/*/repo/
 
+# Transient locked eval dirs (chmod 000 during runs, renamed from eval/)
+base_repo/*/eval.locked/
+
 # Upstream full clones (rebuild with git clone)
 source_repos/
 
