@@ -30,6 +30,19 @@ paper2/*.toc
 *.swp
 *.swo
 *~
+*.bak
+*.bak2
+*.pre_rerun*
+
+# === Local scratch / one-off analysis helpers ===
+.agents/
+docs/STATISTICAL_ANALYSIS.md
+docs/STATS_MINING.md
+reports/aggregate.py
+reports/*.pre_rerun*
+scripts/s2_lookup.py
+scripts/ss_query.py
+scripts/verify_bib.py
 
 # === Agent session metadata (created during runs) ===
 .claude/*
