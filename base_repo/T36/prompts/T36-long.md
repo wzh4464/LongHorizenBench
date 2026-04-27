@@ -1,49 +1,84 @@
-# T36: OpenJDK Sequenced Collections
+# T36: OpenJDK — JEP 431 Sequenced Collections
 
 ## Requirement
-https://openjdk.org/jeps/431
 
----
+*Upstream source, for reference only:* `https://openjdk.org/jeps/431`
 
-**Summary**: JEP 431 提出在 Java Collections Framework 中引入新的接口来表示具有定义遇到顺序（encounter order）的集合。这些集合具有明确定义的第一个元素、第二个元素，依此类推，直到最后一个元素。新接口提供统一的 API 来访问集合的首尾元素，以及以逆序处理集合元素。
+The agent must implement this task without fetching any URL; the full specification needed for a complete implementation is inlined below.
 
-**Motivation**: Java Collections Framework 缺乏一种集合类型来表示具有定义遇到顺序的元素序列。它也缺乏一套统一的操作来处理这类集合。这是一个长期存在的痛点：
+## Summary
 
-1. `List` 和 `Deque` 都定义了遇到顺序，但它们没有共同的超类型。
-2. `Set` 通常不定义遇到顺序，但某些子类型（如 `LinkedHashSet` 和 `SortedSet`）确实定义了遇到顺序。
-3. 获取集合首尾元素的操作不一致：`List.get(0)` vs `Deque.getFirst()`；`List.get(list.size()-1)` vs `Deque.getLast()`。
-4. 获取逆序视图的方式也不统一：`NavigableSet.descendingSet()` vs `Deque.descendingIterator()`，而 `List` 完全没有逆序遍历的简便方法。
+Introduce a set of new collection interfaces and default methods for collections that have a well-defined encounter order. Today, the Java Collections Framework lacks a collection type that represents a sequence of elements with a defined encounter order, along with a common set of operations that apply to such sequences. The absence makes otherwise straightforward operations awkward: there is no way to ask a `LinkedHashSet` for its last element without an iterator walk; and `List` has no common supertype with `Deque` despite sharing semantics (indexable, insertion-ordered).
 
-**Proposal**: 引入三个新接口 `SequencedCollection`、`SequencedSet` 和 `SequencedMap`，并将它们插入到现有的集合类层次结构中。这些接口定义了统一的方法来访问首尾元素和获取逆序视图。现有的实现类（如 `ArrayList`、`LinkedHashSet`、`TreeMap` 等）将实现这些新接口。
+## Motivation
 
-**Design Details**:
+Java's collections have accumulated idiosyncratic ways of getting to the first, last, or reverse view of a sequence:
 
-1. **定义 SequencedCollection 接口**：创建 `java.util.SequencedCollection<E>` 接口，扩展 `Collection<E>`。添加方法：`addFirst(E)`、`addLast(E)`、`getFirst()`、`getLast()`、`removeFirst()`、`removeLast()`、`reversed()`。这些方法应有合理的默认实现或抛出 `UnsupportedOperationException`。
+| Collection         | First                    | Last                   | Reversed                              |
+|--------------------|--------------------------|------------------------|---------------------------------------|
+| `List`             | `get(0)`                 | `get(size()-1)`        | `Collections.reverse(copy)`           |
+| `Deque`            | `getFirst()`             | `getLast()`            | `iterator()` vs `descendingIterator()`|
+| `LinkedHashSet`    | `iterator().next()`      | *no direct method*     | *no direct method*                    |
+| `SortedSet`        | `first()`                | `last()`               | `descendingSet()` (inconsistent name) |
+| `LinkedHashMap`    | `entrySet().iterator()…` | *nothing*              | *nothing*                             |
+| `SortedMap`        | `firstKey()`             | `lastKey()`            | *nothing symmetric*                   |
 
-2. **定义 SequencedSet 接口**：创建 `java.util.SequencedSet<E>` 接口，扩展 `SequencedCollection<E>` 和 `Set<E>`。重写 `reversed()` 方法以返回 `SequencedSet<E>`。
+This JEP introduces three interfaces:
 
-3. **定义 SequencedMap 接口**：创建 `java.util.SequencedMap<K,V>` 接口，扩展 `Map<K,V>`。添加方法：`firstEntry()`、`lastEntry()`、`pollFirstEntry()`、`pollLastEntry()`、`putFirst(K,V)`、`putLast(K,V)`、`reversed()`、`sequencedKeySet()`、`sequencedValues()`、`sequencedEntrySet()`。
+### `SequencedCollection<E>`
+Extends `Collection<E>`. Adds:
+- `SequencedCollection<E> reversed()` — a reverse-ordered *view* (live).
+- `void addFirst(E e)`, `void addLast(E e)` — optional operations.
+- `E getFirst()`, `E getLast()` — throw `NoSuchElementException` on empty.
+- `E removeFirst()`, `E removeLast()` — likewise.
 
-4. **修改现有接口层次结构**：
-   - `List` 扩展 `SequencedCollection`
-   - `Deque` 扩展 `SequencedCollection`
-   - `SortedSet` 扩展 `SequencedSet`
-   - `NavigableSet` 继承自 `SortedSet`（已有）
-   - `SortedMap` 扩展 `SequencedMap`
-   - `NavigableMap` 继承自 `SortedMap`（已有）
+### `SequencedSet<E>`
+A `SequencedCollection` that is also a `Set`. Adds:
+- `SequencedSet<E> reversed()` returning a `SequencedSet<E>`.
+- Inherits the other operations; if duplicates would be introduced by `addFirst`/`addLast`, an implementation may move the element (LinkedHashSet semantics) or throw `UnsupportedOperationException` (TreeSet semantics unless a comparator enforces ordering compatible with insertion).
 
-5. **更新具体实现类**：为 `ArrayList`、`LinkedList`、`ArrayDeque`、`LinkedHashSet`、`LinkedHashMap`、`TreeSet`、`TreeMap`、`ConcurrentSkipListSet`、`ConcurrentSkipListMap`、`CopyOnWriteArrayList` 等类添加新方法的实现。对于某些类（如 `ArrayList`），需要覆盖默认实现以提供更高效的版本。
+### `SequencedMap<K,V>`
+Adds:
+- `SequencedMap<K,V> reversed()`.
+- `Map.Entry<K,V> firstEntry()`, `lastEntry()`, `pollFirstEntry()`, `pollLastEntry()`.
+- `V putFirst(K, V)`, `V putLast(K, V)` — optional.
+- `SequencedSet<K> sequencedKeySet()`, `SequencedCollection<V> sequencedValues()`, `SequencedSet<Map.Entry<K,V>> sequencedEntrySet()`.
 
-6. **创建逆序视图类**：实现内部类来支持 `reversed()` 方法返回的逆序视图。这些视图类需要正确委托所有操作到底层集合，同时反转遇到顺序。主要包括：
-   - `ReverseOrderListView` 用于 `List`
-   - `ReverseOrderDequeView` 用于 `Deque`
-   - `ReverseOrderSortedSetView` 用于 `SortedSet`
-   - `ReverseOrderSortedMapView` 用于 `SortedMap`
+### Retrofits in the existing hierarchy
 
-7. **更新 Collections 工具类**：为 `Collections` 类添加方法来创建不可修改的 sequenced collection 包装器。更新现有的 `unmodifiable*` 和 `synchronized*` 包装器以支持新接口。
+- `List<E> extends SequencedCollection<E>`; new default impls for `addFirst`, `addLast`, `getFirst`, `getLast`, `removeFirst`, `removeLast`, `reversed()`.
+- `Deque<E> extends SequencedCollection<E>` (no semantic change, just the super-interface).
+- `LinkedHashSet<E> implements SequencedSet<E>` (which `extends SequencedCollection<E>`, `Set<E>`); `reversed()` returns a view.
+- `SortedSet<E>`, `NavigableSet<E>` get `SequencedSet<E>` as a super-interface.
+- `LinkedHashMap<K,V> implements SequencedMap<K,V>`.
+- `SortedMap<K,V>`, `NavigableMap<K,V>` get `SequencedMap<K,V>` as a super-interface.
+- `Collections` gains `unmodifiableSequencedCollection`, `unmodifiableSequencedSet`, `unmodifiableSequencedMap`.
 
-8. **更新 ImmutableCollections**：确保通过 `List.of()`、`Set.of()`、`Map.of()` 等工厂方法创建的不可变集合正确实现新接口。
+### API contract for `reversed()`
+- Must be a *view*: changes in the original are visible, and vice versa if supported by the backing collection.
+- Iteration order, `first()/last()`, and `addFirst/addLast` are swapped relative to the original.
+- `reversed().reversed()` must return a collection semantically equivalent to the original (implementations may return `this` for efficiency).
 
-9. **添加数组反转支持**：在 `jdk.internal.util.ArraysSupport` 中添加辅助方法来支持数组元素的原地反转操作。
+### Behavioural constraints
+- `addFirst` / `addLast` on an unmodifiable collection must throw `UnsupportedOperationException`.
+- For `SequencedSet`, `addFirst(E)` on an element already present must move it to the front (and symmetrically for `addLast`).
+- For `SequencedMap`, `putFirst`, `putLast` semantics mirror the above.
 
-10. **编写测试**：为新接口和方法编写全面的单元测试，包括基本功能测试、边界条件测试、逆序视图测试、以及与现有功能的兼容性测试。
+## Implementation Scope
+
+Implement across:
+- Add three new public interfaces `java.util.SequencedCollection`, `java.util.SequencedSet`, `java.util.SequencedMap`.
+- Update `java.util.List`, `java.util.Deque`, `java.util.SortedSet`, `java.util.NavigableSet`, `java.util.LinkedHashSet`, `java.util.LinkedHashMap`, `java.util.SortedMap`, `java.util.NavigableMap`, `java.util.TreeMap`, `java.util.TreeSet` to implement or extend the new types.
+- Provide reversed views as nested classes (`ReverseOrderListView`, `ReverseOrderMap`, etc.).
+- Update `java.util.Collections.unmodifiable*` to return the new interface types.
+- Update `Arrays.asList` to return a `SequencedCollection` view.
+- Spec updates in the corresponding `package-info.java` / javadoc.
+- jtreg regression tests covering ordering invariants, reversed views, and retrofit compatibility.
+
+## Acceptance criteria
+
+* Existing code depending on `List`, `Deque`, `LinkedHashSet`, `LinkedHashMap`, `TreeSet`, `TreeMap`, `SortedSet`, `NavigableSet`, `SortedMap`, `NavigableMap` continues to compile and run.
+* Methods `addFirst`, `addLast`, `getFirst`, `getLast`, `removeFirst`, `removeLast`, `reversed()`, `firstEntry()`, `lastEntry()`, `pollFirstEntry()`, `pollLastEntry()`, `putFirst`, `putLast`, `sequencedKeySet`, `sequencedValues`, `sequencedEntrySet`, `reversed()` exist and behave as specified.
+* `Collections.unmodifiableSequencedCollection`, `unmodifiableSequencedSet`, `unmodifiableSequencedMap` exist and delegate correctly.
+* `javadoc` builds without warnings for the new interfaces.
+* All JCK / jtreg tests covering `java.util` collections continue to pass.

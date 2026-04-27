@@ -1,32 +1,121 @@
-# T30: CPython
+# T30: CPython — PEP 578 Runtime Audit Hooks
 
-**Summary**: PEP 578 引入 Python 运行时审计钩子机制，使测试框架、日志框架和安全工具能够监控并可选地限制运行时采取的操作。该功能提供两个主要 API：审计钩子（用于观察任意运行时事件）和验证打开钩子（专门用于模块导入系统），使安全监控工具能够检测和响应可能被恶意代码利用的敏感操作。
+## Summary
 
-**Motivation**: 在监控 Python 应用程序时存在两个关键挑战。首先是有限的上下文：系统级监控可以检测到操作发生，但缺乏理解触发原因的能力。其次是审计绕过：Python 应用程序可以绕过传统监控工具，例如使用 `urllib.request` 进行网络操作不会被命令行工具监控捕获。PEP 578 通过在运行时关键点触发审计事件，让安全工具能够观察 Python 级别的操作。
+PEP 578 introduces two new runtime APIs to CPython:
 
-**Proposal**: 在 CPython 中实现运行时审计钩子机制，包括：添加 `sys.audit()` 函数和 `sys.addaudithook()` 函数用于 Python 级别的审计；提供 `PySys_Audit()` 和 `PySys_AddAuditHook()` C API 用于 C 扩展；实现 `io.open_code()` 和 `PyFile_SetOpenCodeHook()` 用于验证代码打开操作；在运行时关键位置添加审计事件调用；以及相应的测试和文档。
+1. **Audit hooks** — `sys.audit(event, *args)` raises an event that is
+   delivered synchronously to all registered audit callbacks. Hooks can
+   observe and abort sensitive operations such as importing modules,
+   compiling code, opening files, or starting subprocesses.
+2. **Verified open hook** — `io.open_code(path)` is the sanctioned entry
+   point for the interpreter to load source/bytecode files. A host
+   application may install a verified-open hook that intercepts every
+   such read and validates the file (signature check, allow-list, etc.)
+   before returning a stream.
 
-**Design Details**:
+The PEP positions these hooks as transparent integration points for
+hardened deployments: anti-malware tooling, enterprise security
+monitoring, and embedded interpreters that need to enforce code-loading
+policies.
 
-1. 审计钩子 C API：在 `Python/sysmodule.c` 中实现 `PySys_Audit(const char *event, const char *format, ...)` 函数，用于触发审计事件。实现 `PySys_AddAuditHook(Py_AuditHookFunction hook, void *userData)` 函数，用于注册审计钩子。钩子函数类型为 `int (*)(const char *event, PyObject *args, void *userData)`。更新 `Include/sysmodule.h` 声明这些 API。
+## 2. Audit hook API
 
-2. 审计钩子 Python API：在 `Python/sysmodule.c` 中实现 `sys.audit(event, *args)` 函数，用于从 Python 代码触发审计事件。实现 `sys.addaudithook(hook)` 函数，用于从 Python 代码注册审计钩子。生成对应的 clinic 文件。
+```python
+sys.audit(event: str, *args) -> None
+sys.addaudithook(hook: Callable[[str, tuple], None]) -> None
+```
 
-3. 验证打开钩子 API：在 `Objects/fileobject.c` 中实现 `PyFile_SetOpenCodeHook(Py_OpenCodeHookFunction handler, void *userData)` 函数。在 `Lib/io.py` 和 `Lib/_pyio.py` 中实现 `io.open_code(path)` 函数，作为 `open(abspath(str(pathlike)), 'rb')` 的安全替代。更新 `Include/fileobject.h` 和 `Include/cpython/fileobject.h` 声明 C API。
+- `sys.audit(event, *args)` synchronously invokes every registered hook
+  with the event name and a tuple of positional arguments. CPython itself
+  fires built-in audit events (file open, subprocess spawn, code
+  compilation, `eval`/`exec`, `socket.connect`, etc.) so hooks can observe
+  the same operations as third-party callers.
+- `sys.addaudithook(hook)` appends a hook. Hooks cannot be removed (they
+  are ordered by registration). The interpreter installs hooks per
+  sub-interpreter, but native (C-level) hooks installed via
+  `PySys_AddAuditHook` are global and run before any Python hooks.
+- Hooks must be reentrancy-safe; they may not themselves raise to suppress
+  the operation (they can raise a normal exception, which will surface to
+  the caller of the audited operation).
 
-4. 运行时状态扩展：修改 `Include/internal/pycore_pystate.h`，在解释器状态中添加审计钩子列表。确保钩子只能添加不能移除，异常会导致运行时终止（有意设计）。
+C API equivalents:
 
-5. 内置函数审计事件：在 `Python/bltinmodule.c` 中为 `compile()`、`exec()`、`eval()` 添加审计事件调用。在 `Objects/codeobject.c` 中为 `code.__new__` 添加审计事件。在 `Objects/funcobject.c` 中为 `function.__new__` 添加审计事件。
+```c
+int PySys_Audit(const char *event, const char *format, ...);
+int PySys_AddAuditHook(Py_AuditHookFunction hook, void *userData);
+```
 
-6. 文件和 I/O 审计事件：在 `Modules/_io/fileio.c` 和 `Modules/_io/_iomodule.c` 中为文件打开操作添加审计事件。在 `Modules/posixmodule.c` 中为 `os.open` 等操作添加审计事件。
+## 3. Verified open
 
-7. 网络和外部资源审计事件：在 `Modules/socketmodule.c` 中为 socket 操作添加审计事件。在 `Lib/urllib/request.py` 中为 URL 请求添加审计事件调用。
+```python
+io.open_code(path) -> io.IOBase
+```
 
-8. ctypes 审计事件：在 `Modules/_ctypes/_ctypes.c` 中为 `ctypes.dlopen` 添加审计事件。在 `Modules/_ctypes/callproc.c` 中为 `ctypes.dlsym` 和 `ctypes.cdata` 添加审计事件。
+`open_code` returns a binary stream from which the interpreter reads code
+to compile. By default it behaves as `open(path, "rb")`. A host can install
+a verified-open hook via `PyFile_SetOpenCodeHook` (C API) so that all
+imports, `runpy`, and explicit calls to `open_code` route through the hook
+before the bytes are handed to the compiler. The hook may sign-check, log,
+or refuse the open.
 
-9. 导入系统集成：修改 `Python/import.c` 和 `Lib/importlib/_bootstrap_external.py`，使用 `io.open_code()` 打开模块文件。在 `Lib/zipimport.py` 中同样使用验证打开钩子。
+## Required event coverage
 
-10. 测试和文档：创建 `Lib/test/test_audit.py`，覆盖审计钩子的各种使用场景。在 `Doc/c-api/sys.rst` 中添加 C API 文档。在 `Doc/library/sys.rst` 中添加 Python API 文档。在 `Doc/library/functions.rst` 中为内置函数添加审计事件说明。更新 `Doc/howto/instrumentation.rst` 描述 DTrace/SystemTap 集成。
+At minimum the implementation must emit audit events from the following
+operations (per the PEP table):
 
-## Requirement
-https://peps.python.org/pep-0578/
+- `open` (any file opened via `open()`, `os.open`, etc.)
+- `compile` (compilation of source via `compile()` or import)
+- `exec` (execution of compiled objects)
+- `import` (start and end of module import)
+- `socket.connect`, `socket.bind`, `socket.listen`
+- `subprocess.Popen`
+- `os.system`, `os.exec*`, `os.posix_spawn*`, `os.fork`
+- `urllib.Request`
+- `winreg.OpenKey` / equivalent registry access on Windows
+
+The full list lives in the PEP; the implementation should follow it.
+
+## Public C API additions
+
+- `int PySys_Audit(const char *event, const char *format, ...)`
+- `int PySys_AddAuditHook(Py_AuditHookFunction hook, void *userdata)`
+- `int PyFile_SetOpenCodeHook(Py_OpenCodeHookFunction handler, void *userdata)`
+- `PyObject* PyFile_OpenCode(const char *path)`
+
+## Reference behaviour
+
+- Hooks installed before main are persistent across subinterpreters.
+- Hooks installed at runtime via `sys.addaudithook` are per-interpreter and
+  cannot be removed.
+- Once an audit hook returns, the audited operation proceeds; if it raises,
+  the caller receives that exception.
+
+## 4. Backwards compatibility
+
+The new comprehension syntax is purely additive — nothing previously
+accepted changes meaning. Audit hooks may observe events that previously
+went unobserved; this is intentional.
+
+## Implementation scope
+
+Provide:
+- The `Py_AuditHookFunction` type and `PySys_AddAuditHook` /
+  `PySys_Audit` C entry points.
+- The Python-level helpers `sys.audit`, `sys.addaudithook` and a way to
+  query whether any hook is registered for an event.
+- Audit calls inserted at all the call sites listed in PEP 578 (open,
+  compile, exec, eval, ctypes calls, socket connect, etc.).
+- An "open code" hook (`io.open_code` / `PyFile_OpenCode`) for the import
+  machinery to load source and bytecode through.
+- Documentation listing the events and arguments and a regression test
+  suite that asserts each documented event is emitted.
+
+## Acceptance
+
+- The published audit events listed in the PEP are all emitted with the
+  documented argument shapes.
+- A registered audit hook receives every event raised after registration.
+- `io.open_code` routes through the verified-open hook when one is
+  installed.
+- Existing tests pass; new tests covering each audit event pass.

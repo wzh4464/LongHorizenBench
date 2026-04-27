@@ -1,96 +1,109 @@
-# T40: Kubernetes Pod Certificates
+# T40: Kubernetes — KEP-4317 Pod Certificates
 
 ## Requirement
-https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/4317-pod-certificates/README.md
+
+Source: KEP-4317 ("Pod Certificates"), `kubernetes/enhancements/keps/sig-auth/4317-pod-certificates/`. The KEP is the source of truth; the design content below summarises it. The agent must not invent file paths or internal type names that are not in the KEP — the KEP only specifies APIs and behaviour, not Kubernetes' source layout.
 
 ---
 
-**Summary**: KEP-4317 提出引入 Pod Certificates 功能，包括一个新的 `PodCertificateRequest` API 类型和 `podCertificate` 投射卷源（projected volume source）。该功能允许 kubelet 自动为 Pod 请求和管理 X.509 证书，使得向集群中每个 Pod 安全地、自动地交付证书变得可行。
+## Summary
 
-**Motivation**: `certificates.k8s.io` API 组提供了在 Kubernetes 集群内请求 X.509 证书的灵活机制，但实际将证书交付给工作负载的实现留给了用户。当前存在以下问题：
+The certificates.k8s.io API group already lets cluster administrators issue X.509 certificates by submitting a `CertificateSigningRequest` (CSR), but it leaves the actual issuance and renewal flow to controllers and operators. Pods that need a certificate today have to either talk to a sidecar that performs CSR signing, mount a long-lived secret, or rely on out-of-tree projects.
 
-1. **承载令牌依赖**：现有方案通常依赖 bearer token 进行身份验证，这降低了 mTLS 的安全性优势。
-2. **第三方签名器实现困难**：安全实现第三方签名器需要深入理解 Kubernetes 安全模型，否则可能破坏节点隔离边界。
-3. **证书生命周期管理复杂**：应用开发者需要自行处理密钥生成、证书请求、续期等复杂逻辑。
+KEP-4317 introduces a first-class kubelet-driven flow:
 
-**Proposal**: 引入两个核心组件：
-1. `PodCertificateRequest` API 类型 - 一个精简版的 `CertificateSigningRequest`，专门用于 Pod 证书签发，包含 Pod 身份信息
-2. `podCertificate` 投射卷源 - 指示 kubelet 代表 Pod 处理密钥生成、证书请求和续期
+1. A new namespaced resource `PodCertificateRequest` (in `certificates.k8s.io/v1alpha1`) that kubelet creates on behalf of a pod, carrying a CSR-equivalent payload plus pod identity attributes.
+2. A new `PodCertificate` source for projected volumes; pods that include a `podCertificate` projection get a kubelet-managed credential bundle (private key, leaf certificate, optional chain) automatically rotated.
 
-**Design Details**:
+The signer is pluggable: an in-cluster controller picks up `PodCertificateRequest` resources whose `spec.signerName` it owns, validates them, and writes a signed certificate chain back into `.status`. Kubelet then mounts the resulting credential into the pod and rotates it as needed.
 
-1. **定义 PodCertificateRequest API 类型**：
-   - 在 `staging/src/k8s.io/api/certificates/v1alpha1/` 下创建类型定义
-   - Spec 字段包括：`signerName`、`podName`、`podUID`、`serviceAccountName`、`serviceAccountUID`、`nodeName`、`nodeUID`、`maxExpirationSeconds`、`stubPKCS10Request`
-   - Status 字段包括：`conditions`、`certificateChain`、`issuedAt`、`notBefore`、`notAfter`、`beginRefreshAt`
-   - 在 `pkg/apis/certificates/` 下创建 internal 类型
+## Motivation (from KEP)
 
-2. **实现 PodCertificateRequest 验证**：
-   - 在 `pkg/apis/certificates/validation/` 下添加验证逻辑
-   - 验证公钥类型（支持 RSA3072、RSA4096、ECDSAP256、ECDSAP384、ECDSAP521、ED25519）
-   - 验证 PKCS#10 CSR 签名（持有证明）
-   - 验证证书链格式（如果已签发）
-   - 验证 `maxExpirationSeconds` 范围（最小 3600 秒，最大 7862400 秒）
-   - 确保所有 Spec 字段不可变
+- Provide pod-scoped, automatically rotated TLS material without requiring workloads to ship a custom credential agent.
+- Give cluster operators a uniform, auditable surface to express signing policy ("which signer mints which kind of cert for which pod identity?").
+- Let third-party signers integrate cleanly: an external controller only needs to watch one resource type and write to its `.status`.
 
-3. **实现 PodCertificateRequest Storage**：
-   - 在 `pkg/registry/certificates/podcertificaterequest/` 下创建 strategy 和 storage
-   - 实现 `PrepareForCreate` 和 `PrepareForUpdate`
-   - 实现 status 子资源的 strategy
-   - 注册到 certificates.k8s.io API 组
+## Goals
 
-4. **更新 Node Restriction 准入插件**：
-   - 在 `plugin/pkg/admission/noderestriction/` 中添加 `PodCertificateRequest` 验证
-   - 验证 namespace/pod/service account/node 信息与实际 Pod 匹配
-   - 确保 Pod 已调度到指定节点
-   - 确保 Pod 处于 Pending 或 Running 状态
-   - 验证请求来自对应节点的 `system:node:xxx` 用户
+- New resource: `PodCertificateRequest` in `certificates.k8s.io/v1alpha1`.
+- New projected-volume source: `PodCertificate`.
+- Kubelet flow that creates / watches / refreshes `PodCertificateRequest`s on behalf of pods that mount such projections.
+- Authentication and authorization story: signers must explicitly opt into a signer name; kubelet uses its node identity to create PCRs for pods bound to its node.
+- Strict admission validation: tying `nodeName` and `serviceAccountName` to the actual pod's node and service account; immutability of `spec` after submission.
 
-5. **更新 Node Authorizer**：
-   - 在 `plugin/pkg/auth/authorizer/node/` 中添加 `PodCertificateRequest` 授权逻辑
-   - 允许节点为其上的 Pod 创建 `PodCertificateRequest`
-   - 允许节点读取其创建的 `PodCertificateRequest`
+## Non-goals
 
-6. **扩展 Pod API**：
-   - 在 `pkg/apis/core/types.go` 中添加 `PodCertificateVolumeSource` 类型
-   - 在 `ProjectedVolumeSource` 中添加 `podCertificate` 字段
-   - 在 `staging/src/k8s.io/api/core/v1/` 下同步添加外部类型
+- Replacing CSR for non-pod use cases.
+- Defining a built-in signer or default signing policy.
+- API for arbitrary out-of-cluster CAs (left to the signer controller).
 
-7. **实现 Pod 验证**：
-   - 在 `pkg/apis/core/validation/` 中添加 `podCertificate` 卷的验证
-   - 验证 signerName 格式
-   - 验证必需字段
+## API surface (verbatim from the KEP)
 
-8. **实现 Kubelet PodCertificateManager**：
-   - 在 `pkg/kubelet/podcertificate/` 下创建管理器
-   - 实现密钥对生成（支持多种密钥类型）
-   - 实现 `PodCertificateRequest` 创建和监控
-   - 实现证书续期逻辑（在 `beginRefreshAt` 时间开始续期）
-   - 将证书和密钥写入 tmpfs 卷
+### `PodCertificateRequest` (new resource in `certificates.k8s.io/v1alpha1`)
 
-9. **更新 Projected Volume 插件**：
-   - 在 `pkg/volume/projected/` 中添加 `podCertificate` 源的处理
-   - 调用 `PodCertificateManager` 获取证书
-   - 将密钥和证书链写入容器文件系统
+Spec fields:
 
-10. **添加 Feature Gate**：
-    - 在 `pkg/features/kube_features.go` 中注册 `PodCertificateRequests` feature gate
-    - 控制 `PodCertificateRequest` API 存储的启用
-    - 控制 kubelet 中证书管理功能的启用
+- `signerName` (string) — selector for the signer controller; signers watch by this field.
+- `podName`, `podUID`, `serviceAccountName`, `serviceAccountUID`, `nodeName`, `nodeUID` — pod-identity attributes; the API server enforces consistency with the requesting kubelet's bound pod.
+- `keyType` (string) — one of `RSA3072`, `RSA4096`, `ECDSAP256`, `ECDSAP384`, `ECDSAP521`, `ED25519`.
+- `pkixPublicKey` (`[]byte`) — DER-encoded SubjectPublicKeyInfo for the public key the kubelet generated.
+- `proofOfPossession` (`[]byte`) — signature, made with the private key, over a server-supplied challenge string.
+- `maxExpirationSeconds` (optional) — request a maximum lifetime; signer is free to issue a shorter cert.
 
-11. **实现证书清理控制器**：
-    - 在 `pkg/controller/certificates/cleaner/` 下创建 `PodCertificateRequest` 清理器
-    - 删除已过期或已完成的请求
-    - 删除关联 Pod 已删除的请求
+`PodCertificateRequestStatus` carries:
+- `conditions` (Issued / Failed / Denied),
+- `certificateChain` (PEM bundle),
+- `notBefore`, `beginRefreshAt`, `notAfter`,
+- `failureReason`, `failureMessage`.
 
-12. **更新 RBAC Bootstrap 策略**：
-    - 在 `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/` 中添加相关角色和绑定
-    - 为 kubelet 添加 `podcertificaterequests` 的 create/get/watch 权限
-    - 为签名器控制器添加 `podcertificaterequests/status` 的 update 权限和 signer 的 sign 权限
+PCR is *one-shot*: a controller updates `.status` exactly once. Kubelet creates a fresh PCR for each renewal cycle.
 
-13. **编写测试**：
-    - 添加 API 验证的单元测试
-    - 添加 Node Restriction 准入的测试
-    - 添加 Node Authorizer 的测试
-    - 添加 PodCertificateManager 的单元测试和集成测试
-    - 添加 Projected Volume 的集成测试
+## `PodCertificate` projected-volume source
+
+Pods opt in to per-pod certificates by adding a `PodCertificate` source to a projected volume. Spec fields (per KEP):
+
+- `signerName` (required) — fully-qualified signer name; matched against PCRs the signer is responsible for.
+- `keyType` — one of the supported types (`ECDSAP256`, `ECDSAP384`, `ED25519`, `RSA2048`, `RSA3072`, `RSA4096`). Default is implementation-defined.
+- `maxExpirationSeconds` (optional) — passed through to the PCR.
+- `credentialBundlePath` (optional) — relative path within the projected volume where the combined `key.pem` + `cert.pem` + `ca.pem` bundle is materialised.
+- `keyPath`, `certificateChainPath`, `caPath` (optional) — split-file output paths.
+
+When the source is present, kubelet:
+1. Generates a fresh private key on the node, never persisted to disk.
+2. Creates a `PodCertificateRequest` whose `pkixPublicKey` matches the generated key, signs a proof-of-possession over the API server-supplied challenge, and submits to the API server.
+3. Watches the PCR for `Issued` condition; once observed, writes the chain (and key, if a key path is requested) to a tmpfs in the projected volume.
+4. Re-issues a new PCR before `beginRefreshAt`.
+
+### Authorization & admission
+
+- A new admission plugin (or extension to the existing kubelet admission) ensures the kubelet can only create a PCR whose `nodeName` matches its own bound node, and whose `podName`/`podUID`/`serviceAccountName`/`serviceAccountUID` match a pod actually bound to that node.
+- The signer impersonation rules: a signer principal must hold `sign` permission on the `signers` resource for the named signer.
+- Kubelet refuses to start the pod if the projected volume references a `signerName` that the cluster's RBAC indicates no signer is permitted to fulfil (best-effort warning; final answer comes from the signer's success/failure on the PCR).
+
+### Feature gate
+
+The feature is alpha and guarded by the `PodCertificateRequest` feature gate (kube-apiserver, kubelet, kube-controller-manager). When the gate is off:
+- The new types and the projected-volume source are not registered.
+- Existing pods with the projection are rejected at admission with a clear error.
+
+### Observability
+
+The KEP requires the following metrics:
+- Counters for PCR create/update/delete and signer outcomes (`issued`, `denied`, `failed`).
+- Histograms for time-to-issue and time-to-mount.
+- Kubelet-side gauges for in-flight rotations and pending PCRs per pod.
+
+## Implementation scope for this task
+
+Implement the API and kubelet pieces consistent with the KEP. The contributing PR should:
+
+- Add the `certificates.k8s.io/v1alpha1` `PodCertificateRequest` type and its `Spec` / `Status`, validation, defaulting, registration, and storage. Validation must enforce immutable spec after creation, the signer-name format, the supported key types, and the proof-of-possession length.
+- Add the `PodCertificate` projected-volume source to the core `Volume` API, including OpenAPI changes and validation that exactly one of bundle-path or split paths is set, that signer name is well-formed, and that key types are restricted to the documented set.
+- Add the kubelet projected-volume integration: keypair generation, PCR creation, polling/watching for status, writing the credential bundle into the volume, and refreshing on the signer's schedule.
+- Add the admission/authorization wiring so that:
+  - Only kubelets can create `PodCertificateRequest`s, and only for pods scheduled on their own node.
+  - The signer-name → controller mapping is honoured (built-in signers reject unknown signer names; no signer is shipped in-tree as part of this work).
+- Add the feature gate `PodCertificateProjection` (the umbrella gate from the KEP) and gate every new code path on it.
+- Add unit tests for the new admission/validation logic; integration tests that exercise the projected-volume flow with a fake signer; and an end-to-end test that verifies rotation across `beginRefreshAt`.
+
+The KEP does not prescribe specific package paths in `kubernetes/kubernetes`. Place new code wherever the existing `certificates.k8s.io` types and projected-volume implementations live, mirroring their layout, and update the standard generated files (deepcopy, conversion, openapi, swagger).

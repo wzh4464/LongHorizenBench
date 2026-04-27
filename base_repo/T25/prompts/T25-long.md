@@ -1,32 +1,110 @@
-# T25: CPython
+# T25: CPython — PEP 798 Unpacking in Comprehensions
 
-**Summary**: Python 当前不允许在列表推导式、集合推导式、字典推导式和生成器表达式的表达式部分使用解包操作符（`*` 和 `**`）。PEP 798 提出扩展推导式语法，允许使用 `*expr` 来解包可迭代对象的元素，以及使用 `**expr` 在字典推导式中解包键值对。这使得合并多个可迭代对象变得更加简洁。
+## Summary
 
-**Motivation**: 合并多个可迭代对象到单个对象是常见任务。虽然 `[*it1, *it2, *it3]` 可以合并已知数量的可迭代对象，但当需要合并任意数量的可迭代对象时，开发者必须使用显式循环、嵌套推导式或 `itertools.chain` 等工具，这些方案既不直观也不够优雅。例如，将多个列表展平为一个列表需要写 `list(itertools.chain.from_iterable(lists))` 或双重循环的列表推导式，而新语法允许简洁地写成 `[*lst for lst in lists]`。
+PEP 798 "Unpacking in Comprehensions" extends comprehension and generator
+syntax so that iterable and mapping unpacking (`*` and `**`) may appear in
+the element position. The proposal mirrors the existing unpacking allowed in
+list, set, and dict displays.
 
-**Proposal**: 扩展推导式语法，允许在表达式位置使用解包操作符。对于列表和集合推导式，`*expr` 将 expr 的每个元素添加到结果中；对于字典推导式，除了传统的 `key: value` 形式，还支持 `**expr` 形式将字典的所有键值对添加到结果中；生成器表达式中的 `*expr` 等价于对 expr 的每个元素执行 yield。
+After this change the following expressions are valid:
 
-**Design Details**:
+```
+[*it for it in lists]              # list comprehension flattening
+{*s for s in sets}                 # set comprehension union
+(*it for it in iterables)          # generator expression flattening
+{**d for d in dicts}               # dict comprehension merging
+```
 
-1. 修改语法规则：在 `Grammar/python.gram` 中更新推导式相关规则。引入 `flexible_expression` 允许普通表达式或带星号的解包表达式。修改 `comprehension`、`generator_expression` 等规则以使用新的表达式类型。更新 `dict_comprehension` 允许 `**expr` 形式。
+The reference for this task is PEP 798. Do not access the network — the
+information needed is captured below.
 
-2. 扩展 AST 定义：在 `Parser/Python.asdl` 中，确保 AST 能够正确表示推导式中的解包表达式。解包表达式在 AST 中表示为 `Starred` 节点（对于 `*`）或特殊的字典解包形式（对于 `**`）。
+## 1. Motivation
 
-3. 更新 AST 构建：修改 `Python/ast.c` 以正确构建包含解包表达式的推导式 AST 节点。确保解包表达式仅在允许的推导式上下文中出现。
+Comprehensions are one of the most-used Python constructs, but they only
+allow a single scalar element per iteration. Common patterns such as
+"flatten a list of lists" or "merge a sequence of dictionaries" require
+falling back to nested comprehensions, `itertools.chain.from_iterable`, or
+explicit loops. The PEP argues these idioms are common enough that
+unpacking them with `*` and `**` inside comprehensions parallels the
+already-supported unpacking inside list/set/dict displays.
 
-4. 修改 AST 预处理：更新 `Python/ast_preprocess.c`，在 AST 预处理阶段正确处理推导式中的解包节点，进行必要的转换和验证。
+## 2. New syntax
 
-5. 更新代码生成：修改 `Python/codegen.c`，为包含解包的推导式生成正确的字节码。对于 `*expr`，生成循环遍历 expr 元素并逐个添加到结果的代码；对于字典推导式中的 `**expr`，生成遍历键值对并添加到字典的代码。
+The new forms are:
 
-6. 添加语法错误检查：确保在非法上下文中使用解包时（如在列表推导式中使用 `**`，或在生成器表达式中使用 `**`）给出清晰的语法错误消息。
+```
+[ *iterable_expr  for ... ]             # list comprehension
+{ *iterable_expr  for ... }             # set comprehension
+{ **mapping_expr   for ... }            # dict comprehension
+( *iterable_expr  for ... )             # generator expression
+```
 
-7. 更新文档：修改 `Doc/reference/expressions.rst` 中关于推导式和生成器表达式的语法描述，添加解包操作符的说明。更新 `Doc/tutorial/datastructures.rst` 和 `Doc/tutorial/classes.rst` 中的示例。
+Inside a comprehension element:
 
-8. 更新 whatsnew：在 `Doc/whatsnew/3.15.rst` 中记录此新功能，说明语法变化和用法示例。
+- A single starred expression `*EXPR` produces zero or more elements per
+  iteration; `EXPR` must be iterable at runtime.
+- For dict comprehensions, `**EXPR` produces zero or more `key: value`
+  pairs; `EXPR` must be a mapping.
+- Mixing starred and non-starred elements is allowed in the *element*
+  position only (not in target lists), e.g. `[a, *bs, c for ...]`.
 
-9. 添加 NEWS 条目：在 `Misc/NEWS.d/` 中创建新闻条目，简要描述此功能增强。
+The unpacking semantics are the same as in displays (`[*a, *b]`,
+`{**a, **b}`).
 
-10. 编写测试用例：更新 `Lib/test/test_unpack_ex.py` 添加推导式解包的测试。更新 `Lib/test/test_exceptions.py` 确保错误情况下的异常消息正确。测试各种边界情况，如空可迭代对象、嵌套解包、与条件表达式的组合等。
+## 3. Semantics
 
-## Requirement
-https://peps.python.org/pep-0798/
+For list/set/tuple/generator comprehensions, the element `*EXPR` is
+equivalent to extending the result with `iter(EXPR)`. For dict
+comprehensions, `**EXPR` merges `EXPR` into the result. For sets, duplicate
+elements collapse as usual.
+
+Asynchronous comprehensions (`async def` scope) preserve the same semantics:
+
+```python
+[x async for it in aiter() async for x in it]   # already legal
+[*it async for it in aiter()]                    # new, equivalent
+```
+
+## Behavioural notes
+
+- `*expr` is only allowed at the element position of a list, set, generator
+  or tuple comprehension. It is a `SyntaxError` anywhere else (e.g.
+  `[*x, y for ...]`).
+- `**expr` is only allowed at the element position of a dict comprehension.
+- Existing semantics of generator expressions (lazy evaluation, single-use)
+  are preserved. The starred form yields each unpacked element one at a
+  time.
+- Star-unpacking interacts with `if` filter clauses normally: the filter
+  applies per outer iteration, not per inner element.
+- Comprehensions that need to materialise nested iterables in a `**`
+  context must follow the standard mapping protocol.
+
+## Implementation scope
+
+The implementation must:
+
+1. Extend the grammar of comprehensions to allow `*expr` (and `**expr` for
+   dicts) at the element position, while keeping the existing rejection of
+   bad combinations (`*` outside element position, mixing types, etc.).
+2. Generate appropriate bytecode that iterates over each unpack target and
+   appends/extends the accumulator. The bytecode shape should match the
+   existing handling of `*`/`**` in display syntax.
+3. Reject syntactically invalid combinations with clear `SyntaxError`
+   messages (e.g. `**` in a list comprehension, double-stars in generator
+   expression, mismatched containers).
+4. Update `ast` so that the new element types are representable and
+   round-trippable through `ast.parse` / `ast.unparse`.
+5. Add tests for comprehensions, generator expressions, async comprehensions,
+   and assignment targets, plus error cases.
+
+## Acceptance criteria
+
+- All four comprehension flavours (list, set, dict, generator) accept star
+  unpacking targets per the description above.
+- Existing comprehension behaviour without unpacking is unchanged.
+- The standard `test_grammar`, `test_compile`, `test_ast`, and the new
+  comprehension test additions all pass.
+- `ast.unparse(ast.parse(src))` round-trips comprehensions that use the new
+  syntax.
+- Error cases produce informative `SyntaxError` messages.

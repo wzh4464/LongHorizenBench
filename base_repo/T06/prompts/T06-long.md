@@ -1,25 +1,141 @@
-**Summary**: Godot Engine 当前的节点组（Groups）管理方式存在缺陷：组名称以字符串形式分散在各个场景中，没有集中的注册表，容易出现拼写错误且难以追踪哪些组仍在使用。本提案要求在项目设置中添加"全局组"管理功能，作为组名称的单一真实来源，并在场景编辑器中限制只能从预定义列表中选择组。
+# T06: Godot Engine — Global Groups Registry
 
-**Motivation**: 在开发大型游戏项目时，开发者面临组管理的三个核心痛点：(1) 组名称以字符串形式随意分配，容易因拼写错误导致难以调试的bug；(2) 随着项目迭代，难以追踪哪些组仍在使用，可能积累大量废弃的组定义；(3) 需要手动维护单独的单例脚本来确保代码中的组名称与编辑器中的组名称保持一致。缺乏集中的组管理机制使得团队协作和项目维护变得困难。
+## Requirement — self-contained specification
 
-**Proposal**: 在 Godot Engine 中实现全局组（Global Groups）管理系统：(1) 在项目设置中添加 Group Names 配置区域，作为全局组的中央注册表；(2) 支持组的 CRUD 操作（创建、读取、更新、删除），并可为每个组添加描述信息；(3) 在场景节点的组编辑器中，区分全局组和场景局部组，提供下拉菜单快速分配全局组；(4) 实现场景组缓存机制，追踪哪些场景使用了哪些组；(5) 支持从项目设置中查看和管理全局组在各场景中的使用情况。
+Upstream reference (do not fetch): `https://github.com/godotengine/godot-proposals/issues/3789` — "Global Groups Editor/Registry". All information required to implement the feature is reproduced below.
 
-**Design Details**:
+---
 
-1. 核心数据结构扩展：在 `ProjectSettings` 类中添加全局组的存储结构（`HashMap<StringName, String>` 用于组名到描述的映射），以及场景组缓存结构（`HashMap<StringName, HashSet<StringName>>` 用于场景路径到组集合的映射）。实现相应的 getter/setter 方法，包括 `add_global_group`、`remove_global_group`、`has_global_group`、`get_global_groups_list` 等。
+## 1. Motivation
 
-2. 项目设置持久化：扩展 `ProjectSettings` 的 `_set` 和 `_get` 方法，处理 `global_group/` 前缀的属性，使全局组定义能够保存到 `project.godot` 文件中。
+Godot's scene graph has a built-in "groups" concept: any `Node` can call
+`add_to_group("enemies")` at runtime to register itself in a named group, and
+`SceneTree.get_nodes_in_group("enemies")` returns them. Groups are widely used
+for tagging entities (enemies, pickups, players, triggers) and for addressing
+subsets of a scene.
 
-3. 场景组缓存系统：实现场景组缓存的加载、保存和更新机制。创建 `scene_groups_cache.cfg` 文件存储缓存数据，在项目加载时读取缓存，在场景文件变更时更新缓存。
+In 3.x, groups exist only implicitly: a group name is created the first time
+any node joins it. There is no project-wide index, so typos silently create
+new groups, there is no description or documentation attached to any group,
+and renaming a group requires touching every scene that references it.
 
-4. 编辑器文件系统集成：在 `EditorFileSystem` 中添加场景组更新队列和处理逻辑。当检测到 PackedScene 文件的添加、修改或删除时，将其加入更新队列并在适当时机更新场景组缓存。
+The proposal introduces a **registry of global groups** stored in the project
+settings. Registered groups become first-class: they show up in the inspector
+with autocomplete, they can carry a description, editor tooling knows which
+scenes and nodes belong to which group, and refactors (rename / delete /
+merge) can be performed project-wide with confidence.
 
-5. 全局组编辑器界面：创建 `GroupSettingsEditor` 类，在项目设置中提供全局组的管理界面。支持添加、删除、重命名组，编辑组描述，以及查看组在各场景中的使用情况。实现确认对话框以防止误删除正在使用的组。
+## 2. Data model
 
-6. 节点组编辑器改进：修改 `GroupsEditor` 类，区分全局组和场景局部组的显示。提供快速添加全局组的下拉菜单，允许用户轻松地将节点添加到预定义的全局组中。
+A global group has four pieces of metadata:
 
-7. PackedScene 组信息提取：在 `PackedScene` 和 `SceneState` 类中添加 `get_all_groups` 方法，从场景状态数据中提取所有使用的组名称，用于场景组缓存的构建。
+| Field | Type | Purpose |
+|---|---|---|
+| `name` | `StringName` | Unique identifier, matches the string passed to `add_to_group()` |
+| `description` | `String` | Free-form description shown in tooltips / docs |
+| `scenes` | `Set<String>` | Paths of scene files that reference this group (editor-derived cache) |
+| `is_global` | `bool` | Whether the group is promoted to the project registry |
 
-8. Undo/Redo 支持：所有全局组的修改操作都应通过 `EditorUndoRedoManager` 实现，支持撤销和重做。
+Global groups live in the ProjectSettings section `global_group` and are persisted in `project.godot` under a new `[global_group]` section.
 
-9. 引用更新机制：当重命名或删除全局组时，提供选项批量更新所有引用该组的场景，或只从全局组列表中移除而保留场景中的引用。
+## 3. ProjectSettings API
+
+New entries in `ProjectSettings`:
+
+```
+[global_group]
+Enemies=""
+Friendlies="Characters the player should not attack"
+Collectibles=""
+```
+
+The value after `=` is the optional description string. Godot's `ProjectSettings` singleton exposes helpers:
+
+```gdscript
+ProjectSettings.add_global_group(name: StringName, description: String = "") -> void
+ProjectSettings.remove_global_group(name: StringName) -> void
+ProjectSettings.has_global_group(name: StringName) -> bool
+ProjectSettings.get_global_groups_list() -> PackedStringArray
+ProjectSettings.get_global_group_description(name: StringName) -> String
+ProjectSettings.set_global_group_description(name: StringName, description: String) -> void
+```
+
+Equivalent C++ accessors must be added on the `ProjectSettings` singleton.
+
+## 4. Editor UI
+
+### 4.1 Scene dock — Groups tab enhancements
+
+The existing `GroupsEditor` widget is extended so groups are visually split:
+
+- **Global groups** (bold, with icon) — from ProjectSettings registry.
+- **Scene-local groups** — not in the registry; labelled "Local".
+- Toggle "Add to scene" button on a global group attaches the node to that group within the scene; turning a scene group into a global one prompts the user and registers it in the project.
+
+Affected editor components: scene-tree dock and the groups editor.
+
+### 4.2 Project Settings → Global Groups tab
+
+Add a new tab inside the Project Settings dialog listing all registered global groups with columns `Name`, `Description`, `Usage count`.
+
+From this panel the user can:
+
+- Add a new global group (name + optional description).
+- Rename a group — Godot scans every `.tscn`, `.tres`, and `.gd` file under the project root and rewrites occurrences, showing a confirmation diff.
+- Delete a group — with a warning when the group has usages.
+- View "where used" listings.
+
+Relevant editor components: project-settings dialog plus a new global-groups editor.
+
+### 4.3 Scene + node linkage
+
+Internally, membership in a group continues to be stored on the `Node` in the scene, as a `PackedStringArray` `groups`. No change to the runtime API. What changes is only the *editor view*.
+
+## 4. File format impact
+
+The `[global_group]` section is serialized at the top of `project.godot` immediately after `[gui]`.
+
+Example:
+
+```
+[global_group]
+enemies=""
+collectibles="Pickups scattered around the level"
+```
+
+Scene files (`.tscn`) are unchanged.
+
+## 5. Public API additions
+
+Add these methods to `ProjectSettings`:
+
+```cpp
+bool has_global_group(const StringName &p_name) const;
+String get_global_group_description(const StringName &p_name) const;
+PackedStringArray get_global_group_names() const;
+```
+
+Expose them as `ClassDB::bind_method` entries so they are callable from GDScript (`ProjectSettings.has_global_group("enemies")`).
+
+## 6. Runtime / editor behaviour
+
+Runtime behaviour is unchanged: `Node.add_to_group` still accepts any string; using an unregistered name logs an informational message in the editor (not an error at runtime). The editor's script analyser may warn about node scripts that call `add_to_group(...)` with a literal not in the registry.
+
+## 7. Implementation Task
+
+You must:
+
+1. Extend `ProjectSettings` to parse the new `[global_group]` section and provide the CRUD API above.
+2. Add the Project Settings tab "Global Groups" with CRUD GUI.
+3. Add the Node Inspector Groups panel split.
+4. Implement the "rename group across project" path in a new editor group-settings module, including undo/redo support.
+5. Add a GDScript unit test under the project-settings test suite that creates a group, renames it, and asserts all descriptions and lookups work.
+6. Update the class documentation for `ProjectSettings` and the class-ref for `Node.add_to_group`.
+
+## 8. Acceptance criteria
+
+- Opening an existing project without `[global_group]` works unchanged; the groups tab is empty.
+- Adding a global group via the Project Settings UI is persisted to `project.godot`.
+- Renaming/deleting a global group propagates to all scenes that reference it.
+- Scene files with references to unregistered global groups emit a warning in the editor console.
+- Godot's runtime behaviour (`get_groups()`, `add_to_group()`, `SceneTree::get_nodes_in_group()`) is bitwise identical to the prior release.

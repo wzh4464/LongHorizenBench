@@ -1,44 +1,156 @@
-# T02: CPython
+# T02: CPython — PEP 634 Structural Pattern Matching
 
-## Requirement
-https://peps.python.org/pep-0634/
+## Requirement — self-contained specification
+
+*Upstream reference (do not fetch):* PEP 634 "Structural Pattern Matching: Specification" (`https://peps.python.org/pep-0634/`). Companion PEPs 635 and 636 motivate and tutorialise the feature, but all implementation-relevant rules are below.
+
+The candidate repository is a CPython checkout immediately before the PEP 634 landing. This task adds the `match` statement, its grammar, AST, compiler, and bytecode-level semantics.
 
 ---
 
-**Summary**: PEP 634 为 Python 3.10 引入结构化模式匹配（Structural Pattern Matching）功能。通过 `match`/`case` 语句，开发者可以将 subject 表达式与多种模式进行匹配，支持字面量、捕获、通配符、OR、序列、映射、类等模式类型，并在匹配成功时自动绑定变量。这是 Python 语言层面的重大扩展，需要修改语法解析器、AST、编译器和字节码解释器。
+## 1. Motivation
 
-**Motivation**: Python 长期缺乏原生的模式匹配能力，开发者只能通过 if-elif 链或字典分发来模拟。这导致代码冗长、可读性差，尤其在处理复杂数据结构（如 AST 遍历、协议解析、状态机）时。结构化模式匹配提供了一种声明式、简洁的方式来解构和匹配数据，同时自动处理类型检查和变量绑定，显著提升代码的表达力和可维护性。
+Python 3.x historically lacks a multi-way dispatch based on structure. Equivalent logic is written today as long `isinstance` chains or `if`/`elif` ladders with explicit field extraction. PEP 634 adds a `match` statement that:
 
-**Proposal**: 实现完整的 `match`/`case` 语句支持，包括：扩展 Python 语法（Grammar/python.gram）添加 match 语句和各类模式的产生式、扩展 AST 定义（Parser/Python.asdl）添加 Match 节点和模式节点类型、实现编译器支持将模式匹配编译为字节码、添加新的字节码指令（MATCH_MAPPING、MATCH_SEQUENCE、MATCH_KEYS、MATCH_CLASS 等）、以及在解释器中实现这些指令的执行逻辑。
+- Examines a scrutinee against a sequence of patterns,
+- Binds names based on the shape matched,
+- Optionally guards each arm with a `when` clause (`case p if cond:`),
+- Integrates with existing types through new dunder methods (`__match_args__`) and ABCs.
 
-**Design Details**:
+The feature is user-facing syntax, an AST extension, new compiler logic, and new opcodes — all of which this task must implement.
 
-1. 语法扩展（Grammar/python.gram）：添加 match_stmt、case_block、patterns、pattern 等产生式。match 语句格式为 `match subject_expr: NEWLINE INDENT case_block+ DEDENT`。支持的模式包括：literal_pattern（字面量）、capture_pattern（捕获变量）、wildcard_pattern（通配符 `_`）、or_pattern（用 `|` 连接）、sequence_pattern（列表/元组解构）、mapping_pattern（字典解构）、class_pattern（类匹配）、as_pattern（带绑定的模式）。
+## 2. Surface grammar
 
-2. AST 扩展（Parser/Python.asdl）：添加 Match 语句节点（包含 subject 表达式和 cases 列表）、match_case 结构（包含 pattern、guard、body）、以及各类模式的 AST 节点（MatchValue、MatchSingleton、MatchSequence、MatchMapping、MatchClass、MatchStar、MatchAs、MatchOr）。
+```
+match_stmt:       "match" subject_expr ':' NEWLINE INDENT case_block+ DEDENT
+subject_expr:     named_expression [',' [named_expression [',']]]
+case_block:       "case" patterns [guard] ':' block
+guard:            "if" named_expression
+patterns:         open_sequence_pattern | pattern
+pattern:          as_pattern | or_pattern
+as_pattern:       or_pattern "as" NAME
+or_pattern:       '|'.closed_pattern+
+closed_pattern:   literal_pattern | capture_pattern | wildcard_pattern |
+                  value_pattern | group_pattern | sequence_pattern |
+                  mapping_pattern | class_pattern
+```
 
-3. AST 生成代码（Parser/asdl_c.py）：更新 ASDL 编译器以支持生成新节点类型的 C 代码，包括构造函数、访问器、序列化等。
+`match` and `case` are **soft keywords** — they become keywords only in the grammatical position where they are expected. They are ordinary identifiers elsewhere, so existing code using `match = ...` continues to compile.
 
-4. 字节码指令（Lib/opcode.py、Python/opcode_targets.h）：添加新指令：
-   - MATCH_MAPPING：检查 TOS 是否为 Mapping 类型
-   - MATCH_SEQUENCE：检查 TOS 是否为 Sequence 类型（排除 str/bytes/bytearray）
-   - MATCH_KEYS：检查映射是否包含指定键并提取值
-   - MATCH_CLASS：检查类实例并提取属性
-   - GET_LEN：获取序列长度
-   - COPY_DICT_WITHOUT_KEYS：创建排除指定键的字典副本
+## 3. Pattern kinds
 
-5. 编译器实现（Python/compile.c）：为 Match 语句和各类模式生成字节码。处理模式匹配的控制流（匹配成功跳转到 case body，失败尝试下一个 case）。实现变量捕获的作用域处理，确保捕获的变量在 match 块后可用。
+| Pattern | Syntax | Semantics |
+|---|---|---|
+| Literal | `1`, `"hi"`, `True`, `None` | `==` comparison (or `is` for singletons). Always consumes the subject. |
+| Value | `Color.RED` | Named value (dotted) compared with `==`. |
+| Wildcard | `_` | Always matches, never binds. |
+| Capture | `name` | Always matches, binds to the subject. Conflicts with `_` and with dotted names. |
+| Group | `(p)` | Delegates to inner pattern `p`. |
+| Sequence | `[p1, p2, *rest, p3]` | Matches sequences (excluding `str`/`bytes`/`bytearray`). At most one `*rest`. |
+| Mapping | `{"a": p1, "b": p2, **rest}` | Matches mappings by key equality. `**rest` captures remaining keys into a new dict. |
+| Class | `Point(x=1, y=p2)` | Checks `isinstance(subject, Point)`, then positional/keyword attribute matching. |
+| OR | `p1 \| p2` | Tries each alternative; all must bind the same names. |
+| AS | `p as name` | Inner match + bind subject to `name` on success. |
 
-6. 解释器实现（Python/ceval.c）：在主求值循环中实现新字节码指令的执行逻辑。MATCH_MAPPING 使用 `PyMapping_Check`，MATCH_SEQUENCE 检查 `collections.abc.Sequence` 注册且非 str/bytes/bytearray。
+`__match_args__` on a class converts positional sub-patterns into keyword sub-patterns (e.g. `Point(1, 2)` equivalent to `Point(x=1, y=2)` if `Point.__match_args__ == ("x", "y")`).
 
-7. 类型对象扩展（Objects/*.c）：为内置类型（list、tuple、dict、set、str、bytes、int、float 等）添加 `__match_args__` 支持或相关协议方法，使其能够参与类模式匹配。
+## 4. AST representation
 
-8. AST 优化（Python/ast_opt.c）：可选地对模式匹配进行编译时优化，如常量折叠、死代码消除。
+Add the following AST schema entries:
 
-9. 符号表处理（Python/symtable.c）：更新符号表分析以正确处理模式中的变量绑定，确保同一模式中变量不重复绑定。
+```asdl
+stmt_kind = ...
+          | Match(expr subject, match_case* cases)
 
-10. 标准库支持（Lib/ast.py、Lib/collections/__init__.py、Lib/dataclasses.py）：更新 ast 模块支持新节点类型的访问和转换。确保 dataclasses 和 namedtuple 自动生成 `__match_args__`。
+match_case = (pattern pattern, expr? guard, stmt* body)
 
-11. 文档更新（Doc/library/dis.rst）：为新字节码指令添加文档说明。
+pattern = MatchValue(expr value)
+        | MatchSingleton(constant value)
+        | MatchSequence(pattern* patterns)
+        | MatchMapping(expr* keys, pattern* patterns, identifier? rest)
+        | MatchClass(expr cls, pattern* patterns, identifier* kwd_attrs, pattern* kwd_patterns)
+        | MatchStar(identifier? name)
+        | MatchAs(pattern? pattern, identifier? name)
+        | MatchOr(pattern* patterns)
+```
 
-12. 测试（Lib/test/test_patma.py）：编写全面的测试覆盖各种模式类型、嵌套模式、guard 条件、边界情况和错误处理。
+## 5. Bytecode additions
+
+Add to the internal opcode header and wire up in the bytecode compiler and the bytecode interpreter:
+
+| Opcode | Stack effect | Purpose |
+|---|---|---|
+| `MATCH_MAPPING` | 1 → 2 | Push True if TOS is a mapping, else False (leaves original value in place). |
+| `MATCH_SEQUENCE` | 1 → 2 | Push True iff TOS is a non-str/bytes sequence. |
+| `MATCH_KEYS` | 2 → 3 | TOS is mapping, TOS-1 is tuple of keys. Push tuple of matched values, or None on miss. |
+| `MATCH_CLASS oparg` | 3 → 2 | TOS class, TOS-1 subject, TOS-2 kw names tuple. Push extracted attr tuple, or None on miss. |
+| `GET_LEN` | 1 → 2 | Push `len(TOS)`. |
+| `COPY_DICT_WITHOUT_KEYS` | 2 → 2 | Copy dict excluding the keys in the following tuple. |
+| `ROT_N oparg` | n → n | Rotate N topmost items (used for stack juggling during multi-bind). |
+
+These opcodes replace ad-hoc runtime helpers previously used by the interpreter.
+
+## 3. Semantics summary
+
+1. `match subject:` evaluates `subject` exactly once.
+2. `case pattern [if guard]:` evaluates patterns in source order.
+3. Each pattern either *matches* (committing its name-bindings) or *fails* (discarding them). On match, the `guard` (if any) is evaluated; if it is falsy, the match is retried as a failure.
+4. When a case body runs, the match statement terminates (no fall-through).
+5. `_` is always a wildcard (never a binding).
+6. Irrefutable patterns (`_`, a bare name, `x if True`) must appear last; earlier irrefutable patterns produce a compile-time warning.
+
+## 3. Parser changes
+
+- The PEG grammar gains `match_stmt`, `case_block`, `patterns`, and every `pattern` alternative.
+- The PEG parser emits the corresponding AST nodes.
+- Soft-keyword logic: `match` and `case` are only treated as keywords in the leading position of a line inside a `match_stmt`/`case_block`; elsewhere they remain identifiers.
+
+## 4. AST changes
+
+In the AST schema (asdl):
+
+```
+stmt = ...
+     | Match(expr subject, match_case* cases)
+
+match_case = (pattern pattern, expr? guard, stmt* body)
+
+pattern = MatchValue(expr value)
+        | MatchSingleton(constant value)
+        | MatchSequence(pattern* patterns)
+        | MatchMapping(expr* keys, pattern* patterns, identifier? rest)
+        | MatchClass(expr cls, pattern* patterns, identifier* kwd_attrs, pattern* kwd_patterns)
+        | MatchStar(identifier? name)
+        | MatchAs(pattern? pattern, identifier? name)
+        | MatchOr(pattern* patterns)
+```
+
+## 5. Compiler changes
+
+The bytecode compiler emits bytecode for each pattern form using the new opcodes. A pattern test runs as a sub-graph: successful match leaves the subject value on the stack for the body; failure falls through to the next `case`. `MATCH_KEYS`, `MATCH_CLASS`, `MATCH_MAPPING`, `MATCH_SEQUENCE`, `GET_LEN`, `COPY_DICT_WITHOUT_KEYS` are new opcodes that implement the structural checks.
+
+## 6. Library / tests
+
+- New tests under the dedicated pattern-matching test module exercising:
+  - All pattern kinds (literal, capture, wildcard, value, group, sequence, mapping, class, OR, AS).
+  - Pattern errors (unreachable `_`, inconsistent capture, non-terminal `|`).
+  - Soft-keyword semantics for `match`/`case` as identifiers.
+  - `__match_args__` auto-generation in `dataclasses` and `typing.NamedTuple`.
+- The standard library `ast` and `dis` modules need to understand the new AST node kinds and opcodes.
+
+## 7. Implementation Task
+
+The candidate must:
+
+1. Update the PEG grammar and regenerate the parser.
+2. Add the `Match`, `match_case`, and pattern AST types and regenerate the AST source output.
+3. Implement the new opcodes in the ceval loop.
+4. Update the bytecode compiler to emit the right bytecode for each pattern kind, including the jump-on-mismatch logic.
+5. Support `__match_args__` on user-defined classes and the built-in ABC registrations for `Sequence` and `Mapping`.
+6. Add a pattern-matching test module and confirm related syntax/parser test modules still pass.
+
+## 8. Out of scope
+
+- Exhaustiveness checking (the compiler does not warn on non-exhaustive `match`).
+- Pattern compilation to a decision tree (the compiler emits sequential `MATCH_*` opcodes; the peephole pass can optimise later).
+- Changes to `dis` and `ast.unparse` beyond rendering the new AST node types.

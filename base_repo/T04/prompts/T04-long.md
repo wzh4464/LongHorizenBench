@@ -1,56 +1,112 @@
-# T04: Apache Airflow
+# T04: Apache Airflow — AIP-39 Richer `schedule_interval` / Timetables
 
-## Requirement
-https://cwiki.apache.org/confluence/display/AIRFLOW/AIP-39+Richer+scheduler_interval
+## Requirement — self-contained specification
+
+*Upstream reference (do not fetch at runtime):* AIP-39 "Richer `schedule_interval`" at `https://cwiki.apache.org/confluence/display/AIRFLOW/AIP-39+Richer+scheduler_interval`. All the detail required to implement this feature is reproduced below.
 
 ---
 
-**Summary**: AIP-39 重构 Airflow 的调度系统，引入 Timetable 抽象层来替代简单的 cron/timedelta 调度。新设计将 "何时运行" 与 "处理哪些数据" 分离，通过 data_interval（数据区间）概念明确 DAG run 应处理的数据范围。同时重命名 execution_date 为 logical_date，消除长期存在的命名混淆。
+## 1. Motivation
 
-**Motivation**: 当前 Airflow 调度存在两个核心问题：1) 调度灵活性不足——只能用 cron 或 timedelta，无法表达复杂场景如 "仅工作日运行"、"发薪日运行"、"交易日运行" 等；2) execution_date 命名极其误导——它实际表示数据区间的开始时间而非任务执行时间，导致新用户困惑和代码错误。AIP-39 通过引入可插拔的 Timetable 抽象和清晰的概念命名解决这些问题。
+Airflow's historical `schedule_interval` argument accepts one of:
 
-**Proposal**: 引入 Timetable 抽象类作为调度逻辑的核心接口，提供 `next_dagrun_info()` 方法计算下一次 DAG run 的时间和数据区间。实现多个内置 Timetable：CronDataIntervalTimetable（cron 调度带数据区间）、DeltaDataIntervalTimetable（timedelta 调度）、NullTimetable（手动触发）、OnceTimetable（一次性运行）。重构 DAG 类使用 Timetable 替代直接的 schedule_interval 计算，保持向后兼容。
+* A cron expression (`"0 4 * * *"`),
+* A `datetime.timedelta` (`timedelta(hours=6)`),
+* A preset string (`"@daily"`, `"@hourly"`, ...).
 
-**Design Details**:
+This is insufficient for realistic production schedules because:
 
-1. Timetable 基类（airflow/timetables/base.py）：定义 Timetable 抽象接口，核心方法：
-   - `next_dagrun_info(last_automated_dagrun_date, restriction) -> Optional[DagRunInfo]`：计算下一个 DAG run 的信息
-   - `infer_data_interval(run_after) -> DataInterval`：推断指定时间点的数据区间
-   - DagRunInfo 包含 run_after（最早调度时间）和 data_interval（数据范围）
+1. **No notion of a data interval distinct from the logical run date.** `execution_date` is used as both "the time the job is responsible for" and "the time it was triggered", which leads to confusion.
+2. **No support for irregular cadences.** Skip weekends, dispatch Monday only if Friday's run succeeded, "third Friday of the month", fiscal calendars, etc., cannot be expressed.
+3. **Extending the scheduler** requires patching Airflow core.
 
-2. 数据区间类型（airflow/timetables/base.py）：定义 DataInterval（包含 start 和 end）和 TimeRestriction（调度约束，包含 earliest、latest、catchup 标志）。
+AIP-39 replaces the implicit schedule semantics with an explicit **Timetable** abstraction that lives alongside `schedule_interval`. Existing DAGs keep working; new DAGs can pass a `Timetable` implementation to specify arbitrary cadence logic.
 
-3. 内置 Timetable 实现：
-   - CronDataIntervalTimetable（airflow/timetables/interval.py）：基于 cron 表达式，数据区间为两次触发之间
-   - DeltaDataIntervalTimetable：基于 timedelta，数据区间为固定时长
-   - NullTimetable（airflow/timetables/simple.py）：schedule_interval=None 的场景
-   - OnceTimetable：schedule_interval='@once' 的场景
+## 2. Concepts
 
-4. Schedule 封装（airflow/timetables/schedules.py）：封装 cron 解析和下一触发时间计算逻辑，处理 DST 时区转换问题。
+Three named types are introduced:
 
-5. DAG 类重构（airflow/models/dag.py）：
-   - 添加 timetable 属性，从 schedule_interval 自动推断或直接指定
-   - 重构 following_schedule/previous_schedule 方法委托给 timetable
-   - 添加 get_run_dates 方法替代废弃的 date_range
-   - 废弃 is_fixed_time_schedule 方法
+* **`DataInterval(start: DateTime, end: DateTime)`** — a half-open time window covered by one DAG run. Each run has exactly one `DataInterval`.
+* **`TimeRestriction(earliest, latest, catchup)`** — scheduler-supplied bounds that restrict the timetable's scheduling decisions.
+* **`DagRunInfo(logical_date, data_interval, run_after)`** — the scheduler contract: when the next run should fire, which data interval it covers, and its nominal logical date.
 
-6. DagRun 扩展（airflow/models/dagrun.py）：添加 data_interval_start 和 data_interval_end 属性，存储实际的数据区间。
+## 3. `Timetable` abstract class (new module in the Airflow timetables package)
 
-7. TaskInstance 更新（airflow/models/taskinstance.py）：调整与 data_interval 相关的逻辑，确保任务实例能访问正确的数据区间信息。
+```python
+class Timetable(LoggingMixin, ABC):
+    description: str = ""
+    periodic: bool = True
+    can_run: bool = True
 
-8. BackfillJob 修改（airflow/jobs/backfill_job.py）：更新 backfill 逻辑使用 get_run_dates 并正确设置 align 参数。
+    @abstractmethod
+    def infer_manual_data_interval(self, *, run_after: DateTime) -> DataInterval: ...
 
-9. 依赖检查更新（airflow/ti_deps/deps/prev_dagrun_dep.py）：更新前置 DAG run 依赖检查逻辑适配新的调度模型。
+    @abstractmethod
+    def next_dagrun_info(
+        self,
+        *,
+        last_automated_data_interval: DataInterval | None,
+        restriction: TimeRestriction,
+    ) -> DagRunInfo | None: ...
 
-10. CLI 更新（airflow/cli/commands/dag_command.py）：更新 dag next-execution 命令输出格式。
+    def serialize(self) -> dict[str, Any]: return {}
 
-11. 异常类型（airflow/exceptions.py）：添加 AirflowTimetableInvalid 异常用于 timetable 配置错误。
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> Timetable:
+        return cls()
+```
 
-12. 类型兼容（airflow/compat/functools.pyi）：添加 cached_property 类型存根解决 mypy 类型检查问题。
+The scheduler calls `next_dagrun_info` each time it evaluates whether a DAG should produce a new DagRun. Returning `None` means "no next run".
 
-13. 序列化支持（tests/serialization/test_dag_serialization.py）：确保 DAG 序列化/反序列化正确处理 timetable。
+## 5. Built-in Timetable subclasses
 
-14. 测试：
-    - tests/timetables/ 目录下添加各 Timetable 实现的单元测试
-    - 更新 tests/models/test_dag.py 测试新的调度逻辑
-    - 更新 tests/jobs/test_backfill_job.py 和 test_scheduler_job.py
+Airflow ships four built-in timetable implementations:
+
+### 5.1 `NullTimetable`
+
+Used when `schedule_interval=None`. `next_dagrun_info` always returns `None`; the DAG is triggered only manually.
+
+### 5.2 `OnceTimetable`
+
+Used when `schedule_interval="@once"`. Generates a single DagRun starting at the DAG's `start_date`, and never schedules again.
+
+### 5.3 `CronDataIntervalTimetable(cron, timezone)`
+
+Used when `schedule_interval` is a cron string like `"30 * * * *"`. `next_dagrun_info` calculates the next cron tick that is strictly greater than the most recent `last_automated_data_interval.end`; the data interval is `[previous_tick, next_tick)`.
+
+### 5.4 `DeltaDataIntervalTimetable(timedelta)`
+
+Used when `schedule_interval` is a `timedelta`. Similar to above but increments by the fixed delta.
+
+## 6. Integration
+
+- `airflow.models.dag.DAG.__init__` now accepts `timetable=…` OR `schedule_interval=…` (the latter is mapped onto the appropriate `Timetable` subclass).
+- The scheduler uses `Timetable.next_dagrun_info(...)` exclusively; the old `schedule_interval` logic is implemented as a compatibility shim around `CronTimetable`.
+- New DB columns `data_interval_start` and `data_interval_end` on `dag_run`.
+
+## 7. Plugin protocol
+
+Custom timetables are loaded via the `airflow.plugins_manager` protocol: plugins can register `Timetable` subclasses, which become available via `provide_timetable` or by string reference in serialized DAG JSON.
+
+## 8. Implementation Task
+
+1. Introduce the `Timetable`, `DataInterval`, `DagRunInfo`, and `TimeRestriction` abstractions in a new timetables package.
+2. Add the cron-based timetable module containing `CronDataIntervalTimetable` and `DeltaDataIntervalTimetable`.
+3. Add a simple timetable module with `NullTimetable`, `OnceTimetable`.
+4. Update the DAG model so `schedule_interval` resolves to a `Timetable`; add a `timetable` keyword argument with priority over `schedule_interval`.
+5. Modify the scheduler job to query the active timetable for next DagRunInfo.
+6. Add Alembic migration introducing `data_interval_start/data_interval_end` columns, backfill from `execution_date`.
+7. Wire plugin support so `from __future__ import annotations`-style timetable classes can be discovered.
+8. Add unit tests covering the new timetable abstractions.
+
+## 9. Backwards compatibility
+
+- `DAG(schedule_interval='@daily')` continues to work (mapped to `cron="0 0 * * *"` and wrapped in `CronDataIntervalTimetable`).
+- `execution_date` remains as a field on `DagRun` but semantics are clarified: it equals `data_interval_start`.
+- Existing custom operators continue to see `execution_date` in context.
+
+## 7. Tests and acceptance
+
+- New unit tests cover each built-in `Timetable`, boundary cases (DST, leap days), and edge cases (empty `next_dagrun_info` output).
+- The existing scheduler-job test suite continues to pass.
+- `dag.iter_dagrun_infos_between(start, end)` returns matching `DagRunInfo` values for legacy cron schedules, identical to pre-change behaviour.

@@ -1,45 +1,90 @@
-# T32: OpenJDK
+# T32: OpenJDK / JEP 439 - Generational ZGC
 
-**Summary**: ZGC 是 HotSpot JVM 中的低延迟垃圾收集器，当前实现为非分代收集器，每次 GC 都需要遍历整个对象图。JEP 439 提出实现分代 ZGC（Generational ZGC），将堆划分为年轻代和老年代，使 ZGC 能够更快地回收内存，更好地支持高分配率、大存活集或资源受限的工作负载。
+## Requirement source
 
-**Motivation**: 非分代 ZGC 在每次垃圾收集时都需要遍历整个堆，这对于大存活集的应用会造成较大开销。分代假设（大多数对象生命周期很短）表明，将堆划分为年轻代和老年代可以显著提高 GC 效率。分代 ZGC 可以更频繁地收集年轻代（这里存放大部分短命对象），而较少收集老年代，从而减少 CPU 开销、降低分配停顿风险、减少堆内存需求，同时保持 ZGC 的低延迟特性。
+This task implements OpenJDK JEP 439 ("Generational ZGC"). All
+behavioral requirements are sourced from the JEP itself
+(https://openjdk.org/jeps/439). Implementations should match the JEP's
+specified behavior; specific class layouts, file paths, and internal
+identifiers are not specified by this prompt.
 
-**Proposal**: 实现分代 ZGC 作为现有 ZGC 的演进版本。通过 `-XX:+ZGenerational` 标志启用（需配合 `-XX:+UseZGC`）。为确保平稳过渡，初期同时保留两个版本：非分代 ZGC 保持在 `gc/z` 目录，分代 ZGC 的遗留代码重命名为 `gc/x`（类名前缀从 Z 改为 X）。未来计划弃用并移除非分代版本，届时分代 ZGC 将成为默认选项。
+## Goal
 
-**Design Details**:
+Extend the Z Garbage Collector (ZGC) so that it manages the Java heap
+as two generations — a young generation for newly allocated objects
+and an old generation for objects that have survived enough young
+collections — while preserving ZGC's existing properties (concurrent,
+sub-millisecond pauses, scalable heap sizes).
 
-1. 目录结构重组：将非分代 ZGC 代码从 `gc/z` 复制到 `gc/x` 目录，所有类名和文件名前缀从 Z 改为 X（如 ZGC -> XGC, ZBarrier -> XBarrier）。这涉及 HotSpot 各平台目录下的实现（aarch64, x86, ppc, riscv）以及操作系统相关代码（linux, bsd, windows, posix）。
+## Goals (per the JEP)
 
-2. 分代 ZGC 核心实现：在 `gc/z` 目录下实现分代收集逻辑，包括：
-   - 年轻代和老年代的内存管理
-   - 代际间引用的记录和处理（记忆集）
-   - 晋升策略（对象从年轻代晋升到老年代）
-   - 分代并发标记和重定位算法
+- Reduce the risk of allocation stalls.
+- Lower the required heap memory overhead.
+- Lower the GC CPU overhead, especially for applications with the
+  typical "weak generational" property where most objects die young.
+- Continue to provide pause times that do not exceed one millisecond.
+- Continue to support heap sizes up to many terabytes.
+- Avoid introducing manual tuning: heap size and other parameters
+  should not need different tuning values when the generational mode
+  is enabled.
+- Maintain the same source-language and platform support as
+  non-generational ZGC.
 
-3. 地址视图（Address Views）更新：分代 ZGC 引入新的地址元数据位布局。更新 `zAddress.cpp/hpp` 和相关内联文件，处理分代指针着色方案。每个平台需要相应的实现（aarch64, x86, ppc, riscv）。
+## Non-goals (per the JEP)
 
-4. 屏障实现：为各平台实现分代写屏障和读屏障：
-   - `zBarrierSetAssembler_*.cpp/hpp`：汇编级屏障实现
-   - C1 和 C2 编译器集成：`c1/zBarrierSetC1.cpp`, `c2/zBarrierSetC2.cpp`
-   - 解释器屏障：更新模板表和宏汇编器
+- This is not an evolution of any non-ZGC collector (G1, Parallel,
+  Serial, Shenandoah).
+- Multi-generational (more than two generations) is not in scope.
+- The user-visible API of ZGC must remain unchanged.
 
-5. 构建系统更新：
-   - 修改 `make/hotspot/lib/JvmFeatures.gmk` 支持同时编译 `gc/z` 和 `gc/x`
-   - 更新 `make/hotspot/gensrc/GensrcAdlc.gmk` 包含两套 AD 文件
-   - 添加条件编译宏 `INCLUDE_ZGC` 控制代码包含
+## Required behavior
 
-6. 运行时集成：
-   - C1 LIRAssembler 更新：条件判断使用 `UseZGC && !ZGenerational` 区分版本
-   - 更新全局变量和类型定义支持分代模式
-   - 修改 stub 生成器支持分代屏障
+- Generational ZGC must split the heap into a young and an old
+  generation, with separate collection cycles for each generation.
+- Young-generation collections concurrently identify and reclaim
+  short-lived objects without stopping the application beyond the
+  small pauses already characteristic of ZGC.
+- A reference from an object in the old generation to an object in the
+  young generation must be tracked (a remembered set / write-barrier
+  mechanism) so the young-generation collector can find live objects
+  reachable from the old generation without scanning the entire old
+  generation.
+- Survivors of repeated young collections are promoted (tenured) into
+  the old generation. The implementation must define a promotion
+  policy and adjust it to keep CPU and memory overhead reasonable.
+- The full-heap collector must continue to support heaps from a few
+  hundred megabytes up to multi-terabyte heaps with pause times in the
+  sub-millisecond range, as in current ZGC.
+- The new collector must coexist with non-generational ZGC during
+  the transition. The user opts in to the generational mode via a
+  command-line option (the JEP introduces `-XX:+ZGenerational`),
+  defaulting to non-generational ZGC initially.
 
-7. 平台特定实现：为 aarch64、x86_64、ppc64、riscv64 四个平台分别实现：
-   - 地址解码/编码逻辑
-   - 屏障汇编代码
-   - AD 文件（编译器后端匹配规则）
-   - nmethod 入口屏障
+## User-facing requirements
 
-8. 测试：验证分代 ZGC 和非分代 ZGC 都能正常工作，通过 tier1-8 测试套件。
+- A new flag, `-XX:+ZGenerational`, enables Generational ZGC. Without
+  it, ZGC continues to behave as the existing single-generation
+  collector.
+- All other ZGC options (heap size, concurrent threads, etc.)
+  continue to apply.
+- ZGC's external behavior (pause-time goals, heap usage reporting,
+  GC log format) must remain compatible. Pause times must remain
+  consistent with the existing ZGC promise (typically below 1 ms).
+- ZGC's interaction with the rest of the JVM (JNI, JFR, JVMTI, etc.)
+  must continue to work; in particular JFR must be able to report
+  generational events.
 
-## Requirement
-https://openjdk.org/jeps/439
+## Acceptance criteria
+
+- Running with `-XX:+UseZGC -XX:+ZGenerational` boots a working JVM
+  whose ZGC operates as a two-generation collector.
+- Allocation-heavy workloads where most objects die young show
+  reduced CPU overhead and reduced allocation stalls compared to
+  non-generational ZGC.
+- Applications using large long-lived data sets continue to run
+  without regressions in pause time or throughput.
+- The existing ZGC test suite continues to pass; new tests verify
+  that the generational behavior matches the JEP's stated invariants
+  (young objects collected more frequently, old generation only
+  scanned during major cycles, remembered set correctly tracking
+  cross-generation references).

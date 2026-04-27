@@ -1,32 +1,190 @@
-# T22: CPython
+# T22: CPython — Implement PEP 654 Exception Groups and `except*`
 
-**Summary**: Python 当前的异常处理机制一次只能传播一个异常。PEP 654 提出引入 `ExceptionGroup` 和 `BaseExceptionGroup` 两个新的标准异常类型，用于同时表示和传播多个不相关的异常，并新增 `except*` 语法来专门处理异常组。
+## Requirement (PEP 654, inlined; do not fetch external sources)
 
-**Motivation**: 在多个并发任务失败、批量回调执行、重试逻辑等场景中，程序可能需要同时报告多个不相关的错误。asyncio、Trio 等异步框架在多个任务同时失败时难以优雅地传播所有异常；pytest 等测试框架在多个 fixture 或 teardown 失败时也面临类似问题；socket 连接尝试多个地址时可能收集多个失败原因。现有的单一异常模型无法满足这些需求，开发者被迫使用各种变通方案（如将异常存入列表），但这些方案既不标准也不够健壮。
+PEP 654 introduces a way to raise and handle multiple unrelated exceptions
+simultaneously, and a new syntactic form `except*` for handling them. The
+upstream document is the only source of normative truth; everything you need
+is summarized below.
 
-**Proposal**: 引入 `ExceptionGroup` 和 `BaseExceptionGroup` 类来封装多个异常，提供 `subgroup()` 和 `split()` 方法按条件分割异常组。新增 `except*` 语法来匹配和处理异常组中的特定类型，未匹配的异常自动重新抛出。同时更新 AST、字节码和编译器以支持新语法。
+## 1. Motivation
 
-**Design Details**:
+Several concurrency and resource-management patterns naturally produce more
+than one exception at the same time:
 
-1. 扩展 AST 定义：在 `Parser/Python.asdl` 中添加 `TryStar` 语句类型，其结构与 `Try` 类似但语义不同。同时更新 `Include/internal/pycore_ast.h` 中的枚举和结构体定义。
+- `asyncio.TaskGroup` and `asyncio.gather(...)` worker failures.
+- `socket.socketpair`/multi-endpoint dial failures.
+- Trio-style nursery teardown.
+- `__exit__` raising while another exception is propagating.
 
-2. 修改语法规则：在 `Grammar/python.gram` 中添加 `except_star_block` 规则来解析 `except*` 子句，更新 `try_stmt` 规则以支持 `TryStar` 语法。添加语法验证确保同一 try 块中不能混用 `except` 和 `except*`。
+Today Python collapses these into a single exception (often arbitrarily the
+last one), losing information. Chained exceptions (`__context__`,
+`__cause__`) describe causal chains, not concurrent siblings. PEP 654 adds
+two builtins, `BaseExceptionGroup` and `ExceptionGroup`, that wrap a list of
+inner exceptions, and a new `try ... except* T:` form whose body runs once
+per matching exception leaf.
 
-3. 实现 ExceptionGroup 类：在 `Objects/exceptions.c` 中实现 `ExceptionGroup` 和 `BaseExceptionGroup` 类型，包括构造函数、`subgroup()`、`split()` 等方法，以及异常组的嵌套和递归处理逻辑。
+## 2. New built-in types
 
-4. 添加新字节码指令：在 `Lib/opcode.py` 和 `Python/opcode_targets.h` 中定义 `JUMP_IF_NOT_EG_MATCH`（异常组匹配跳转）和 `PREP_RERAISE_STAR`（准备重新抛出未匹配异常）等新指令。
+```
+class BaseExceptionGroup(BaseException):
+    def __new__(cls, message: str, exceptions: Sequence[BaseException]): ...
+    message: str
+    exceptions: tuple[BaseException, ...]
+    def subgroup(self, condition) -> Self | None: ...
+    def split(self, condition) -> tuple[Self | None, Self | None]: ...
+    def derive(self, excs: Sequence[BaseException]) -> Self: ...
 
-5. 更新编译器：修改 `Python/compile.c` 以生成 `TryStar` 语句的字节码，包括异常组的拆分、匹配、处理和重新抛出逻辑。实现与普通 try/except 不同的控制流。
+class ExceptionGroup(BaseExceptionGroup, Exception):
+    """All contained exceptions must be Exception subclasses."""
+```
 
-6. 修改求值循环：在 `Python/ceval.c` 中实现新字节码指令的执行逻辑，处理异常组的匹配、拆分和重组操作。
+Construction rules:
 
-7. 更新 AST 优化器和符号表：修改 `Python/ast_opt.c` 和 `Python/symtable.c` 以正确处理 `TryStar` 节点的遍历和分析。
+* `BaseExceptionGroup(msg, excs)` auto-promotes to `ExceptionGroup` if every
+  element of `excs` is an `Exception`; otherwise it stays a
+  `BaseExceptionGroup`.
+* `ExceptionGroup(msg, excs)` rejects any non-`Exception` element with
+  `TypeError`.
+* The `exceptions` argument must be a non-empty sequence; an empty input
+  raises `ValueError`.
+* `condition` for `split`/`subgroup` is either a callable
+  `(BaseException) -> bool` or an exception type / tuple of types (matched
+  by `isinstance` recursively).
+* `split` returns a pair `(matched, rest)`; each side may be `None` if
+  empty. Both sides preserve traceback, cause, context, and notes from the
+  originals; structure of nested groups is preserved.
+* `derive` lets subclasses control how rebuilt groups are constructed; the
+  default implementation builds a fresh `BaseExceptionGroup` /
+  `ExceptionGroup` carrying the same `message`.
 
-8. 扩展 ast 模块：更新 `Lib/ast.py` 以支持 `TryStar` 节点的解析和反解析（unparse），确保 `ast.dump()` 和 `ast.unparse()` 正确处理新语法。
+## 3. `except*` syntax
 
-9. 更新文档：修改 `Doc/library/ast.rst` 和 `Doc/library/dis.rst`，添加 `TryStar` 类和新字节码指令的文档说明。在 `Doc/whatsnew/3.11.rst` 中记录此功能。
+```
+try_stmt:
+      "try" ":" block
+      ("except" "*" expression ["as" NAME] ":" block)+
+      ["else" ":" block]
+      ["finally" ":" block]
+   |  ...
 
-10. 编写测试用例：在 `Lib/test/` 下添加 `test_except_star.py` 和 `test_exception_group.py`，覆盖异常组的创建、嵌套、拆分、`except*` 语法的各种场景、与普通异常的交互等。
+```
 
-## Requirement
-https://peps.python.org/pep-0654/
+- A `try` statement may use either `except` clauses or `except*` clauses, but
+  not a mixture.
+- The exception expression after `except*` is evaluated with the usual rules
+  (a type or tuple of types). It must not be a `BaseExceptionGroup` /
+  `ExceptionGroup` subclass — that is rejected with `TypeError` at runtime.
+- During exception handling the active group is split into matched and
+  unmatched parts (`split`). Each `except*` clause runs at most once with the
+  matched subgroup bound to the `as` name. Unmatched leaves are re-raised as
+  a single combined group after all clauses run.
+- Re-raising inside an `except*` clause (`raise` with no expression) re-raises
+  the matched subgroup unchanged. Raising a new exception inside an
+  `except*` clause causes that exception to be combined with any other raised
+  / unmatched exceptions into a fresh group at the end of the `try`.
+- `continue`, `break`, and `return` are disallowed inside `except*` clauses
+  because the body may be entered multiple times semantically (one
+  iteration per matched group). The parser must reject them.
+
+## 4. Traceback rendering
+
+For both regular `print_exception` and the default uncaught-exception hook,
+the renderer must:
+
+* Print `<type>: <message>` for the outer group.
+* Indent each contained exception with the `  +-+- N ----` header used in
+  the PEP examples, recursing through nested groups.
+* Preserve `__context__` / `__cause__` chaining for each leaf.
+
+## Runtime contract (Python level)
+
+```python
+class BaseExceptionGroup(BaseException):
+    def __new__(cls, message, exceptions): ...
+    message: str
+    exceptions: tuple[BaseException, ...]
+    def subgroup(self, condition) -> "BaseExceptionGroup | None": ...
+    def split(self, condition) -> tuple["BaseExceptionGroup | None",
+                                         "BaseExceptionGroup | None"]: ...
+    def derive(self, excs) -> "BaseExceptionGroup": ...
+
+class ExceptionGroup(BaseExceptionGroup, Exception):
+    pass
+```
+
+`condition` may be:
+
+* an exception type or tuple of types (matched with `isinstance`),
+* or a callable `f(exc) -> bool` invoked on each leaf and on each group node.
+
+Empty results from `subgroup`/`split` return `None`. Both methods preserve
+`__traceback__`, `__cause__`, `__context__`, `__suppress_context__`, and
+`__notes__` on every leaf and on the new groups they construct. `derive` is
+the override hook for subclasses to customise the type of split/subgroup
+outputs; the default implementation returns a `BaseExceptionGroup` (or
+`ExceptionGroup` if all `excs` are `Exception`).
+
+## `except*` semantics
+
+```
+try:
+    ...
+except* T1 as e1:
+    handler1
+except* (T2, T3):
+    handler2
+```
+
+Behaviour:
+
+1. Collect the raised exception. If it is not a group, wrap it in a
+   transient `ExceptionGroup` of length 1.
+2. For each `except*` clause in order, split the current group on the
+   clause's type expression. If the matched subgroup is non-empty, run the
+   handler with the matched group bound to the `as` name (if any). The
+   un-matched remainder becomes the new "current group" for subsequent
+   clauses.
+3. After all clauses run, if any handlers raised new exceptions, combine
+   them (and any still-unmatched remainder) into a single
+   `ExceptionGroup` and re-raise. If only one exception is left and it is
+   not an `ExceptionGroup`, re-raise it directly.
+4. `else:` and `finally:` clauses follow the standard rules; `else` runs
+   only when the entire `try` body completed without raising.
+
+Static rules:
+
+* `except*` and `except` cannot be mixed in the same `try`.
+* `except*` cannot match `BaseExceptionGroup` / `ExceptionGroup` types.
+* `continue`, `break`, and `return` are forbidden inside `except*`
+  blocks.
+
+## Implementation scope
+
+The implementation needs to cover:
+
+- The new builtin exceptions `BaseExceptionGroup` and `ExceptionGroup` and
+  their `subgroup`/`split`/`derive` methods.
+- Grammar and AST support for `except*` clauses.
+- Bytecode and interpreter changes to compile and execute `try ... except*`,
+  including the runtime split/merge of groups across multiple clauses.
+- AST module support for the new syntax (and round-trip via `unparse`).
+- Traceback rendering of nested groups in the documented `+-+- n -----` style.
+- Tests for the new builtins, the new syntax, the static rejection of
+  `continue`/`break`/`return` inside `except*`, and traceback rendering.
+- Documentation in the language reference and what's-new.
+
+The agent decides where in the CPython source tree to make each change; the
+PEP itself does not prescribe filenames.
+
+## Acceptance
+
+* `BaseExceptionGroup`/`ExceptionGroup` are available as builtins with the
+  documented constructor signature, methods, and pickling support.
+* `try ... except* ...:` parses and executes per the semantics above and
+  rejects mixed `except`/`except*` use, as well as `break`/`continue`/`return`
+  inside `except*`.
+* The standard test suite for exception groups and `except*` passes.
+* `traceback.format_exception` renders nested groups with the PEP-654
+  indentation pattern.
+* Reference implementation: see PEP 654 ("Reference Implementation" section).

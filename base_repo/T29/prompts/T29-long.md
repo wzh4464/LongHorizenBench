@@ -1,32 +1,90 @@
-# T29: OpenJDK
+# T29: OpenJDK — JEP 516: Ahead-of-Time Object Caching for Any GC
 
-**Summary**: JEP 516 提出了 Ahead-of-Time 对象缓存与任意 GC 兼容的功能。当前 AOT 缓存通过 mmap 将文件中的字节直接放置到 GC 管理的堆中来缓存堆对象，这要求所有 GC 具有完全相同的对象和引用格式。该 JEP 引入了一种新的对象流式加载机制，使用对象索引而非原始指针表示对象引用，从而实现与所有 GC（包括 ZGC）的兼容，并支持延迟物化和并发处理。
+## Requirement source
 
-**Motivation**: 现有的 AOT 堆归档机制通过内存映射直接将归档的堆区域放置到 Java 堆中，这种方法要求所有 GC 对对象和引用有相同的内存布局。由于 ZGC 使用不同的指针格式（彩色指针），导致 AOT 缓存的高级功能（如堆对象缓存）无法在 ZGC 下使用。JEP 516 通过引入在线布局决策和逐对象分配的方式，让归档对象对 GC 来说与普通对象无异，从而解耦 GC 实现与归档机制。
+JEP 516 ("Ahead-of-Time Object Caching for Any GC"),
+https://openjdk.org/jeps/516. The text below paraphrases the JEP. The
+implementation should match the behavior described in the JEP; do not
+hard-code internal class or file names beyond what the JEP explicitly
+says.
 
-**Proposal**: 实现与任意 GC 兼容的 AOT 对象缓存机制，包括：引入对象流式加载架构，使用对象索引替代原始指针；实现 AOT 后台线程进行批量物化；添加延迟物化支持以优化启动时间；实现字符串驻留的在线处理；支持映射模式和流式模式的切换；以及相应的测试和 GC 适配。
+## Goal
 
-**Design Details**:
+Extend the AOT cache (introduced by JEP 483, "Ahead-of-Time Class Loading
+& Linking") so that the cached Java objects can be used by any HotSpot
+garbage collector, including ZGC. Today the AOT cache stores objects in a
+GC-specific format and is therefore unusable with ZGC, which has its own
+representation of object references. The change introduces a neutral,
+GC-independent format and a sequential ("streamed") loading mode so that
+ZGC and other collectors can consume the same cache.
 
-1. 对象流式加载架构：创建 `aotStreamedHeapWriter.cpp/hpp` 和 `aotStreamedHeapLoader.cpp/hpp`，实现基于对象索引的归档和加载机制。对象引用使用索引（如 1, 2, 3）而非原始指针表示，一张表将对象索引映射到归档对象，另一张表将对象索引映射到运行时分配的堆对象。
+## Goals (per the JEP)
 
-2. 映射式加载架构重构：创建 `aotMappedHeapWriter.cpp/hpp` 和 `aotMappedHeapLoader.cpp/hpp`，将现有的内存映射加载逻辑重构为独立模块。在 `heapShared.cpp/hpp` 中实现两种加载模式的统一接口。
+- Make the AOT object cache usable with all HotSpot collectors,
+  including ZGC. AOT class loading and linking is no longer restricted to
+  serial/parallel/G1.
+- Decouple the AOT cache from any single GC's object reference encoding.
+- Preserve the start-up benefit of JEP 483 to the extent reasonable; the
+  new mechanism should approach the existing speed-up.
+- Allow the JVM to ship with built-in AOT cache content for the JDK that
+  any supported GC can read.
 
-3. AOT 后台线程：创建 `aotThread.cpp/hpp`，实现 AOT 物化后台线程。该线程在启动时执行大部分物化工作，减少对主线程的影响。物化按批次进行，每个批次包含 N 个根对象及其可达对象。
+## Non-goals
 
-4. 根对象管理：实现根对象注册机制，不同组件可以在 dump 时注册对象根。每个根分配一个根索引，运行时可以通过根索引请求获取对象引用。在 `aotMapLogger.cpp/hpp` 中更新日志支持以处理两种堆归档模式。
+- Replacing the existing GC-specific (mapped) caching path entirely.
+  The mapped path remains as an option for the configurations where it
+  works best.
+- Caching arbitrary user objects beyond what AOT cache already handles.
 
-5. DFS 预序遍历布局：对象按根的 DFS 预序排列，使对象索引与 DFS 遍历顺序一致。这样后台线程的 DFS 遍历与线性物化对象的顺序相同（称为迭代物化），优化了缓存局部性。
+## Background
 
-6. 并发同步机制：每个批次在锁下被认领，但实际处理可以无锁进行。应用线程遍历时可以判断对象是否已被后台线程物化（在当前批次范围之前）、需要等待（在当前批次范围内）或需要自行遍历（在当前批次范围之后）。
+JEP 483 caches a snapshot of loaded classes and a small set of
+associated heap objects (interned strings, the `Class` mirrors, etc.).
+That snapshot is mapped directly into the Java heap by the running GC.
+Object references in the snapshot are encoded using the running GC's
+pointer representation (compressed OOPs, etc.). This approach works for
+collectors that share a pointer/heap layout but is incompatible with
+ZGC, which has a fundamentally different reference representation. As a
+result, the existing AOT cache cannot be combined with ZGC.
 
-7. 字符串驻留处理：与映射方案不同，新方案不 dump 整个字符串表。归档中的驻留字符串被标记，加载器在解包时知道该字符串应被驻留。修改 `stringTable.cpp/hpp` 以支持此逻辑。
+## Required behavior
 
-8. GC 前后的物化策略：在 GC 允许运行之前，物化代码使用原始 oop 映射对象索引到对象，并原地修复引用。GC 可运行后，使用更谨慎的策略——批量复制原始数据范围，但对象引用逐个复制，避免 GC 看到包含垃圾对象索引的引用槽。
+- A new GC-agnostic object encoding for the AOT cache is added.
+  Object references in the cached snapshot are stored as indices or
+  identifiers that are independent of the running GC.
+- At cache load time, the JVM reads cached objects sequentially and
+  materializes them by allocating in the running collector's heap and
+  fixing up references. Because allocation and fix-up happen at runtime,
+  any GC that supports normal Java object allocation can host the
+  cache.
+- ZGC must be able to use AOT caches produced under this scheme.
+- Existing collectors (Serial, Parallel, G1) must keep working. They
+  may continue to use the mapped path or use the streamed path; both
+  are supported.
+- The user-visible command-line surface introduced by JEP 483
+  (`-XX:AOTMode`, `-XX:AOTConfiguration`, `-XX:AOTCache`) is unchanged.
+- Choice between mapped and streamed object loading is automatic. The
+  JEP describes a heuristic: by default the cache is created in a form
+  that can be streamed; collectors that support direct mapping may opt
+  in to map it instead.
 
-9. 模式选择逻辑：在 `heapShared.cpp` 中实现启发式选择逻辑，当压缩 oop 关闭时使用新的流式机制。修改 `cds_globals.hpp` 添加相关配置选项。
+## Non-goals (from the JEP)
 
-10. 测试与 GC 适配：更新现有 AOT/CDS 测试以支持两种堆归档方案。在 `test/hotspot/jtreg/runtime/cds/` 下添加测试用例，覆盖所有 GC（包括 ZGC）与 AOT 缓存的组合。修改 `zCollectedHeap.cpp`、`shenandoahHeap.cpp` 等 GC 实现以支持新的归档机制。
+- This JEP does not change the AOT cache user interface, classes, or
+  contents beyond what is required for the new format.
+- It does not introduce new tuning knobs that users have to set in
+  normal use.
 
-## Requirement
-https://openjdk.org/jeps/516
+## Acceptance criteria
+
+- Running with ZGC (or any GC that previously could not use the AOT
+  cache) and loading a cache produced by another GC works and yields
+  the documented startup-time benefit. Running with a mapping-capable
+  GC (e.g., G1) on a cache also continues to work.
+- A cache produced on one supported GC is loadable by every supported
+  GC.
+- Existing AOT cache tests continue to pass.
+- No regression in startup time for collectors that previously
+  supported the AOT cache.
+- ZGC + AOT cache produces a measurable startup-time improvement over
+  ZGC without an AOT cache.

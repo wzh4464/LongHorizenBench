@@ -1,35 +1,157 @@
-**Summary**: JDK 目前缺少一个简单的命令行 HTTP 服务器工具，用于快速提供静态文件服务。JEP 408 提出在 `jdk.httpserver` 模块中实现一个 Simple Web Server，提供开箱即用的命令行工具和可编程 API，用于测试、开发和调试目的的静态文件服务。
+# T07 — JEP 408: Simple Web Server
 
-**Motivation**: 开发人员在测试、原型验证和临时文件共享时，经常需要一个简单的 HTTP 服务器来提供静态文件服务。当前 JDK 虽然有 `com.sun.net.httpserver` 包提供底层 HTTP 服务器 API，但使用起来需要编写大量样板代码。其他语言（如 Python 的 `python -m http.server`）早已提供了类似的便捷工具。JEP 408 旨在填补这一空白，同时增强现有 HTTP 服务器 API 的可用性。
+## Requirement source
 
-**Proposal**: 在 `jdk.httpserver` 模块中实现一个简单的文件服务器：(1) 提供 `jwebserver` 命令行工具，可通过 `java -m jdk.httpserver` 启动；(2) 创建 `SimpleFileServer` 类提供编程式 API 来创建文件服务器、文件处理器和输出过滤器；(3) 增强现有 API，添加 `Request` 接口、`HttpHandlers` 工具类、以及 `Headers` 和 `Filter` 的新工厂方法；(4) 支持 GET 和 HEAD 请求、目录列表、MIME 类型检测和可配置的日志输出。
+Upstream specification: JEP 408, "Simple Web Server" (https://openjdk.org/jeps/408).
+The text below paraphrases the JEP. The implementation must match the JEP's
+goals and surface; specific file layouts and internal class names are left to
+the implementer.
 
-**Design Details**:
+## Goals
 
-1. 命令行入口点：在 `jdk.httpserver` 模块的 `module-info.java` 中声明 main class。创建 `sun.net.httpserver.simpleserver.Main` 类处理命令行参数（绑定地址、端口、根目录、输出级别等），解析参数并启动服务器。在构建系统中配置模块的 main class 属性。
+Provide a minimal HTTP server in the JDK that serves a single directory of
+static files, with the following purposes:
 
-2. `SimpleFileServer` 公共 API：创建 `com.sun.net.httpserver.SimpleFileServer` 类，提供三个静态工厂方法：
-   - `createFileServer(InetSocketAddress, Path, OutputLevel)` - 创建完整的文件服务器
-   - `createFileHandler(Path)` - 创建文件处理器，可集成到现有服务器
-   - `createOutputFilter(OutputStream, OutputLevel)` - 创建日志输出过滤器
-   定义 `OutputLevel` 枚举（NONE、INFO、VERBOSE）控制日志输出详细程度。
+- Out-of-the-box static file serving for prototyping, ad-hoc coding, and
+  testing — particularly in educational settings.
+- A small programmatic API on top of the existing `com.sun.net.httpserver`
+  package so that a static file server, file-server handler, and supporting
+  filters/handlers can be created without writing boilerplate.
+- Reduce the friction of getting started with the JDK: a developer should be
+  able to serve files immediately, the way `python -m http.server` does in
+  Python.
 
-3. 文件处理器实现：创建 `sun.net.httpserver.simpleserver.FileServerHandler` 类实现 `HttpHandler` 接口。处理 GET/HEAD 请求，对其他方法返回 405。实现目录路径到文件系统路径的安全映射（防止路径遍历攻击）。生成 HTML 格式的目录列表。通过 `URLConnection.getFileNameMap()` 进行 MIME 类型检测。
+The server is intentionally minimal. Non-goals:
 
-4. 输出过滤器实现：创建 `sun.net.httpserver.simpleserver.OutputFilter` 类作为后处理过滤器。实现 Common Logfile Format 格式的 INFO 级别输出。实现包含请求/响应头的 VERBOSE 级别输出。
+- It is not a feature-rich or production server. No authentication, access
+  control, encryption, or HTTPS.
+- It does not aim to replace tools like Apache httpd, nginx, or production
+  Java servers.
 
-5. `Request` 接口：创建 `com.sun.net.httpserver.Request` 接口，提供 HTTP 请求状态的不可变视图。包含 `getRequestURI()`、`getRequestMethod()`、`getRequestHeaders()` 方法。提供 `with(String, List<String>)` 默认方法用于添加请求头。让 `HttpExchange` 实现此接口。
+## 2. Command-line tool
 
-6. `HttpHandlers` 工具类：创建 `com.sun.net.httpserver.HttpHandlers` 类，提供静态工厂方法：
-   - `handleOrElse(Predicate<Request>, HttpHandler, HttpHandler)` - 条件处理器组合
-   - `of(int, Headers, String)` - 创建返回固定响应的处理器
+A new command-line tool, `jwebserver`, starts a minimal HTTP file server.
 
-7. `Headers` 类增强：添加 `Headers(Map<String, List<String>>)` 构造函数支持从 Map 创建可变 Headers。添加 `Headers.of(String...)` 和 `Headers.of(Map<String, List<String>>)` 静态工厂方法创建不可变 Headers。创建 `sun.net.httpserver.UnmodifiableHeaders` 内部类实现不可变 Headers。
+Default behaviour, when invoked with no arguments:
 
-8. `Filter` 类增强：添加 `Filter.adaptRequest(String, UnaryOperator<Request>)` 静态方法，创建请求适配过滤器。创建 `sun.net.httpserver.DelegatingHttpExchange` 辅助类支持请求状态的包装和适配。
+- Binds to the loopback address.
+- Listens on port 8000.
+- Serves files from the current working directory.
+- Prints a message such as the local address it is bound to and the directory
+  being served.
 
-9. `HttpServer`/`HttpsServer` 增强：添加 `create(InetSocketAddress, int, String, HttpHandler, Filter...)` 重载方法，支持一步创建带初始上下文的服务器。
+The tool must accept the following options (long and short forms as listed in
+the JEP):
 
-10. 资源本地化：创建 `simpleserver.properties` 资源文件存储命令行帮助信息和错误消息。配置构建系统生成 ListResourceBundle 类。
+- `-h` / `--help` / `-?` — print a help message and exit.
+- `-b <addr>` / `--bind-address <addr>` — bind to the given address. To bind
+  to all interfaces, the user may pass `0.0.0.0` or `::`.
+- `-d <dir>` / `--directory <dir>` — serve the given directory. Must be an
+  existing, readable directory; otherwise the tool exits with an error.
+- `-o <level>` / `--output <level>` — output verbosity, one of `none`,
+  `info`, or `verbose`. Default `info`.
+- `-p <port>` / `--port <port>` — TCP port. Default `8000`.
+- `-version` / `--version` — print version and exit.
+- `-h` and `--help` print a usage message describing all options.
 
-11. 测试：为命令行工具编写正向和负向测试用例。为各 API 组件编写单元测试，覆盖正常流程和边界情况。
+Behaviour rules:
+
+- Only `HEAD` and `GET` requests are served. Any other method results in a
+  `405 Method Not Allowed` response.
+- The server serves files from the configured root directory. Requests that
+  resolve outside the root (for example via `..`) must be rejected with
+  `404 Not Found`.
+- A request for a directory returns a generated HTML index listing the
+  directory entries, unless the directory contains an `index.html` file, in
+  which case that file is served.
+- Symbolic links are not followed when resolving paths inside the root.
+- The MIME type of a response is derived from the requested file's
+  extension; unknown extensions fall back to `application/octet-stream`.
+- The server binds to the loopback address by default; it must be possible
+  to bind to a different address via the `-b` option.
+- On startup, the tool prints a one-line message identifying the bound
+  address, port, and served directory.
+
+## API
+
+A new public class `SimpleFileServer` is added to the `com.sun.net.httpserver`
+package. It provides static factory methods that return:
+
+1. An `HttpServer` configured to serve a directory of static files.
+2. An `HttpHandler` that serves files from a directory (so callers can mount
+   it at an arbitrary context path on an existing `HttpServer`).
+3. A `Filter` that logs requests at one of three verbosity levels.
+
+A new enum `OutputLevel` (or equivalent) with the values `NONE`, `INFO`, and
+`VERBOSE` selects how much information the logging filter writes. `INFO`
+logs one line per request in Common Log Format; `VERBOSE` adds request and
+response headers.
+
+Two new helper types extend the existing `com.sun.net.httpserver` API:
+
+- `HttpHandlers` — utilities for composing `HttpHandler` instances, including
+  `handleOrElse(predicate, handler, fallback)` for predicate-based dispatch
+  and `of(statusCode, headers, body)` for fixed responses.
+- A new `Request` view interface giving handlers and filters read-only access
+  to the request line, headers, and URI without exposing the mutable
+  `HttpExchange`.
+
+The handler returned by the factory must:
+
+- Serve `GET` and `HEAD`, and respond `405` to other methods with an
+  `Allow: GET, HEAD` header.
+- Resolve the request path relative to the configured root directory and
+  refuse to serve any path that escapes the root (returning `404`).
+- For directories, serve `index.html` if present, otherwise an autogenerated
+  listing.
+- Set `Content-Type` from the file extension and a sensible default
+  (`application/octet-stream`) when the type cannot be determined.
+- Return `404` for paths that do not exist.
+
+## CLI: `jwebserver`
+
+A new command-line launcher named `jwebserver` is added to the JDK and is
+discoverable through the `java.util.spi.ToolProvider` mechanism (so it can
+also be invoked programmatically).
+
+Synopsis (from the JEP):
+
+```
+jwebserver [-b bind-address] [-p port] [-d directory] [-o none|info|verbose]
+           [-h] [-?] [--help] [-version] [--version]
+```
+
+Defaults: bind address = loopback; port = 8000; directory = current working
+directory; output = `info`.
+
+On a successful start the tool prints, to stdout, the bind address, port,
+and served directory. On Ctrl-C / SIGINT the server shuts down cleanly.
+
+The tool must exit with a non-zero status when invoked with an invalid
+option, an unreadable directory, or when the bind address/port is already
+in use, after printing a useful diagnostic.
+
+## Out of scope (per the JEP)
+
+- Authentication, access control, encryption (HTTPS).
+- Server-side scripting / dynamic content (CGI, servlets, etc.).
+- Tuning for production traffic; the server is for prototyping, testing,
+  education, and debugging.
+
+## Acceptance
+
+- `jwebserver` can be launched from a built JDK and serves files from the
+  configured directory.
+- Programmatic use via `SimpleFileServer.createFileServer(...)` returns a
+  configured `HttpServer` whose handler matches the semantics above.
+- `SimpleFileServer.createFileHandler(...)` and
+  `SimpleFileServer.createOutputFilter(...)` (output filter factory) behave
+  as described, supporting the documented output verbosity levels.
+- The new `HttpHandlers.handleOrElse` and `HttpHandlers.of` factory methods
+  exist and behave as described in JEP 408.
+- The new `Request` view exposes the documented read-only request state to
+  filters/handlers without granting them mutation access to the underlying
+  exchange.
+
+The behaviour and method signatures must align with what JEP 408 describes;
+no new public API beyond what JEP 408 specifies should be added.

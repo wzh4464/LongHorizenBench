@@ -1,56 +1,75 @@
-# T13: Godot Engine - 动画标记系统 (Animation Markers)
+# T13: Godot Engine - Animation Loop Segments via Markers
 
-## Summary
+*Upstream reference:* Godot proposal https://github.com/godotengine/godot-proposals/issues/2159, implementation PR https://github.com/godotengine/godot/pull/60965. All relevant content is inlined below; the implementing agent must not perform network access.
 
-Godot 引擎的动画系统目前无法指定动画的部分片段进行循环播放。当动画包含启动序列和循环主体时，每次循环都会从头播放启动序列。本任务需要为 Animation 资源添加标记 (Marker) 系统，并扩展 AnimationPlayer 以支持基于标记的片段播放功能。
+## 1. Background
 
-## Motivation
+Godot's `AnimationPlayer` supports looping playback, but only for the entire animation. Many game scenes need finer control: playing a character "intro" once, then looping an idle section, then playing an outro when triggered. Today authors work around this by splitting a single motion across three animations and cross-fading in GDScript or `AnimationTree`. This is verbose and error prone, and each split loses shared curve state.
 
-在游戏开发中，很多动画需要"启动-循环"的播放模式：
+The proposal introduces **named markers** on `Animation` resources (time positions on the timeline with string names and a color) and **section playback** APIs on `AnimationPlayer` that accept marker names (or raw times). The engine plays only the selected section, optionally looping between two markers.
 
-- **角色攻击动画**：抬手准备 -> 挥砍循环
-- **跑步动画**：起步加速 -> 稳定跑步循环
-- **技能特效**：蓄力阶段 -> 持续释放循环
+## 2. Feature goals
 
-当前 Godot 的动画循环会从头开始，导致：
-- 每次循环都重复播放启动帧
-- 无法实现"播放一次启动，然后只循环主体"的效果
-- 开发者需要将动画拆分为多个资源，增加管理复杂度
+1. Add markers to `Animation`: each marker is identified by a `StringName`, has a `time` (double, seconds), and an optional `Color`.
+2. Allow the editor to add/rename/recolor/delete markers and render them on the timeline.
+3. Expose new `AnimationPlayer` methods to play only a slice of the animation, optionally with a loopable subsection.
+4. Keep backwards compatibility: `play()` without arguments must behave exactly as before.
 
-通过引入动画标记系统，开发者可以在单个动画中标记不同片段，并指定要播放/循环的区域。
+## 3. Detailed design
 
-## Proposal
+### 3.1 Markers on `Animation`
 
-为 Godot 引擎的动画系统添加标记 (Marker) 功能：
+```gdscript
+animation.add_marker("loop_start", 1.5)
+animation.add_marker("loop_end", 3.0, Color.GREEN)
+animation.get_marker_time("loop_start")    # 1.5
+animation.get_marker_names()               # ["loop_start", "loop_end"]
+animation.remove_marker("loop_start")
+```
 
-1. 在 Animation 资源中添加标记数据结构，支持命名标记和时间点关联
-2. 为 Animation 类添加标记的增删查改 API
-3. 为 AnimationPlayer 添加基于标记的片段播放方法
-4. 在动画编辑器中添加标记的可视化编辑界面
-5. 支持在 AnimationTree/AnimationNodeAnimation 中使用标记配置自定义时间线
+Markers are stored as a sorted list of `(time, name, color)`. Lookups by name are O(N) but expected usage is small counts (typically < 16).
 
-## Design Details
+### 3.2 New `AnimationPlayer` API
 
-1. **Animation 类扩展**：在 `scene/resources/animation.h/.cpp` 中为 Animation 类添加标记存储结构；实现 `add_marker(name, time)`、`remove_marker(name)`、`has_marker(name)`、`get_marker_time(name)`、`get_marker_names()` 等方法；添加 `get_marker_color(name)`、`set_marker_color(name, color)` 支持标记颜色自定义。
+```
+play_section(anim_name, start_time, end_time, custom_blend=-1, custom_speed=1, from_end=false)
+play_section_with_markers(anim_name, start_marker, end_marker, custom_blend=-1, custom_speed=1, from_end=false)
+play_with_capture(anim_name, duration, ...)         # existing helper, unchanged
+set_section(start_time, end_time)                  # adjust the playing section on the fly
+get_section_start_time() / get_section_end_time()
+```
 
-2. **标记查询方法**：实现 `get_marker_at_time(time)` 返回指定时间点的标记；实现 `get_next_marker(time)` 和 `get_prev_marker(time)` 返回相邻标记。
+While a section is active, the animation loops between `start_time` and `end_time` irrespective of the animation's own loop mode.
 
-3. **AnimationPlayer 片段播放**：在 `scene/animation/animation_player.h/.cpp` 中添加 `play_section(name, start_time, end_time, ...)` 方法；添加 `play_section_with_markers(name, start_marker, end_marker, ...)` 基于标记名播放；实现 `play_section_backwards` 和 `play_section_with_markers_backwards` 反向播放版本。
+### 3.3 AnimationMixer integration
 
-4. **片段状态管理**：添加 `has_section()`、`get_section_start_time()`、`get_section_end_time()` 查询当前片段状态；添加 `reset_section()` 清除片段设置恢复全动画播放。
+`AnimationMixer` (the successor of `AnimationTree`) adds a `PlaybackInfo.section_start/section_end` pair on the advance path; when both are non-zero they clamp the effective playback window and wrap the playback position when it exceeds the end.
 
-5. **AnimationMixer 集成**：在 `scene/animation/animation_mixer.h/.cpp` 中处理片段边界逻辑；确保片段结束时间不超过动画长度；正确处理循环模式下的片段边界。
+### 3.4 Editor integration
 
-6. **编辑器 UI - 标记添加**：在 `editor/animation_track_editor.cpp/.h` 中添加右键菜单选项"Add Marker"；实现标记名称输入对话框，验证名称唯一性。
+The animation editor gains a new track-header affordance: right-clicking on the timeline inserts a marker. Markers show as flags above the timeline, can be renamed/recoloured, and are draggable with the mouse.
 
-7. **编辑器 UI - 标记显示**：添加标记图标资源 (`editor/icons/Marker.svg`, `MarkerSelected.svg`)；在时间轴上渲染标记，支持选中、拖动调整时间。
+### 3.5 Save format
 
-8. **编辑器 UI - 片段选择**：实现双击两个标记选中它们之间的片段；高亮显示选中的片段区域；播放按钮在有片段选中时播放片段而非全动画。
+Markers are persisted on `Animation` as:
 
-9. **AnimationTree 支持**：在 `editor/plugins/animation_blend_tree_editor_plugin.cpp/.h` 中添加"Set Custom Timeline from Marker"按钮；实现标记选择对话框，自动填充时间偏移和长度。
+```gdscript
+animation.add_marker("loop_start", 1.5)
+animation.add_marker("loop_end", 3.0)
+```
 
-10. **文档更新**：更新 `doc/classes/Animation.xml` 添加新方法文档；更新 `doc/classes/AnimationPlayer.xml` 添加片段播放方法文档。
+## 4. Implementation Task
 
-## Requirement
+1. The `Animation` resource — marker storage, helpers `Animation.add_marker()`, `Animation.remove_marker()`, `Animation.get_marker_names()`, and the corresponding serialization.
+2. `AnimationPlayer` exposes `play_section(start_time, end_time, ...)` and `play_section_with_markers(start_name, end_name, ...)`.
+3. The `AnimationMixer` advance/blend code: add `PlaybackInfo.section_start/section_end`; clamp the blend processing to the active section.
+4. Editor support: extend the animation-player editor plugin and the animation-track editor with the marker UX.
+5. Documentation updates for `Animation`, `AnimationPlayer`, `AnimationMixer`, `AnimationTree`.
+6. Add tests covering marker upsert, section playback semantics, and serialization round-trip.
 
-https://github.com/godotengine/godot-proposals/issues/2159
+## 5. Acceptance Criteria
+
+- Adding a marker at time `t` with `add_marker(name, t)` and reading it back via `get_marker_time(name)` returns `t`.
+- `AnimationPlayer.play_section_with_markers("anim", "s", "e")` plays only between the two markers and loops within that range while the section is active.
+- Deleting the `AnimationPlayer` mid-playback does not leak timers.
+- All existing tests for `AnimationPlayer`/`AnimationTree` continue to pass.

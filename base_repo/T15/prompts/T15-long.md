@@ -1,54 +1,58 @@
-# T15: OpenJDK - macOS/AArch64 移植 (JEP 391)
+# T15 - OpenJDK: macOS/AArch64 Port (JEP 391)
 
-## Summary
+*Upstream source:* https://openjdk.org/jeps/391 plus implementation PR https://github.com/openjdk/jdk/pull/5027. Full specification is inlined below so the implementing agent does not need internet access.
 
-Apple 宣布将 Mac 产品线从 x64 迁移到基于 ARM 的 Apple Silicon (AArch64)。本任务需要将 OpenJDK 移植到 macOS/AArch64 平台，使 Java 应用能够在 Apple Silicon Mac 上原生运行，而无需通过 Rosetta 2 模拟 x64 代码。
+## 1. Motivation
 
-## Motivation
+Apple is transitioning its Mac hardware lineup from Intel x86_64 to the ARM-based Apple Silicon (AArch64). JEP 391 adds OpenJDK (HotSpot, class libraries, JDK tools, tests) support for the new `macosx-aarch64` platform so that:
 
-Apple 于 2020 年开始在 Mac 上使用自研的 Apple Silicon (M1) 芯片，该芯片基于 AArch64 架构。虽然 Rosetta 2 可以模拟运行 x64 版本的 JDK，但存在以下问题：
+- Java developers can build and run applications on Apple Silicon Macs natively without going through Rosetta 2.
+- Benchmarks show AArch64 native builds are substantially faster (both CPU and I/O) than emulated x86_64 builds.
+- The JDK remains a first-class citizen on Apple's platform.
 
-- **性能损失**：模拟运行比原生运行有显著性能开销
-- **兼容性风险**：某些 JVM 特性可能在模拟环境下工作异常
-- **未来不确定性**：Apple 可能在未来版本中降低或移除 Rosetta 2 支持
+Prior JEPs (237 "Linux/AArch64 Port", 388 "Windows/AArch64 Port") already introduced AArch64 code-generation and most of the VM internals. JEP 391 is about the *platform integration* of the existing AArch64 HotSpot on the Darwin/BSD OS family: signal handling, code signing, write-protected JIT pages (W^X), and Mach-O binary format.
 
-macOS/AArch64 原生移植可以：
-- 发挥 Apple Silicon 的全部性能潜力
-- 确保完整的 JDK 功能支持
-- 为长期在 Apple 平台上运行 Java 提供保障
+## 2. Detailed Specification
 
-## Proposal
+### 2.1 Build / platform identifier
 
-基于现有的 linux/aarch64、macos/x86_64 和 windows/aarch64 移植代码，实现 macOS/AArch64 平台支持：
+- `configure --with-native-platform=macosx-aarch64` must be supported end-to-end.
+- The platform ID `os=darwin arch=aarch64` is exposed to build logic, tests and runtime.
 
-1. 添加 bsd_aarch64 平台的 os_cpu 层实现
-2. 支持 macOS AArch64 特有的 ABI 调用约定
-3. 实现 W^X (Write XOR Execute) 内存保护机制
-4. 移植 Serviceability Agent 到 macOS/AArch64
-5. 更新构建系统以支持新平台
+### 2.2 Operating-system interface
 
-## Design Details
+Darwin imposes several distinctive requirements that the Linux/AArch64 port does not:
 
-1. **构建系统适配**：更新 `make/autoconf/build-aux/config.guess` 正确识别 arm64 架构；修改 `make/autoconf/flags.m4` 为 AArch64 设置正确的 `MACOSX_VERSION_MIN` (11.00.00)；更新 `make/autoconf/jvm-features.m4` 禁用不支持的特性（AOT、CDS）。
+1. **W^X enforcement** — Apple Silicon requires a memory region to be writable *xor* executable at any given time. HotSpot must call `pthread_jit_write_protect_np()` before writing JIT output and switch the page to executable before running. All codegen paths (template interpreter, C1, C2, stubs, nmethod patching) must be audited to obey this invariant.
+2. **`MAP_JIT` flag** — `mmap()` for JIT pages must include `MAP_JIT` so the kernel permits the RW<->RX toggles.
+3. **Hardened runtime entitlements** — compiled binaries must ship with `com.apple.security.cs.allow-jit` and `com.apple.security.cs.allow-unsigned-executable-memory` entitlements and must be code-signed.
+4. **Mach exceptions** — Darwin delivers native signals via the Mach exception mechanism before falling back to POSIX signals. The signal handler must co-operate with other debugger tools.
+5. **Page sizes** — Apple Silicon Macs use 16 kB pages; the VM's page-aligned assumptions must be re-audited.
 
-2. **os_cpu 层实现**：创建 `src/hotspot/os_cpu/bsd_aarch64/` 目录；基于 linux_aarch64 实现，适配 BSD/macOS 特定 API；实现 `os_bsd_aarch64.cpp` 处理信号、线程栈、上下文获取等。
+## 3. Assembler / interpreter
 
-3. **ABI 调用约定**：在 `interpreterRT_aarch64.cpp` 中处理 macOS 特有的参数传递方式；更新 `sharedRuntime_aarch64.cpp` 实现正确的调用包装器；适配 macOS 的浮点参数传递和返回值处理。
+The `aarch64` HotSpot back-end (introduced for Linux/AArch64 in JDK 16) already covers most CPU codegen. JEP 391 reuses it but must fix three divergences:
 
-4. **寄存器约定**：在 `globalDefinitions_aarch64.hpp` 中定义 `R18_RESERVED`，因为 macOS 保留 x18 寄存器供平台使用；更新所有 AArch64 代码路径避免使用 x18 寄存器。
+1. **ABI** — Darwin AArch64 passes the first eight integer and floating-point arguments in registers like LP64 ELF, but passes variadic arguments on the stack (ELF keeps them in registers). JNI stubs must be adjusted.
+2. **Stack guards and red zones** — Darwin reserves the top of the page for thread exceptions; the VM must enlarge its guard pages accordingly.
+3. **Unwinder** — use `libunwind` keyed off the `__eh_frame` sections, not the Linux `.debug_frame` tables.
 
-5. **W^X 实现**：实现基于 `pthread_jit_write_protect_np` 的 W^X 模式切换；在 `thread.hpp/.cpp` 中添加线程本地的 W^X 状态管理；Java 线程执行 Java 或 native 代码时使用 execute-only 模式，执行 VM 代码时使用 write-only 模式。
+## 4. Build
 
-6. **SafeFetch 处理**：在 `safefetch.inline.hpp` 中处理需要临时切换到 execute 模式的情况；更新 stub 生成器支持 W^X 模式切换。
+`make configure --openjdk-target=aarch64-apple-darwin` must succeed. The build must produce a universal macOS DMG by combining the x86_64 and aarch64 outputs.
 
-7. **Serviceability Agent**：创建 `BsdAARCH64ThreadContext.java` 和 `BsdAARCH64CFrame.java`；更新 `BsdCDebugger.java` 和 `BsdThreadContextFactory.java` 支持 AArch64；修改 `libsaproc` 的 native 代码支持 AArch64 寄存器和调试。
+## 5. Implementation Items
 
-8. **代码签名**：更新 `NativeCompilation.gmk` 使用 `-f` 标志强制重新签名；macOS AArch64 要求所有代码必须签名才能执行。
+1. Add the macOS/AArch64 HotSpot OS-CPU layer implementing thread context, signal handling, stack guards, page size queries, W^X memory protection toggles (`pthread_jit_write_protect_np`), and SP/FP register accessors.
+2. Hook into HotSpot's build to recognise Apple Silicon and honour W^X during code generation.
+3. Adjust code-patch routines to temporarily toggle write access via `pthread_jit_write_protect_np`.
+4. Add universal binary support so the JDK can be code signed and notarised via Apple tooling.
+5. Integrate with system JNI library search paths and the hardened runtime.
 
-9. **编译器警告处理**：在 `Awt2dLibraries.gmk` 中添加针对 AArch64 clang 的警告抑制；处理 HarfBuzz 等第三方库在 AArch64 上的编译警告。
+## 6. Acceptance Criteria
 
-10. **测试适配**：更新 `CompressedClassPointers.java` 等测试适配新平台；确保 GTest 和 JTreg 测试在 macOS/AArch64 上正常运行；更新 SA 相关测试支持新平台的调试格式。
-
-## Requirement
-
-https://openjdk.org/jeps/391
+- The JDK compiles on an Apple Silicon Mac and produces a self-consistent image.
+- `java -version` reports `aarch64` and runs on macOS 11+ natively.
+- `jtreg tier1` and `tier2` HotSpot suites pass on macOS/aarch64.
+- JIT compilation toggles write protection via the JIT write-protect APIs without causing segfaults under code patching.
+- Existing macOS/x86_64 builds continue to pass their test suites (no regression).

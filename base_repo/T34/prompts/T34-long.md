@@ -1,55 +1,89 @@
-# T34: Kubernetes
+# T34: Kubernetes — KEP-5598 Opportunistic Batching for the Scheduler
 
-**Summary**: Kubernetes 调度器当前的调度算法时间复杂度为 O(Pod 数量 x 节点数量)，在大规模集群和批量调度场景下性能成为瓶颈。KEP-5598 提出实现机会主义批处理（Opportunistic Batching）机制，通过 Pod 调度签名和结果缓存，让具有相同调度特征的 Pod 可以复用前一个 Pod 的调度结果，显著提升批量调度性能。
+## Requirement (inlined from KEP-5598)
 
-**Motivation**: 在 ML 训练、批处理任务等场景中，常常需要调度大量相似的 Pod（相同的资源请求、节点亲和性等）。当前调度器为每个 Pod 独立执行完整的过滤和评分流程，即使这些 Pod 会得到相同的调度结果。这在"单 Pod 单节点"的批量环境中尤为低效。通过识别调度等价的 Pod 并复用调度结果，可以大幅减少重复计算，提升调度吞吐量。
+*Upstream source (do not fetch):* `https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/5598-opportunistic-batching/README.md`. The relevant content is reproduced below; no external access is needed.
 
-**Proposal**: 引入三个核心组件：(1) Pod 调度签名机制，捕捉影响调度决策的 Pod 属性；(2) 批处理结果缓存，存储上一次调度的可行节点列表；(3) 节点提示机制，让后续相同签名的 Pod 直接尝试缓存的最优节点。通过 `OpportunisticBatching` feature gate 控制，Beta 阶段默认启用。
+### Summary
 
-**Design Details**:
+Today the kube-scheduler processes pods one at a time. For each pod it executes the full PreFilter / Filter / PostFilter / PreScore / Score pipeline, and then commits the binding. When a controller (Deployment, StatefulSet, Job, …) emits many similar pods at once, almost all of that work is duplicated. KEP-5598 adds an *opportunistic batching* mechanism: pods whose scheduling-relevant attributes are identical produce the same **pod signature**, and the scheduler can reuse the result of one full pipeline evaluation for every subsequent pod that shares the signature, falling back to a fresh evaluation only when something invalidates the prior result.
 
-1. Feature Gate 注册：在 `pkg/features/kube_features.go` 中注册 `OpportunisticBatching` feature gate，设置版本和默认状态。
+The KEP is intentionally limited to the simple "1-pod-per-node" workloads that appear most often in batch and inference workloads. It does not introduce true gang scheduling, but it lays the groundwork (signatures, validation, fast path) for future gang-scheduling work.
 
-2. Framework 接口扩展：在 `pkg/scheduler/framework/interface.go` 中添加新接口：
-   - `SignPod(ctx, pod, recordStats) PodSignature`：为 Pod 生成调度签名
-   - `GetNodeHint(ctx, pod, state, cycleCount) (hint, signature)`：获取节点提示
-   - `StoreScheduleResults(ctx, signature, hintedNode, chosenNode, otherNodes, cycleCount)`：存储调度结果
-   - `SortedScoredNodes` 接口：返回排序后的节点列表
+### Motivation
 
-3. SignPlugin 接口：定义插件签名接口，让各调度插件贡献签名片段：
-   - 在 `staging/src/k8s.io/kube-scheduler/framework/` 下定义 `SignPlugin` 接口和 `SignFragment` 类型
-   - `signers.go`：实现签名合并和管理逻辑
+* For Jobs that schedule thousands of identical pods, the filtering and scoring phases dominate scheduler latency. Reusing the per-cycle work would amortise that cost across the entire batch.
+* The 1-pod-per-node pattern is increasingly common (training jobs, inference serving, stateful operators) and is naturally amenable to a shared scheduling result.
+* Existing scheduler optimisations (Equivalence cache, Equivalence Class, etc.) were considered too narrow or too tightly coupled to the legacy scheduler architecture.
 
-4. 插件签名实现：为各调度插件实现 `SignPod` 方法：
-   - `imagelocality`：基于容器镜像名称生成签名
-   - `nodeaffinity`：基于节点亲和性规则生成签名
-   - `nodeports`：基于端口需求生成签名
-   - `noderesources/fit.go` 和 `balanced_allocation.go`：基于资源请求生成签名
-   - `nodename`, `nodeunschedulable`, `nodevolumelimits`, `tainttoleration`：各自的签名逻辑
-   - `volumebinding`, `volumezone`, `volumerestrictions`：存储相关签名
+### Design
 
-5. 不可签名场景处理：某些复杂场景标记 Pod 为不可签名：
-   - `interpodaffinity`：Pod 间亲和/反亲和
-   - `podtopologyspread`：拓扑分布约束
-   - `dynamicresources`：DRA 资源声明（返回 Unschedulable 状态）
+#### Pod signature
+Each plugin that participates in scheduling decisions optionally exposes a new method `SignPod(pod *v1.Pod) (SignatureFragment, error)`. The framework concatenates the returned fragments to compute the pod's `Signature` (a `[]byte`). Pods whose signature returns an error or `nil` from any contributing plugin are treated as "non-batchable" and follow the regular path.
 
-6. 批处理运行时实现：在 `pkg/scheduler/framework/runtime/` 下：
-   - `batch.go`：实现批处理核心逻辑，包括签名缓存、节点提示验证、结果存储
-   - `framework.go`：集成批处理逻辑到调度框架
+The plugins that are expected to contribute fragments are listed in the KEP (see `Plugin Sign Behaviour` table). They include `NodeAffinity`, `NodeResources`, `NodeName`, `TaintToleration`, `PodTopologySpread`, `PodAffinity`, `VolumeBinding`, etc. Each plugin's fragment is a hash over the parts of the pod spec it consults; e.g. `NodeAffinity` hashes only `pod.spec.nodeAffinity`, `NodeResources` hashes only `pod.spec.containers[*].resources`. Plugins that depend on cluster state (e.g. `InterPodAffinity`) opt out and force the pod into the slow path.
 
-7. 调度主循环集成：在 `pkg/scheduler/schedule_one.go` 中：
-   - 调度开始时调用 `GetNodeHint` 获取节点提示
-   - 如果有有效提示，优先评估该节点，通过则直接返回
-   - 提示失败则降级到正常调度流程
-   - 调度完成后调用 `StoreScheduleResults` 缓存结果
+#### `BatchEntry` cache
 
-8. 指标和监控：在 `pkg/scheduler/metrics/metrics.go` 中添加批处理相关指标，追踪命中率、跳过的节点数等。
+The scheduler maintains an in-memory map `signature -> BatchEntry` where:
 
-9. 测试：
-   - `pkg/scheduler/framework/runtime/batch_test.go`：单元测试
-   - `pkg/scheduler/schedule_one_test.go`：调度流程测试
-   - `test/integration/scheduler/batch/`：集成测试
-   - 各插件目录下的签名测试
+```go
+type BatchEntry struct {
+    Node string                  // node selected by the previous identical pod
+    SnapshotVersion uint64       // version of the cluster snapshot when this entry was created
+    NodeInfo *framework.NodeInfo // pointer to the node that won
+    Score    int64               // accumulated score from the previous schedule cycle
+}
+```
 
-## Requirement
-https://github.com/kubernetes/enhancements/blob/master/keps/sig-scheduling/5598-opportunistic-batching/README.md
+Entries are evicted when:
+1. The cluster snapshot version advances (capacity changes, taints, allocatable, etc.) and a `Refresh()` call invalidates them.
+2. The TTL passes (default 5 seconds).
+3. Memory pressure: the cache is bounded.
+
+#### `GetNodeHint` flow
+
+```
+fast := scheduler.fastPath(pod)
+if fast != nil && fast.SnapshotVersion == cur && fast.Node still admits pod {
+   bind(pod, fast.Node)
+} else {
+   normal scheduling; if signature exists, store result
+}
+```
+
+### Plugin signing concepts
+
+Each plugin implements:
+
+```go
+type Signer interface {
+    SignPod(p *v1.Pod) ([]byte, error)
+}
+```
+
+returning a deterministic, plugin-local hash of the relevant pod fields. The framework concatenates the byte slices in a fixed plugin order and feeds them to FNV-1a (the spec only requires a stable hash). Plugins that cannot produce a hash (e.g. they depend on dynamic cluster state) return an error, which makes the pod ineligible for batching.
+
+### Cache correctness rules
+
+1. The cache is invalidated when the snapshot version advances.
+2. Plugins that advertise themselves as snapshot-sensitive can ask for cache invalidation when their internal data changes.
+3. After a successful bind, the cache stores `(signature → node, snapshotVersion)`.
+4. Before reusing a cached node, the scheduler re-runs the binding-permit hooks (DRA reservation, reservation arbiter, etc.); only the filter/score work is skipped.
+
+### Feature gate
+
+The KEP proposes one feature gate:
+
+```
+SchedulerOpportunisticBatching   alpha (default false)
+```
+
+The gate covers all behavioural changes; when `false` the scheduler is byte-for-byte identical to the unmodified version.
+
+### Acceptance criteria (per the KEP)
+
+* When the cache is warm, p99 scheduling latency for a homogeneous batch of pods drops by at least 50%.
+* No identical pod sees a different scheduling decision under cache hit vs. cache miss.
+* Existing single-pod scheduling APIs and external behaviour are unchanged.
+* Feature gate disabled = no behaviour change vs. upstream main.

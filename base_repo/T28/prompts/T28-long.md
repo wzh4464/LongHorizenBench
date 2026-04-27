@@ -1,32 +1,144 @@
-# T28: CPython
+# T28: CPython — PEP 768: Safe External Debugger Interface for Running Python Processes
 
-**Summary**: PEP 768 引入安全的外部调试器接口，允许调试器和性能分析器在不注入任意代码的情况下安全地附加到运行中的 Python 进程。该功能通过在 CPython 的求值循环中引入零开销的检查点机制，让外部工具能够请求在下一个安全执行点执行指定的 Python 脚本，从而为生产环境和高可用系统提供可靠的调试能力。
+## Summary
 
-**Motivation**: 当前调试工具（如 DebugPy、Memray）尝试附加到运行中的 Python 进程时面临严峻挑战。现有方法通过 GDB/LLDB 进行不安全的代码注入，可能在内存分配或垃圾回收等关键操作期间执行，导致崩溃和解释器损坏。PEP 768 通过利用 CPython 现有的 `eval_breaker` 机制，提供一种安全的方式让外部进程在明确定义的安全点执行调试代码，且在正常执行期间零开销。
+PEP 768 adds a first-class, low-overhead debugger attach interface to CPython.
+Target version: 3.14. Upstream references: `https://peps.python.org/pep-0768/`
+and PR `python/cpython#131937`. The feature allows an external process to
+cause an already-running Python interpreter to execute a specified Python
+script at the next safe point, without patching memory, using ptrace/LD_PRELOAD
+tricks, or injecting code at random.
 
-**Proposal**: 在 CPython 中实现安全的远程调试接口，包括：扩展 `PyThreadState` 结构以支持远程调试器状态；在求值循环中添加对 pending debugger call 的检查；实现 `sys.remote_exec(pid, script)` 函数用于向远程进程发送执行请求；添加环境变量和命令行选项以禁用该功能；扩展 configure 脚本以支持编译时禁用；以及相应的测试和文档。
+Tools like profilers, debuggers, and live-ops scripts previously attached by
+modifying `.text` pages or hijacking threads; this was unsafe (race with GC,
+SIGSEGV if the interpreter moved), platform-fragile, and required elevated
+privileges. PEP 768 exposes a cooperative channel built into the runtime.
 
-**Design Details**:
+## 2. Why
 
-1. PyThreadState 扩展：在 `Include/cpython/pystate.h` 中定义 `_PyRemoteDebuggerSupport` 结构体，包含 `debugger_pending_call` 标志（int32_t）和 `debugger_script_path` 缓冲区（512 字节）。将此结构体添加为 `PyThreadState` 的成员 `remote_debugger_support`。
+- Attach a debugger (e.g. pdb, debugpy, py-spy) to a production process
+  without needing a signal handler or a custom extension.
+- Let tools execute `sys.remote_exec(pid, "/tmp/some_script.py")` and have
+  the target interpreter run the script at a safe point.
+- Keep the steady-state cost near zero — no new per-opcode check when the
+  feature is idle.
 
-2. PyConfig 扩展：在 `Include/cpython/initconfig.h` 的 `PyConfig` 结构体中添加 `remote_debug` 配置项（int 类型），用于控制远程调试功能的启用状态。
+## 2. Design overview
 
-3. 调试偏移量表扩展：在 `Include/internal/pycore_debug_offsets.h` 中扩展 `_Py_DebugOffsets` 结构体，添加调试器相关字段的偏移量信息，使外部工具能够定位关键结构（无论 ASLR 或编译配置如何）。
+Per-interpreter state gains a small cooperative handshake:
 
-4. 求值循环集成：修改 `Python/ceval_gil.c`，在 GIL 获取后检查 `debugger_pending_call` 标志。如果设置，则读取 `debugger_script_path` 并执行指定的 Python 脚本。利用现有的 `eval_breaker` 机制确保零开销——只有在 `eval_breaker` 已被设置时才会检查调试器标志。
+- `PyInterpreterState` has a new `_PyRemoteDebuggerSupport` struct that
+  sits at a well-known offset (so tools can find it via
+  `_Py_DebugOffsets`). The struct exposes:
+  - `debugger_script_path[MAX_PATH]`: a buffer the attacher fills with the
+    filesystem path of a Python source file to execute.
+  - `pending_call_request`: a byte the attacher sets after writing the path.
+  - `eval_breaker` bit: toggles `eval_breaker` in the target thread so the
+    interpreter checks for work at the next eval breaker.
+- The interpreter checks `pending_call_request` at eval breakers. If set, it
+  loads `debugger_script_path`, resets the flag, and (via
+  `_PyEval_RunDebuggerScript`) executes the file inside the current thread
+  (in `PyRun_AnyFileEx` with globals/locals from the running frame).
+- Attach flow from the foreign process:
+  1. Locate the target interpreter's `_Py_DebugOffsets` via
+     `process_vm_readv` / `ReadProcessMemory`.
+  2. Walk `_PyRuntimeState` → `interpreters` → `_PyRemoteDebuggerSupport`.
+  3. Write the script path into a control structure and set the pending bit.
+  4. Send a signal or write to the eval breaker so the target wakes up.
 
-5. sys.remote_exec 实现：在 `Python/sysmodule.c` 中实现 `sys.remote_exec(pid, script)` 函数。该函数将脚本路径写入目标进程的线程状态内存，设置 pending call 标志和 eval_breaker 位。生成对应的 clinic 文件 `Python/clinic/sysmodule.c.h`。
+## 3. Public API
 
-6. 远程调试模块：创建 `Python/remote_debugging.c`，实现跨平台的远程进程内存读写功能。在 Linux 上使用 `process_vm_writev`，在 macOS 上使用 Mach task 系统，在 Windows 上使用 `WriteProcessMemory`。
+New Python-level APIs:
 
-7. 配置和初始化：修改 `Python/initconfig.c`，处理 `remote_debug` 配置项的初始化和解析。实现对 `-X disable_remote_debug` 选项和 `PYTHON_DISABLE_REMOTE_DEBUG` 环境变量的支持。
+```
+sys.remote_exec(pid: int, script: str | bytes | os.PathLike) -> None
+```
 
-8. 构建系统扩展：修改 `configure.ac`，添加 `--without-remote-debug` 选项以在编译时完全禁用该功能。更新 `pyconfig.h.in` 添加相应的宏定义。修改 `Makefile.pre.in` 和 `PCbuild/pythoncore.vcxproj` 以包含新的源文件。
+A new module `_remote_debugging` provides richer access but is considered
+internal.
 
-9. 文档更新：在 `Doc/library/sys.rst` 中添加 `sys.remote_exec` 函数的文档。在 `Doc/using/cmdline.rst` 中记录 `-X disable_remote_debug` 选项。在 `Doc/using/configure.rst` 中记录 `--without-remote-debug` 选项。更新 `Doc/whatsnew/3.14.rst` 添加 PEP 768 的 What's New 条目。
+Environment variable `PYTHON_DISABLE_REMOTE_DEBUG` (and `-X remote_debug=off`)
+disables the feature. Configure-time flags `--disable-remote-debug` (or
+`--without-remote-debug`) drop compilation entirely.
 
-10. 测试：在 `Lib/test/test_sys.py` 中添加 `sys.remote_exec` 的测试用例。在 `Lib/test/test_embed.py` 中测试嵌入式场景下的行为。创建跨进程调试的集成测试，验证脚本能够在目标进程中正确执行。
+## 4. Core data structures
 
-## Requirement
-https://peps.python.org/pep-0768/
+```c
+// PyThreadState additions
+typedef struct _pycfg_remote_debugger_support {
+    Py_ssize_t max_path_length;
+    int debugger_pending_call;  // 0/1, set by external attacher
+    char debugger_script_path[PYTHON_REMOTE_DEBUG_SCRIPT_PATH_LEN];
+} _PyRemoteDebuggerSupport;
+```
+
+Inside `PyThreadState` add `_PyRemoteDebuggerSupport remote_debugger_support`.
+
+Also add a symbol `_Py_DebugOffsets` that encodes the offsets an external
+attacher needs: offsets into `PyRuntime` → `PyThreadState` fields → the new
+debug-support struct. This makes the attach code resilient to interpreter
+layout changes.
+
+## 5. Evaluation breaker integration
+
+the bytecode interpreter / the GIL implementation add a bit to the eval breaker,
+`_PY_REMOTE_DEBUG_PENDING_BIT`. When the bit is set, the interpreter handles
+it in `handle_eval_breaker`: read the path to the script from
+`_PyRemoteDebuggerSupport`, call `PyRun_AnyFile` or `Py_CompileStringExFlags`
+to compile and execute the script inside the current frame's globals/locals.
+Errors during execution are stored on a dedicated queue (so other work
+doesn't stop) and surfaced via a new audit event `sys.remote_exec`.
+
+## 6. Command-line / config interface
+
+* `sys.remote_exec(pid, script_path)` — public entry point.
+* `PYTHONREMOTEDEBUG` env variable and `-X remote_debug=on|off` flag.
+* `--with-remote-debug` / `--without-remote-debug` at configure time.
+* `sys.flags.remote_debug` reports the effective state.
+* When disabled, `sys.remote_exec` raises `RuntimeError`.
+* The target process never acts on commands from a remote process unless
+  the attachment API has been invoked explicitly (cooperative model), except
+  for the `SIGUSR2` handler that the `sys` module installs optionally.
+
+## 2. Public API
+
+- New function `sys.remote_exec(pid: int, script_path: str) -> None`
+  (Python level). It writes a single absolute path to the target's
+  `_PyRemoteDebuggerSupport` struct, sets the pending flag, and nudges
+  the target using a platform-specific mechanism (Linux: `process_vm_writev`
+  + `pidfd_send_signal`; macOS: `mach_vm_write` + Mach port; Windows:
+  `WriteProcessMemory` + `QueueUserAPC`).
+- Audit event `sys.remote_exec` is raised on both the caller and the
+  callee.
+- A new `-X disable-remote-debug` flag and matching env var
+  `PYTHONDISABLEREMOTEDEBUG` turn off the handshake at interpreter start.
+
+## 3. Interpreter changes
+
+- Extend `PyThreadState` with `_PyRemoteDebuggerSupport remote_debugger_support`.
+- Add the remote-debug helper module hosting the protocol: the worker installs a
+  pending callback through `_PyEval_AddPendingCall` when the flag flips.
+- Expose the relevant struct offsets via `_Py_get_remote_debug_offsets()` so
+  external tools can discover them with a single symbol lookup.
+- Ensure the flag is checked at every `CHECK_EVAL_BREAKER` so pending
+  requests run at a safe point, never while holding internal locks.
+
+## 5. Build flags and runtime defaults
+
+* Default: enabled on POSIX and Windows, disabled on WASI/Emscripten.
+* `./configure --disable-remote-debug` omits the feature entirely.
+* `sys.flags.remote_debug` reflects the runtime setting.
+* A security-sensitive audit event `sys.remote_exec` is fired each time a
+  script is loaded, with the pid and the path.
+
+## 6. Acceptance criteria
+
+* `sys.remote_exec(pid, path)` loads and executes the script inside the
+  target process at the next eval-breaker safe point.
+* `make test TEST=test_remote_debugging` passes, including the
+  `_testinternalcapi` tests that exercise the handshake.
+* Building with `--disable-remote-debug` produces an interpreter where
+  `sys.remote_exec` raises `NotImplementedError` and the ThreadState layout
+  no longer contains the support struct.
+* The feature introduces no measurable overhead in the default hot path; the
+  CHECK_EVAL_BREAKER microbench stays within 1% of baseline.

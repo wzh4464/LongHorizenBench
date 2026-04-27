@@ -1,32 +1,117 @@
-# T24: CPython
+# T24: CPython — PEP 669 `sys.monitoring`
 
-**Summary**: CPython 当前的 `sys.settrace()` 和 `sys.setprofile()` 机制在启用调试或性能分析时会导致显著的性能下降（通常是数量级的）。PEP 669 提出引入 `sys.monitoring` 命名空间，提供一个低开销的程序监控 API。通过利用 PEP 659 的自适应解释器机制，新 API 能够使调试下的代码性能接近甚至超过未调试的 Python 3.11 版本。
+## Requirement (PEP 669)
 
-**Motivation**: 开发者不应该为使用调试器和性能分析器付出过高的性能代价。现有的 `sys.settrace()` 机制会在每条 Python 指令执行时调用 trace 函数，即使用户只关心少数特定事件（如函数调用或异常），这种"全量"监控导致严重的性能损耗。Python 开发者应该能够像 C++ 和 Java 开发者一样，在调试器下以接近全速运行程序。
+*Source of truth: PEP 669. Do not access the network; the description below
+is sufficient to implement the feature.*
 
-**Proposal**: 引入 `sys.monitoring` 模块，定义多种监控事件（如 `PY_START`、`PY_RETURN`、`LINE`、`RAISE` 等），允许工具注册回调函数来监听特定事件。通过字节码插桩（instrumentation）机制，仅在需要监控的代码位置插入检测点，未被监控的代码完全不受影响。支持最多 6 个工具并行运行，每个工具可独立启用/禁用事件。
+PEP 669 adds a new monitoring API exposed as the `sys.monitoring` namespace.
+It provides tool authors (debuggers, profilers, coverage tools) with a way
+to subscribe to a fixed set of interpreter-level events without paying the
+overhead that `sys.settrace`/`sys.setprofile` impose on every frame.
 
-**Design Details**:
+## 1. Motivation
 
-1. 定义监控事件类型：在 `Include/cpython/code.h` 中定义 `PY_MONITORING_EVENTS`（16 种事件）和 `PY_MONITORING_UNGROUPED_EVENTS`（14 种基本事件）。事件包括：PY_START、PY_RESUME、PY_RETURN、PY_YIELD、CALL、LINE、INSTRUCTION、JUMP、BRANCH、STOP_ITERATION、RAISE、EXCEPTION_HANDLED 等。
+`sys.settrace()` and `sys.setprofile()` impose a constant per-frame
+overhead even when nothing interesting is being traced. Existing tooling
+also competes for the single trace slot, making it impossible to run two
+tools concurrently. PEP 669 introduces a pull-style monitoring API where
+each tool registers callbacks for the events it cares about and the
+interpreter only triggers them when those events occur. Tools coexist via
+distinct tool IDs, and the interpreter is allowed to specialise / disable
+event delivery for code objects that no tool is interested in.
 
-2. 扩展代码对象结构：在 `PyCodeObject` 中添加 `_co_monitoring` 字段（指向 `_PyCoMonitoringData` 结构）和 `_co_instrumentation_version` 字段。`_PyCoMonitoringData` 包含本地监控设置、活跃监控设置、以及每指令的工具位图和原始 opcode 存储。
+## 2. Public API (`sys.monitoring`)
 
-3. 实现插桩机制：创建 `Python/instrumentation.c`，实现字节码插桩的核心逻辑。当监控被激活时，将目标指令替换为 `INSTRUMENTED_*` 版本；当监控被禁用时，恢复原始指令。使用版本号确保代码对象的插桩状态与全局监控设置同步。
+```
+use_tool_id(tool_id, name)
+free_tool_id(tool_id)
+get_tool(tool_id)
+set_events(tool_id, event_set)
+get_events(tool_id) -> int
+set_local_events(tool_id, code, event_set)
+get_local_events(tool_id, code) -> int
+register_callback(tool_id, event, func) -> previous_callback_or_None
+restart_events()
+DISABLE        # sentinel callback return value
+MISSING        # sentinel "no argument" value
+```
 
-4. 添加插桩字节码：在 `Python/bytecodes.c` 中为需要监控的 opcode 添加 `INSTRUMENTED_` 前缀版本，这些版本在执行时会检查并触发相应的监控回调。更新 `Lib/opcode.py` 和 `Python/opcode_targets.h`。
+Constants on `sys.monitoring.events` (integer bitmasks):
 
-5. 修改求值循环：更新 `Python/ceval.c` 和 `Python/ceval_macros.h`，移除旧的 `use_tracing` 字段检查，改为基于插桩字节码的事件触发机制。优化热路径，确保未被监控的代码不产生额外开销。
+```
+PY_START   PY_RESUME    PY_RETURN   PY_YIELD   PY_THROW   PY_UNWIND
+CALL       C_CALL       C_RETURN    C_RAISE
+LINE       INSTRUCTION  JUMP        BRANCH
+RAISE      RERAISE      EXCEPTION_HANDLED  STOP_ITERATION
+NO_EVENTS
+```
 
-6. 实现 sys.monitoring 模块：在 `Python/instrumentation.c` 中导出 Python API，包括 `register_callback()`、`set_events()`、`get_events()`、`set_local_events()` 等函数。定义工具 ID 常量（DEBUGGER、PROFILER、OPTIMIZER 等）。
+Tool ids: `DEBUGGER_ID = 0`, `COVERAGE_ID = 1`, `PROFILER_ID = 2`,
+`OPTIMIZER_ID = 5`. Ids `3` and `4` are unused but reserved.
 
-7. 更新解释器状态：修改 `Include/internal/pycore_interp.h` 和 `Include/internal/pycore_pystate.h`，添加全局监控状态结构。在 `_PyInterpreterState` 中存储每个工具的事件回调和启用状态。
+## 3. Callback signatures
 
-8. 实现 legacy tracing 兼容层：创建 `Python/legacy_tracing.c`，将 `sys.settrace()` 和 `sys.setprofile()` 映射到新的监控 API。确保现有使用 trace/profile 的代码继续工作。
+Callbacks are registered per `(tool_id, event)` pair. Their signatures
+depend on the event:
 
-9. 更新帧对象：修改 `Include/internal/pycore_frame.h` 和 `Objects/frameobject.c`，添加 `f_last_traced_line` 字段用于 LINE 事件去重，调整栈指针管理逻辑以支持监控期间的栈状态检查。
+| Event                | Arguments                                |
+|----------------------|------------------------------------------|
+| PY_START / PY_RESUME | `(code, instruction_offset)`             |
+| PY_RETURN / PY_YIELD | `(code, instruction_offset, retval)`     |
+| CALL                 | `(code, instruction_offset, callable, arg0)` |
+| LINE                 | `(code, line_number)`                    |
+| INSTRUCTION          | `(code, instruction_offset)`             |
+| JUMP / BRANCH        | `(code, instruction_offset, destination_offset)` |
+| RAISE / RERAISE      | `(code, instruction_offset, exception)`  |
+| EXCEPTION_HANDLED    | `(code, instruction_offset, exception)`     |
+| STOP_ITERATION       | `(code, instruction_offset, exception)`     |
+| C_RETURN / C_RAISE   | `(code, instruction_offset, callable, arg0)` |
 
-10. 编写测试用例：创建 `Lib/test/test_monitoring.py`，覆盖所有事件类型、多工具并行、动态启用/禁用、与 legacy tracing 的交互、性能基准测试等场景。
+A callback may return the special value `sys.monitoring.DISABLE` to indicate
+that the event should not fire again for that (code object, instruction
+offset) pair until `sys.monitoring.restart_events()` is called.
 
-## Requirement
-https://peps.python.org/pep-0669/
+## 3. Behavioural rules
+
+* `set_events(tool_id, event_set)` — global subscription for a tool.
+* `set_local_events(tool_id, code, event_set)` — limits a tool's events to a
+  single code object.
+* `register_callback(tool_id, event, callback)` returns the previously
+  registered callback (or `None`).
+* Multiple tools may subscribe to the same event; the interpreter calls each
+  tool's callback in tool-id order.
+* When no tool subscribes to an event, the interpreter must not pay any cost
+  in the hot path — this is the core motivation behind the PEP.
+* `sys.settrace` and `sys.setprofile` are reframed as bridge implementations
+  built on top of `sys.monitoring`; the legacy public API continues to work.
+
+## 4. Backward compatibility
+
+`sys.settrace` / `sys.setprofile` continue to function, layered on top of a
+dedicated tool ID reserved for them. Existing debuggers and profilers should
+not need to change.
+
+## Implementation scope
+
+Implement the `sys.monitoring` module, the per-event/per-tool dispatch in
+the interpreter, and the bytecode hooks needed to fire each event. Update
+`sys.settrace` and `sys.setprofile` so they keep working by registering
+themselves under the legacy tool slot. Add a regression test module that
+exercises every event type and the `DISABLE`/`restart_events()` flow.
+
+The PEP does not prescribe specific filenames in CPython for the
+implementation; the agent decides where the new code, tests and
+documentation live.
+
+## Acceptance
+
+1. `import sys; sys.monitoring.use_tool_id(0, "test")` succeeds and
+   `get_tool(0)` returns "test".
+2. Registering callbacks for `PY_START`, `LINE`, `CALL`, `RETURN`, `RAISE`,
+   `EXCEPTION_HANDLED` produces the expected event order on a test program.
+3. Returning `sys.monitoring.DISABLE` from a callback prevents further
+   invocations for the same `(code, offset)` pair until
+   `sys.monitoring.restart_events()` is called.
+4. `sys.settrace`/`sys.setprofile` still observe Python execution after the
+   change.

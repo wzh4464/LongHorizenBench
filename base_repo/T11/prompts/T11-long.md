@@ -1,53 +1,87 @@
-# T11: TypeScript - 装饰器元数据 (Decorator Metadata)
+# T11 — Decorator Metadata
 
-## Summary
+## Source proposal
 
-TC39 装饰器提案在最新版本中移除了装饰器对类原型的直接访问能力，导致装饰器无法方便地为类关联元数据。本任务需要在 TypeScript 编译器中实现 TC39 Decorator Metadata 提案，使装饰器能够通过 `Symbol.metadata` 向类附加元数据信息，支持依赖注入、序列化、验证等常见使用场景。
+TC39 proposal: "Decorator Metadata" (https://github.com/tc39/proposal-decorator-metadata).
+The proposal extends the Stage 3 "Decorators" proposal with a way for decorators to store and observe metadata on the class they decorate.
 
-## Motivation
+The summary below is taken faithfully from the proposal README; nothing about the host implementation (compiler, parser, emit code, file layout) is dictated by the proposal.
 
-在装饰器提案的早期版本中，装饰器可以访问类原型，从而能够向其附加元数据。但在最新的 Stage 3 装饰器提案中，装饰器只能访问"直接被装饰的值"（方法、字段、accessor 等），无法直接访问类本身。这限制了很多依赖元数据的场景：
+---
 
-- **依赖注入 (DI)**：需要记录哪些参数需要注入什么类型
-- **序列化/反序列化**：需要记录字段的序列化规则
-- **验证**：需要记录字段的验证规则
-- **Web 组件**：需要记录属性与 DOM 属性的映射
-- **声明式路由**：需要记录方法与路由的对应关系
+## 1. Motivation
 
-Decorator Metadata 提案通过在装饰器上下文中提供一个共享的 `metadata` 对象，并最终将其附加到类的 `Symbol.metadata` 属性上，解决了这一问题。
+Decorators frequently need to record information about a class, method, field, or accessor that other parts of a program will read back later. Common examples are dependency injection frameworks, ORM bindings, validation libraries, and serialization libraries. Without a built-in metadata channel, every framework invents its own (e.g. a side-table keyed on the class), which is fragile and incompatible across libraries.
 
-## Proposal
+The decorator metadata proposal therefore extends the decorators proposal with an officially blessed metadata channel that is accessible:
 
-在 TypeScript 编译器中实现 Decorator Metadata 提案：
+- to every decorator while it runs (via the `context` argument); and
+- to user code at runtime (via a well-known symbol on the class).
 
-1. 扩展装饰器上下文对象，添加 `metadata` 属性
-2. 为每个被装饰的类创建一个元数据对象，该对象的原型指向父类的元数据对象（实现继承）
-3. 将同一个元数据对象传递给应用于类及其所有成员的装饰器
-4. 在类定义完成后，将元数据对象附加到类的 `Symbol.metadata` 属性
-5. 添加 `esnext.decorators` 库定义，包含 `Symbol.metadata` 的类型声明
+## 2. The `context.metadata` property
 
-## Design Details
+Every decorator receives a `context` object as its second argument. That object is extended with a new `metadata` property:
 
-1. **扩展装饰器上下文类型定义**：在 `ESDecorateClassContext` 和 `ESDecorateClassElementContext` 接口中添加 `metadata: Expression` 字段，用于在代码生成时传递元数据引用。
+```js
+function dec(value, context) {
+  // context.metadata is a fresh object the first time a decorator on this class
+  // runs; the same object is shared by every decorator applied to the class
+  // and to its members.
+  context.metadata.someKey = "some value";
+}
+```
 
-2. **创建元数据对象**：在 `createClassInfo` 函数中为每个被装饰的类创建唯一的元数据标识符（`_metadata`），用于在转换过程中引用元数据对象。
+Properties of `context.metadata`:
 
-3. **修改上下文对象生成**：更新 `createESDecorateClassContextObject` 和 `createESDecorateClassElementContextObject` 函数，在生成的上下文对象中包含 `metadata` 属性。
+- It is a plain object.
+- It is **the same object** for every decorator applied to one class declaration (class itself, its methods, fields, accessors, and getters/setters).
+- Its prototype chain is the metadata object of the parent class, if any. If the class has no decorated parent, the prototype is `null`.
+- It is created lazily — the first decorator that runs for a class triggers its creation.
 
-4. **实现元数据继承**：在类定义的开始位置生成创建元数据对象的代码，如果类有父类，则元数据对象的原型应指向父类的 `Symbol.metadata`。
+## 3. The `Symbol.metadata` slot on the class
 
-5. **附加元数据到类**：在所有装饰器执行完毕后，将元数据对象设置为类的 `Symbol.metadata` 属性值。
+After a class is decorated, its accumulated `metadata` object is exposed under a well-known symbol:
 
-6. **添加库定义文件**：创建 `lib.esnext.decorators.d.ts`，声明 `Symbol.metadata` 符号；更新 `lib.esnext.d.ts` 引用新的库文件；更新 `libs.json` 和 `commandLineParser.ts` 注册新库。
+```js
+@dec
+class C {}
 
-7. **更新 emit helpers**：修改 `emitHelpers.ts` 中的辅助函数，确保正确生成包含元数据的装饰器调用代码。
+C[Symbol.metadata] // the metadata object
+```
 
-8. **处理类表达式和类声明**：确保无论是类表达式还是类声明，元数据对象都能正确创建和附加。需要调整 `classFields.ts` 中的临时变量处理逻辑。
+If no decorators on the class (or on any of its members) run, `C[Symbol.metadata]` is not set. Inheritance follows the normal prototype chain of the constructor: a subclass that adds nothing inherits its parent's metadata via the prototype.
 
-9. **添加测试用例**：创建覆盖各种场景的 conformance 测试，包括：基本元数据使用、元数据继承、静态成员装饰器、私有成员装饰器等。
+## 4. Inheritance semantics
 
-10. **添加评估测试**：在 testRunner 中添加运行时评估测试，验证生成的代码在运行时的正确行为。
+```js
+@parentDec
+class P {}
 
-## Requirement
+@childDec
+class C extends P {}
 
-https://github.com/tc39/proposal-decorator-metadata
+Object.getPrototypeOf(C[Symbol.metadata]) === P[Symbol.metadata]
+```
+
+A decorator on `C` can read everything the parent's decorators wrote (via the prototype chain), and can override entries by writing to `context.metadata` directly.
+
+## Implementation
+
+You are working in a TypeScript compiler repository that already implements TC39 stage-3 decorators. Add support for decorator metadata so that:
+
+1. Each decorator's `context` argument has a `metadata` property — a plain object shared by every decorator on the same class.
+2. After all decorators on a class have run, the class is given a `[Symbol.metadata]` slot pointing at that same object.
+3. The prototype-chain-based inheritance semantics described above are honoured: when a class extends another decorated class, its metadata object's prototype is the parent class's metadata object.
+4. Update the public type declarations (`lib.*.d.ts`) so that the decorator-context interfaces expose `metadata`, and the global `SymbolConstructor` exposes `metadata`.
+5. Add tests that demonstrate metadata sharing among co-applied decorators, prototype inheritance, and `Symbol.metadata` exposure on the class.
+
+## Acceptance criteria
+
+- `tsc` compiles a decorated class targeting `esnext` and emits code that, at runtime, exposes `Class[Symbol.metadata]` and gives every decorator's `context.metadata` a reference to the same object.
+- The metadata object of a subclass has the parent's metadata object as its `[[Prototype]]`.
+- The compiler's existing decorator tests continue to pass.
+- New tests cover the metadata behaviour described above.
+
+## Out of scope
+
+- The proposal does not specify how a host (e.g. TypeScript) chooses to store metadata when targeting environments that lack `Symbol.metadata`. Any reasonable polyfill or downlevel emit strategy is acceptable as long as observable semantics match the proposal.

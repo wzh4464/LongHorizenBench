@@ -1,102 +1,151 @@
-# T50: Kubernetes - 实现动态资源分配（DRA）
+# T50: Kubernetes — Dynamic Resource Allocation (KEP-3063)
 
-## Requirement
+## Requirement source
 
-https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/3063-dynamic-resource-allocation/README.md
+*Upstream KEP*: KEP-3063 "Dynamic Resource Allocation" in the kubernetes/enhancements repository. The KEP is the authoritative spec — implement against what it says, not against the summary below.
 
-## Summary
+## 1. Motivation
 
-KEP-3063 引入动态资源分配（Dynamic Resource Allocation, DRA）功能，提供比现有 Device Plugins 更灵活的资源管理机制。DRA 允许 Pod 请求（claim）特殊类型的资源，这些资源可以是节点级别、集群级别或任意自定义模型。通过新的 `resource.k8s.io` API 组，定义 `ResourceClaim`、`ResourceClass`、`ResourceClaimTemplate` 和 `PodScheduling` 等资源类型，实现资源的声明、分配和调度协调。
+Today, container resource needs are expressed via `ResourceRequirements`
+(opaque resource counts) and the legacy device plugin framework, neither of
+which is rich enough for modern accelerators. They cannot:
 
-## Motivation
+- Express that two pods need to share the same device, or that a single pod
+  needs a specific topology of devices.
+- Carry per-claim driver-specific parameters.
+- Allocate devices that span beyond a single node.
+- Allow third-party drivers to participate in scheduling decisions.
 
-现有的 Device Plugins 机制存在以下限制：
-- 资源必须以整数数量表示，难以描述复杂资源
-- 仅支持节点本地资源
-- 不支持资源共享
-- 缺乏资源初始化和清理的钩子
-- 无法在调度前进行资源准备
+KEP-3063 introduces **Dynamic Resource Allocation (DRA)** in the new
+`resource.k8s.io` API group: pods describe their needs as `ResourceClaim`
+objects, and a per-driver controller (or, in newer iterations, the scheduler
+itself, using "structured parameters") allocates concrete devices and writes
+the result back into the claim's status. Kubelet picks up the allocation when
+the pod is admitted and prepares the resources on the node before the
+container starts.
 
-DRA 解决这些问题，支持：
-- GPU/FPGA 等需要复杂配置的设备
-- 网络连接的加速器
-- 需要组合使用的硬件功能
-- 跨 Pod 共享的资源
+## Goals
 
-## Proposal
+- Workloads describe device needs declaratively in a Kubernetes API resource
+  (`ResourceClaim`/`ResourceClaimTemplate`).
+- Drivers (or the scheduler with structured parameters) allocate devices to
+  claims; allocation can be deferred until the pod is scheduled (`WaitForFirstConsumer`)
+  or done eagerly (`Immediate`).
+- Pods reference claims via the new `pod.spec.resourceClaims` field; containers
+  in the pod opt into individual claims.
+- Kubelet exposes a gRPC plugin contract with the on-node driver
+  (`NodePrepareResources`/`NodeUnprepareResources`) so per-claim resources
+  (devices, mounts, env vars, CDI annotations) are prepared just before
+  containers start and torn down after they exit.
 
-引入新的 `resource.k8s.io/v1alpha1` API 组，包含以下核心资源：
-- **ResourceClass**：定义资源类型和驱动程序
-- **ResourceClaim**：声明对特定资源的需求
-- **ResourceClaimTemplate**：用于创建 ResourceClaim 的模板
-- **PodScheduling**：协调 Pod 调度和资源分配
+## Goals
 
-在 Pod 规格中添加 `resourceClaims` 字段引用 ResourceClaim，容器通过 `resources.claims` 引用需要的资源。调度器与资源驱动控制器协作，通过 PodScheduling 对象协商资源分配。
+- Provide a portable, vendor-neutral way for workloads to claim resources
+  that are richer than what the existing `requests/limits` machinery can
+  express (GPUs with mode, RDMA NICs with virtualisation level, FPGA
+  bitstreams, etc.).
+- Allow a per-pod resource scheduling decision to involve a vendor-specific
+  controller without coupling that controller into the kubelet or kube-scheduler
+  binaries.
+- Keep all ownership, GC, and quota semantics consistent with the rest of
+  Kubernetes by representing claims as first-class API objects.
 
-## Design Details
+## Non-Goals
 
-1. **API 类型定义**：在 `staging/src/k8s.io/api/resource/v1alpha1/` 中创建：
-   - `types.go`：定义 ResourceClass、ResourceClaim、ResourceClaimTemplate、PodScheduling、AllocationResult 等类型
-   - `register.go`：注册 API 类型到 scheme
-   - `doc.go`：包文档
+- Replacing the existing device plugin framework outright. DRA and device
+  plugins coexist; vendors can choose either.
+- Defining a portable "device language" — DRA is a framework. The schemas
+  for class parameters, claim parameters, and structured parameter selectors
+  are vendor-specific.
 
-2. **内部 API 类型**：在 `pkg/apis/resource/` 中：
-   - `types.go`：内部版本的类型定义
-   - `register.go`：注册到 scheme
-   - 在 `v1alpha1/` 子目录实现版本转换和默认值
+## API surface
 
-3. **API Validation**：在 `pkg/apis/resource/validation/` 中实现：
-   - ResourceClass 的验证
-   - ResourceClaim 的验证（名称、参数、分配模式）
-   - ResourceClaimTemplate 的验证
-   - PodScheduling 的验证
+The KEP introduces the following types under the `resource.k8s.io` API group:
 
-4. **Core API 扩展**：在 `staging/src/k8s.io/api/core/v1/types.go` 和 `pkg/apis/core/types.go` 中：
-   - 添加 `ClaimSource` 类型（引用 ResourceClaim 或 ResourceClaimTemplate）
-   - 添加 `PodResourceClaim` 类型
-   - 在 `PodSpec` 中添加 `ResourceClaims` 字段
-   - 在 `ResourceRequirements` 中添加 `Claims` 字段
+- `ResourceClass`: cluster-scoped, vendor-neutral declaration of a class of
+  resources, referencing a driver and optional parameter object.
+- `ResourceClaim`: namespace-scoped object representing a request, with
+  parameters, allocation result, and reservedFor list.
+- `ResourceClaimTemplate`: pod-scoped template that the controller materialises
+  into a `ResourceClaim` per-pod, similar to PVC templates for StatefulSets.
+- `PodSchedulingContext`: scheduler/driver coordination object that records
+  potential nodes, the selected node, and per-driver scheduling state.
 
-5. **Feature Gate**：在 `pkg/features/kube_features.go` 中注册 `DynamicResourceAllocation` feature gate。
+Allocation modes:
 
-6. **Registry 实现**：在 `pkg/registry/resource/` 中为每个资源类型实现：
-   - `strategy.go`：创建/更新策略
-   - `storage/storage.go`：REST 存储实现
+- `Immediate`: allocator runs as soon as the claim is created.
+- `WaitForFirstConsumer`: the claim is left pending until a pod that uses it is
+  ready to be scheduled, allowing per-pod context to influence allocation.
 
-7. **控制器实现**：在 `pkg/controller/resourceclaim/` 中：
-   - `controller.go`：ResourceClaim 控制器，处理 claim 的生命周期
-   - `uid_cache.go`：UID 缓存实现
-   - `metrics/metrics.go`：控制器指标
+Reservation semantics:
 
-8. **调度器插件**：在 `pkg/scheduler/framework/plugins/dynamicresources/` 中：
-   - `dynamicresources.go`：实现 Filter、Reserve、PreBind 等调度阶段
-   - 与资源驱动控制器通过 PodScheduling 协调
-   - 更新 `plugins/names/names.go` 和 `plugins/registry.go`
+- A claim can be reserved by one or more pods (controlled by
+  `claim.spec.allocation.shareable`); the controller revokes the reservation
+  when the consuming pods finish.
 
-9. **Kubelet 集成**：在 `pkg/kubelet/cm/dra/` 中：
-   - `manager.go`：DRA 管理器实现
-   - `claiminfo.go`：claim 信息管理
-   - `cdi.go`：CDI（Container Device Interface）集成
-   - `plugin/`：插件客户端和存储
+Pod plumbing:
 
-10. **DRA 插件 API**：在 `staging/src/k8s.io/kubelet/pkg/apis/dra/v1alpha1/` 中：
-    - `api.proto`：gRPC 接口定义
+- `Pod.Spec.ResourceClaims` lists the claims (or claim templates) the pod
+  needs.
+- `Container.Resources.Claims` references a subset of the pod's claims by
+  local name; the kubelet uses this to set up runtime resources for the
+  container only.
 
-11. **动态资源分配库**：在 `staging/src/k8s.io/dynamic-resource-allocation/` 中：
-    - `controller/`：通用控制器实现
-    - `kubeletplugin/`：kubelet 插件框架
-    - `resourceclaim/`：claim 处理工具
+## Scheduler & kubelet integration
 
-12. **RBAC 策略**：在 `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/` 中：
-    - 更新 `controller_policy.go` 添加控制器权限
-    - 更新 `policy.go` 添加资源访问规则
+- The scheduler runs a `DynamicResources` plugin that defers binding until
+  every claim is allocated (or, with structured parameters, allocates the
+  claim itself in `Reserve`/`Bind`).
+- The kubelet maintains a Plugin gRPC channel to each registered DRA driver
+  and calls `NodePrepareResources` before container startup and
+  `NodeUnprepareResources` on cleanup, mirroring the CSI lifecycle.
+- All node-level state (claim → CDI device list, prepared/unprepared) is
+  durably checkpointed so restarts do not strand allocations.
 
-13. **控制平面集成**：
-    - 在 `cmd/kube-controller-manager/app/` 中注册 ResourceClaim 控制器
-    - 在 `cmd/kube-apiserver/app/` 中注册 resource API
-    - 在 `pkg/controlplane/instance.go` 中添加 REST 存储
+## Feature gates and APIs
 
-14. **E2E 测试**：在 `test/e2e/dra/` 中：
-    - `dra.go`：DRA 功能测试
-    - `test-driver/`：测试驱动实现
-    - 部署清单和示例资源
+- `DynamicResourceAllocation` gates the API group `resource.k8s.io`, the
+  scheduler plugin, and the kubelet plumbing.
+- `DRAControlPlaneController` (alpha) gates the older external-controller
+  flow that uses `PodSchedulingContext` and a vendor controller.
+- The two flows can coexist; the structured-parameters flow is the
+  long-term direction.
+
+## Test plan
+
+- Unit tests for: validation, controller reconciliation, scheduler plugin
+  filter/score/reserve/postbind transitions, kubelet plugin manager.
+- Integration tests for: claim allocation modes, reserved-for lifecycle,
+  pod admission denial when claims are missing, GC of claims with deleted
+  pods.
+- E2E with a test driver in `test/e2e/dra` covering: scheduling with
+  structured parameters, two-claim pods, claim sharing, restart of the
+  driver during pod startup, restart of kubelet during prepare/unprepare.
+
+## Implementation Task
+
+Implement the alpha for KEP-3063 / KEP-4381 (structured parameters):
+
+1. Add the `resource.k8s.io` API group with `ResourceClass`,
+   `ResourceClaim`, `ResourceClaimTemplate`, `PodSchedulingContext`,
+   and (for structured parameters) `ResourceSlice` /
+   `DeviceClass` / `ResourceClaim` parameter types as described in
+   the KEP.
+2. Wire a new `DynamicResources` scheduler plugin that drives
+   `WaitForFirstConsumer` allocations through the
+   `PodSchedulingContext` lifecycle, and (when structured parameters
+   are enabled) performs in-scheduler allocation.
+3. Add a kubelet plugin manager hook so DRA drivers can register
+   over the kubelet plugin socket and receive
+   `NodePrepareResources` / `NodeUnprepareResources` calls before
+   container start.
+4. Provide a feature gate `DynamicResourceAllocation` that guards
+   the group registration, scheduler plugin, and kubelet plumbing.
+5. Add admission/quota integration so claims and templates count
+   against existing quota and namespaces.
+6. Add tests at unit, integration, and (where feasible) e2e levels
+   following the test plan above.
+
+The PR layout, generated code, and exact package locations are not
+prescribed by the KEP — implement them following Kubernetes
+conventions for new API groups.

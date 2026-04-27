@@ -1,90 +1,133 @@
-# T39: OpenJDK Virtual Threads (Project Loom)
+# T39: OpenJDK JEP 425 — Virtual Threads (Preview)
 
-## Requirement
-https://openjdk.org/jeps/425
+## Requirement (inlined from JEP 425)
 
----
+*Upstream source, for reference only:* https://openjdk.org/jeps/425
 
-**Summary**: JEP 425 提出引入虚拟线程（Virtual Threads）作为 Java 平台的预览特性。虚拟线程是轻量级线程，可以大幅减少编写、维护和观察高吞吐量并发应用程序的工作量。虚拟线程基于 continuation 和 scheduler 实现，允许在单个 OS 线程上运行大量虚拟线程。
+All information needed to complete this task is reproduced below. The agent must not fetch any external URL.
 
-**Motivation**: 传统 Java 线程（平台线程）是对操作系统线程的包装，创建和上下文切换开销较大。这导致了几个问题：
+## Summary
 
-1. **线程数量限制**：由于 OS 线程开销，典型服务器能支持的并发连接数受限于线程数（通常几千个）。
-2. **编程模型分裂**：为提高吞吐量，开发者被迫采用异步编程模型，但这违背了 Java 的 thread-per-request 设计理念。
-3. **调试困难**：异步代码的堆栈跟踪难以理解，调试工具支持有限。
-4. **代码复杂性**：回调和 Future 组合使代码难以阅读和维护。
+Introduce virtual threads to the Java Platform. Virtual threads are lightweight threads that dramatically reduce the effort of writing, maintaining, and observing high-throughput concurrent applications. The familiar `java.lang.Thread` API is preserved; the JVM, the standard library, and the tools are extended so that a `Thread` can be one of two kinds:
 
-**Proposal**: 引入虚拟线程，它们在用户态由 JVM 调度，可以在阻塞时自动挂起并释放底层平台线程。虚拟线程与现有 `Thread` API 兼容，允许现有代码无需大量修改即可受益。核心实现基于 Continuation（定界续体）机制，当虚拟线程遇到阻塞操作时，将其栈帧保存到堆上，释放载体线程执行其他虚拟线程。
+* A **platform thread** — a traditional `Thread` bound to a single OS thread for its entire lifetime. This is the pre-JEP-425 behaviour.
+* A **virtual thread** — a thread implemented by the JVM on top of a small pool of *carrier* platform threads. A virtual thread captures a carrier thread only while it is runnable; when it blocks on I/O or synchronisation, it unmounts and returns the carrier to the pool.
 
-**Design Details**:
+This preview feature makes the thread-per-request programming model viable for high-concurrency server workloads without sacrificing throughput.
 
-1. **Continuation 基础设施**：
-   - 在 HotSpot 中实现 `Continuation` 类，支持栈帧的冻结（freeze）和解冻（thaw）
-   - 实现 `ContinuationEntry` 用于标记 continuation 边界
-   - 在各 CPU 架构（aarch64、x86、arm、ppc、riscv、s390）下实现 continuation 相关的汇编代码
+*Upstream reference (do not fetch):* https://openjdk.org/jeps/425
 
-2. **栈帧管理**：
-   - 实现 `StackChunk` 对象用于在堆上存储冻结的栈帧
-   - 修改 `frame` 类支持堆上栈帧的遍历
-   - 实现 `StackChunkFrameStream` 用于遍历 chunk 中的帧
-   - 添加相对指针（relative pointers）支持，用于堆上帧的重定位
+## Motivation
 
-3. **JVM 运行时支持**：
-   - 添加 `JVM_CurrentCarrierThread` 和 `JVM_SetCurrentThread` native 方法
-   - 添加 `JVM_GetStackTrace` 用于虚拟线程栈跟踪
-   - 添加 `JVM_RegisterContinuationMethods` 用于注册 continuation intrinsics
-   - 实现 `JVM_VirtualThreadMountBegin/End` 和 `JVM_VirtualThreadUnmountBegin/End` 用于 JVMTI 通知
+Developers have long faced a choice between two concurrency styles on the JVM:
 
-4. **监视器和同步**：
-   - 修改监视器膨胀（monitor inflation）逻辑以支持虚拟线程
-   - 更新 `ObjectMonitor` 追踪持有监视器的虚拟线程
-   - 实现虚拟线程在 synchronized 块中的 pinning 机制
-   - 添加 `held_monitor_count` 用于追踪线程持有的监视器数量
+1. **Thread-per-task** — simple, debuggable, and natural with `InputStream`, `Thread.sleep`, blocking `Socket`, etc. but the platform thread is an expensive resource so the model does not scale past a few thousand concurrent tasks.
+2. **Asynchronous / reactive** — scales to millions of operations but forces a different programming style (callbacks, `CompletableFuture`, reactive streams) and confuses debugging, profiling, and stack traces.
 
-5. **C1/C2 编译器支持**：
-   - 在 C1 中添加 `do_continuation_doYield` intrinsic
-   - 在 C2 中添加 continuation 相关的 IR 节点
-   - 修改调用指令在调用后发出 `post_call_nop` 用于栈遍历
-   - 更新 `LIRAssembler` 和 `LIRGenerator` 支持 continuation
+Virtual threads let synchronous, blocking code scale to millions of concurrent tasks. The JVM automatically parks a blocked virtual thread and reuses the carrier platform thread for another ready virtual thread.
 
-6. **解释器修改**：
-   - 修改 `TemplateInterpreter` 生成 continuation enter/exit 代码
-   - 更新 `InterpreterMacroAssembler` 添加虚拟线程相关操作
-   - 实现解释器帧的冻结和解冻支持
+## Key design points
 
-7. **GC 集成**：
-   - 更新各 GC（G1、Shenandoah、ZGC）的 barrier set 支持 continuation
-   - 实现 `StackChunk` 的 GC 遍历和对象重定位
-   - 添加 `StackChunkOop` 类封装堆上栈操作
+### 3.1 Model
 
-8. **RegisterMap 和栈遍历**：
-   - 实现 `SmallRegisterMap` 用于高效的寄存器映射
-   - 修改 `RegisterMap` 支持堆上帧的寄存器定位
-   - 更新 `frame::sender()` 方法正确处理 continuation 边界
+- `java.lang.Thread` gets a factory `Thread.ofVirtual()` and a direct helper `Thread.startVirtualThread(Runnable)`.
+- `Executors.newVirtualThreadPerTaskExecutor()` creates an executor that starts a new virtual thread for each submitted task.
+- Virtual threads are **daemon** by default, cannot be placed in thread groups (they all belong to the placeholder `VirtualThreads` group), and ignore `setPriority`.
 
-9. **JVMTI 支持**：
-   - 添加虚拟线程挂载/卸载事件
-   - 更新 `GetStackTrace` 和其他线程相关 JVMTI 函数
-   - 实现虚拟线程的 `SuspendThread` 支持
+### Scheduler
 
-10. **Java 层实现**：
-    - 实现 `java.lang.VirtualThread` 类
-    - 实现 `jdk.internal.vm.Continuation` 类
-    - 修改 `Thread` 类添加虚拟线程相关方法
-    - 实现默认的 `ForkJoinPool` 作为虚拟线程调度器
+A virtual thread's carrier is a platform thread managed by a default `ForkJoinPool`-based scheduler. When a virtual thread blocks on a supported operation (I/O, `Thread.sleep`, `LockSupport.park`, `Object.wait`, `ReentrantLock`, etc.) it *unmounts* from its carrier, freeing it for another virtual thread. The scheduler later *mounts* the resumed virtual thread onto any free carrier. This transition is invisible to the programmer.
 
-11. **I/O 和网络支持**：
-    - 更新 NIO channel 实现支持虚拟线程阻塞时 unmount
-    - 修改 socket 操作在虚拟线程上 park 而非阻塞 OS 线程
-    - 更新 `FileChannel` 和 `DatagramChannel` 等
+### 3.3 Continuations
 
-12. **诊断和调试**：
-    - 更新 `Thread.getStackTrace()` 支持虚拟线程
-    - 实现 `Thread.getAllStackTraces()` 过滤虚拟线程
-    - 添加 JFR 事件支持虚拟线程
+Internally, virtual threads rely on `jdk.internal.vm.Continuation` and the HotSpot machinery for stack freezing/thawing. The VM manipulates the stack in chunks (`StackChunk`) stored on the Java heap, so context switches are cheap.
 
-13. **测试**：
-    - 添加虚拟线程基本功能测试
-    - 添加 continuation freeze/thaw 测试
-    - 添加 JVMTI 虚拟线程事件测试
-    - 添加各架构的 JIT 编译测试
+### 3.4 I/O integration
+
+The following JDK facilities are aware of virtual-thread unmounting so they do not pin the carrier:
+
+- `java.net.Socket`, `ServerSocket`, `DatagramSocket`
+- `java.nio.channels.*`
+- `java.io.Reader`, `Writer`, `PipedInputStream`, `PipedOutputStream`
+- `java.util.concurrent.locks.*` and `synchronized` (only when no native frame is on stack)
+- `Thread.sleep`, `Thread.join`
+- `Object.wait`, `notify`
+
+When a virtual thread is blocked on a monitor held by another thread, or on native code, or on a `synchronized` block containing a blocking call, the carrier thread is "pinned" and cannot be reused. Diagnostics (`-Djdk.tracePinnedThreads=short|full`) must be available to flag these situations.
+
+### 3.2 New Java API surface
+
+```
+java.lang.Thread.Builder             // fluent builder, base of OfPlatform / OfVirtual
+java.lang.Thread.Builder.OfPlatform  // for platform threads
+java.lang.Thread.Builder.OfVirtual   // for virtual threads
+java.lang.Thread.startVirtualThread(Runnable)
+java.lang.Thread.ofVirtual() / ofPlatform()
+java.lang.Thread.isVirtual()
+java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()
+java.util.concurrent.ThreadFactory.virtualThreadFactory()
+```
+
+`Thread.Builder` must be a `static interface` on `Thread`. `OfVirtual.factory()` returns a `ThreadFactory` that spawns a new unstarted virtual thread on each `newThread(...)`.
+
+### Supporting JVM changes
+
+1. **Continuation support** — enhance `jdk.internal.vm.Continuation` with new native entry points `enter0`, `doYield`, `pin`, `unpin`; add the HotSpot `zBarrier` and `objectMonitor` cooperation to avoid pinning.
+2. **Stack chunking** — allocate continuations on the Java heap as `StackChunk` objects; integrate with ZGC, G1, and Parallel GC barriers so chunks can be traced and relocated.
+3. **ForkJoinPool carrier pool** — `java.util.concurrent.ForkJoinPool` adds a method `commonPool().forkJoinWorkerThreadFactory()` variant that labels its workers as `CarrierThread` for JFR events and thread dumps.
+4. **JFR / jcmd** — `jcmd Thread.dump_to_file -format=json` includes virtual threads. `-format=plain` prints them interleaved with carrier threads.
+
+### Library-level API
+
+```
+java.lang.Thread.ofVirtual()                      // factory
+java.lang.Thread.startVirtualThread(Runnable r)   // convenience
+java.lang.Thread.Builder.OfVirtual#name(String)
+java.lang.Thread.Builder.OfVirtual#factory()
+java.util.concurrent.Executors#newVirtualThreadPerTaskExecutor()
+java.util.concurrent.StructuredTaskScope         // accompanying preview
+```
+
+### Observability
+
+- `Thread.isVirtual()` must return `true` for threads created through any virtual-thread API.
+- `ThreadGroup.list()` on the virtual-threads group returns an empty enumeration (virtual threads are not enumerated).
+- JFR events `jdk.VirtualThreadStart`, `jdk.VirtualThreadEnd`, `jdk.VirtualThreadPinned`, `jdk.VirtualThreadSubmitFailed`.
+
+## Implementation Scope
+
+1. **`java.base`**
+   - Add `java.lang.VirtualThread` (package-private) in the `java.lang` package.
+   - Extend `java.lang.Thread` with virtual-thread factory methods.
+   - Introduce `jdk.internal.vm.Continuation`, `ContinuationScope`.
+   - Add `ThreadContainer`, `ThreadContainers` for structured grouping.
+   - Plumb `Executors.newVirtualThreadPerTaskExecutor()` and `Executors.newThreadPerTaskExecutor(...)` variants.
+
+2. **HotSpot**
+   - Implement `Continuation_JvmtiOps`, `StackChunkOop`, `StackChunkKlass`.
+   - Update GC barriers (G1, Parallel, Serial, Z) to understand stack chunks.
+   - Add `JvmtiExt::set_thread_carrier()` / notifications.
+   - Update `Thread::current()` and thread-local handshakes.
+
+3. **JDK tools / diagnostics**
+   - Extend `jcmd Thread.dump` with `-format=json` and `-virtual` filters.
+   - Add `-Djdk.tracePinnedThreads=short|full` command-line option.
+   - Add `jdk.JfrHub::threadStart` event so that flight-recorder captures virtual threads.
+
+4. **Preview flag**
+
+Virtual threads are introduced as a preview feature: `--enable-preview` must be passed at both compile- and run-time; `java --version` must print `VirtualThreads (preview)` when listing enabled previews.
+
+## Acceptance
+
+- `try (var exec = Executors.newVirtualThreadPerTaskExecutor())` successfully runs 10 million short tasks on a laptop without exhausting the heap.
+- The JDK virtual-thread test suite under the standard JDK test tree passes.
+- `Thread.ofVirtual().start(r)`, `Thread.ofVirtual().unstarted(r).start()`, and `Thread.ofVirtual().factory().newThread(r)` all return virtual threads.
+- `Thread.currentThread().isVirtual()` reports `true` when called from a virtual thread.
+- `jcmd <pid> Thread.print` lists both platform and virtual threads, marking virtual ones.
+
+## Out of scope
+
+- Removing carrier-thread pinning on every blocking syscall (a follow-up JEP, handled later).
+- Structured concurrency (`StructuredTaskScope`) — separate preview JEP.
+- ForkJoinPool integration other than using it as the default carrier scheduler.

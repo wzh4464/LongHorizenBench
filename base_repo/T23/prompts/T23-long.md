@@ -1,32 +1,163 @@
-# T23: Apache Kafka
+# T23: Apache Kafka — KIP-768: Extend SASL/OAUTHBEARER with OIDC
 
-**Summary**: Apache Kafka 的 SASL/OAUTHBEARER 机制当前仅提供一个不安全的开发示例实现。KIP-768 提出扩展 SASL/OAUTHBEARER 以支持 OIDC（OpenID Connect），提供生产级别的实现，允许 Kafka 客户端和 broker 连接到外部 OAuth/OIDC 身份提供商（如 Okta、Auth0、Azure AD 等）进行身份验证和 token 获取。
+## Requirement (inlined, no external access needed)
 
-**Motivation**: KIP-255 定义了 SASL/OAUTHBEARER 的接口，但仅提供了一个不安全的 JWT 示例实现用于开发测试。生产环境中的用户需要自行实现 `AuthenticateCallbackHandler` 来连接实际的身份提供商，这增加了使用门槛。社区需要一个开箱即用的、安全的 OAuth/OIDC 实现，支持标准的 OAuth client credentials grant 流程，能够从 HTTPS 端点获取 access token，并使用 JWKS（JSON Web Key Set）验证 JWT 签名。
+Reference: KIP-768 "Extend SASL/OAUTHBEARER with Support for OIDC". PR
+apache/kafka#11284. All pertinent design, interfaces, and file layout are
+reproduced below; do not fetch the original page.
 
-**Proposal**: 实现一对 `AuthenticateCallbackHandler`：一个用于客户端登录（`OAuthBearerLoginCallbackHandler`），通过 OAuth token endpoint 获取 access token；另一个用于 broker 端验证（`OAuthBearerValidatorCallbackHandler`），使用 JWKS 验证 JWT 的签名和 claims。同时添加相关配置项、重试机制、以及支持从文件读取 token 的备选方案。
+## 1. Motivation
 
-**Design Details**:
+Kafka has always shipped an *unsecured* `OAUTHBEARER` SASL mechanism (KIP-255)
+intended purely as an illustrative / testing backend. In production deployments
+operators usually terminate authentication at an OIDC Identity Provider (Okta,
+Azure AD, Keycloak, Auth0). Before KIP-768, integrating Kafka brokers and
+clients with such an IdP required writing a bespoke
+`AuthenticateCallbackHandler` plus bespoke JWT verification logic. KIP-768
+ships a standards-compliant, production-grade OIDC client and a broker-side
+validator in the Kafka codebase so that no custom code is needed.
 
-1. 添加 SASL 配置项：在 `SaslConfigs.java` 中定义新的配置常量，包括 token endpoint URL、JWKS endpoint URL、scope/sub claim 名称、超时时间、重试参数、时钟偏差容忍度等。这些配置以 `sasl.oauthbearer.*` 和 `sasl.login.*` 为前缀。
+The new handlers accomplish two things:
 
-2. 实现 Access Token 获取：创建 `AccessTokenRetriever` 接口和两个实现类——`HttpAccessTokenRetriever`（从 OAuth token endpoint 通过 HTTP POST 获取 token）和 `FileTokenRetriever`（从本地文件读取 token）。实现 `AccessTokenRetrieverFactory` 根据配置选择合适的 retriever。
+1. Client-side — the `OAuthBearerLoginCallbackHandler` fetches an access token
+   from the IdP's token endpoint using the OAuth 2.0 `client_credentials`
+   grant and refreshes it automatically.
+2. Broker-side — the `OAuthBearerValidatorCallbackHandler` validates incoming
+   JWTs (signature + standard claims) against the IdP's JWKS endpoint, with
+   jittered retries, caching, and JWKS refresh on unknown-`kid`.
 
-3. 实现 JWT 验证：创建 `AccessTokenValidator` 接口和实现类——`LoginAccessTokenValidator`（客户端侧简单验证）和 `ValidatorAccessTokenValidator`（broker 侧使用 jose4j 库进行完整的 JWT 签名验证和 claims 校验）。实现 `AccessTokenValidatorFactory` 工厂类。
+## 2. Public configuration surface
 
-4. 实现 JWKS 管理：创建 `VerificationKeyResolver` 相关类来管理 JWT 验证所需的公钥。`RefreshingHttpsJwks` 从 HTTPS endpoint 定期刷新 JWKS；`JwksFileVerificationKeyResolver` 从本地文件加载 JWKS；`RefreshingHttpsJwksVerificationKeyResolver` 包装刷新逻辑。
+Configuration keys added to `org.apache.kafka.common.config.SaslConfigs` /
+`SaslConfigs`. All keys are optional; defaults listed where applicable.
 
-5. 实现 Login Callback Handler：创建 `OAuthBearerLoginCallbackHandler`，在客户端认证时调用 `AccessTokenRetriever` 获取 token，使用 `LoginAccessTokenValidator` 进行基本验证，然后创建 `OAuthBearerToken` 对象供 SASL 机制使用。
+Client-side (producer / consumer / admin / broker inter-broker):
 
-6. 实现 Validator Callback Handler：创建 `OAuthBearerValidatorCallbackHandler`，在 broker 端收到客户端 token 时，使用 `ValidatorAccessTokenValidator` 和 JWKS 验证 JWT 签名，检查过期时间、issuer、audience 等 claims。
+```
+sasl.oauthbearer.token.endpoint.url          # required (https://... or file://...)
+sasl.oauthbearer.scope.claim.name            # default "scope"
+sasl.oauthbearer.sub.claim.name              # default "sub"
+sasl.login.connect.timeout.ms                # default 10000
+sasl.login.read.timeout.ms                   # default 10000
+sasl.login.retry.backoff.ms                  # default 100
+sasl.login.retry.backoff.max.ms              # default 10000
+```
 
-7. 添加重试机制：实现 `Retry` 和 `Retryable` 类，支持指数退避重试策略。Token 获取和 JWKS 刷新都应使用此机制处理临时性网络故障。
+Broker-side validator:
 
-8. 实现辅助类：创建 `BasicOAuthBearerToken`（token 数据对象）、`SerializedJwt`（JWT 解析）、`ClaimValidationUtils`（claims 校验工具）、`ConfigurationUtils`（配置读取工具）、`JaasOptionsUtils`（JAAS 配置解析）等辅助类。
+```
+sasl.oauthbearer.jwks.endpoint.url           # required (https://... or file://...)
+sasl.oauthbearer.jwks.endpoint.refresh.ms    # default 3600000 (1 hour)
+sasl.oauthbearer.jwks.endpoint.retry.backoff.ms     # default 100
+sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms # default 10000
+sasl.oauthbearer.clock.skew.seconds          # default 30
+sasl.oauthbearer.expected.audience           # optional, List<String>
+sasl.oauthbearer.expected.issuer             # optional, String
+sasl.login.connect.timeout.ms                # default 10000
+sasl.login.read.timeout.ms                   # default 10000
+sasl.login.retry.backoff.ms                  # default 100
+sasl.login.retry.backoff.max.ms              # default 10000
+```
 
-9. 添加 jose4j 依赖：在 `build.gradle` 和 `gradle/dependencies.gradle` 中添加 jose4j 库依赖，用于 JWT 签名验证。更新 `checkstyle/import-control.xml` 允许导入 jose4j 包。
+Credentials: the client provides `clientId`, `clientSecret`, optional
+`scope` through the JAAS config (`OAuthBearerLoginModule`).
 
-10. 编写测试用例：为所有新组件编写单元测试，包括 token 获取、JWT 验证、JWKS 刷新、配置解析、错误处理等场景。创建 `AccessTokenBuilder` 测试辅助类用于生成测试 JWT。
+## 3. Runtime flow
 
-## Requirement
-https://cwiki.apache.org/confluence/display/KAFKA/KIP-768%3A+Extend+SASL%2FOAUTHBEARER+with+Support+for+OIDC
+### Client (login) side
+
+1. `OAuthBearerLoginCallbackHandler.configure(...)` parses JAAS options and
+   config properties and builds an `AccessTokenRetriever` via
+   `AccessTokenRetrieverFactory.create(...)`.
+   - `HttpAccessTokenRetriever` if the endpoint is `https://...` or `http://`
+     (allowed only when the SASL listener is plaintext).
+   - `FileTokenRetriever` if the endpoint is `file://...`.
+2. On authentication, the handler invokes `retriever.retrieve()`, validates
+   the raw string with `LoginAccessTokenValidator` (structural checks only:
+   decode header/payload, verify required claims, no signature check),
+   converts the result into `BasicOAuthBearerToken`, and returns it through
+   `OAuthBearerTokenCallback`.
+3. The token is cached; refresh is driven by `ExpiringCredentialRefreshingLogin`
+   (existing Kafka infrastructure) which calls `retrieve()` again before expiry.
+
+## 4. Broker side — `OAuthBearerValidatorCallbackHandler`
+
+Broker uses:
+
+- `VerificationKeyResolver` (jose4j) backed by either
+  `JwksFileVerificationKeyResolver` (file://) or `RefreshingHttpsJwks` (https URL)
+  wrapped by `RefreshingHttpsJwksVerificationKeyResolver`.
+- `JwtConsumer` configured with expected issuer, audience(s), clock skew, and
+  signature verification using the resolver.
+- A `ValidatorAccessTokenValidator` implementation that parses the token, runs
+  the `JwtConsumer`, and surfaces claims (`sub`, `iss`, `aud`, `exp`, `iat`,
+  custom scope claim).
+- Failures throw `ValidateException`, mapped to SASL negotiation failure.
+
+## 5. Configuration keys (SASL namespace)
+
+All keys are prefixed by the JAAS login module options or exposed as
+`org.apache.kafka.common.config.SaslConfigs` constants. The most important:
+
+| key | side | purpose |
+|-----|------|---------|
+| `sasl.oauthbearer.token.endpoint.url` | client | OAuth2 token URL (`https://` or `file://`) |
+| `sasl.oauthbearer.jwks.endpoint.url` | broker | JWKS URL (`https://` or `file://`) |
+| `sasl.oauthbearer.jwks.endpoint.refresh.ms` | broker | 1 hour default |
+| `sasl.oauthbearer.jwks.endpoint.retry.backoff.ms` | broker | 100 |
+| `sasl.oauthbearer.jwks.endpoint.retry.backoff.max.ms` | broker | 10 000 |
+| `sasl.oauthbearer.scope.claim.name` | default `scope` |
+| `sasl.oauthbearer.sub.claim.name` | default `sub` |
+| `sasl.oauthbearer.expected.audience` | optional list |
+| `sasl.oauthbearer.expected.issuer` | optional string |
+| `sasl.oauthbearer.clock.skew.seconds` | default 30 |
+| `sasl.login.connect.timeout.ms` | default 10 000 |
+| `sasl.login.read.timeout.ms` | default 10 000 |
+| `sasl.login.retry.backoff.ms` | default 100 |
+| `sasl.login.retry.backoff.max.ms` | default 10 000 |
+
+JAAS options `clientId`, `clientSecret`, `scope` are the standard OAuth
+client-credentials inputs.
+
+## 3. Component and class layout
+
+All new code sits under
+`clients/src/main/java/org/apache/kafka/common/security/oauthbearer/secured/`:
+
+- `OAuthBearerLoginCallbackHandler` — client-side `AuthenticateCallbackHandler`.
+- `OAuthBearerValidatorCallbackHandler` — broker-side handler validating
+  `OAuthBearerValidatorCallback` objects.
+- `AccessTokenRetriever` (interface) plus
+  `HttpAccessTokenRetriever`, `FileTokenRetriever`.
+- `AccessTokenValidator` (interface) plus `LoginAccessTokenValidator` (quick
+  local checks) and `ValidatorAccessTokenValidator` (full signature check).
+- `VerificationKeyResolverFactory` wrapping `HttpsJwksVerificationKeyResolver`
+  with refresh/backoff and `JwksFileVerificationKeyResolver` for on-disk keys.
+- `BasicOAuthBearerToken` — implements `OAuthBearerToken` using parsed claims.
+- `ClaimValidationUtils`, `ConfigurationUtils`, `JaasOptionsUtils` helpers.
+- `Retry<T>` — exponential-backoff runner shared by HTTP and JWKS calls.
+
+Dependencies added in `build.gradle`:
+
+```
+implementation libs.jose4j               # org.bitbucket.b_c:jose4j:0.7.9
+```
+
+The new symbol `org.jose4j` must be whitelisted under `clients/` in
+`checkstyle/import-control.xml`.
+
+## 2. Acceptance criteria
+
+1. Unit tests `OAuthBearerLoginCallbackHandlerTest`,
+   `OAuthBearerValidatorCallbackHandlerTest`, `HttpAccessTokenRetrieverTest`,
+   and the shared retriever/validator tests under
+   `clients/src/test/java/org/apache/kafka/common/security/oauthbearer/secured/`
+   pass.
+2. Client obtains a JWT via `client_credentials` when JAAS supplies
+   `clientId` + `clientSecret` + token endpoint URL.
+3. Validator handler verifies JWT signature against JWKS, checks expiry,
+   `aud`, `iss`, `sub`, and extracts scope into `OAuthBearerToken.scope()`.
+4. All new config keys surface via `SaslConfigs` and `SslConfigs` so tooling
+   (`kafka-configs.sh`) can list them.
+5. Failure modes (unreachable token endpoint, malformed JWT, missing
+   claim) yield `SaslAuthenticationException` with a descriptive message.

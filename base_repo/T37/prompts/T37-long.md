@@ -1,49 +1,128 @@
-# T37: OpenJDK Module Import Declarations
+# T37: OpenJDK / JEP 476 — Module Import Declarations (Preview)
 
-## Requirement
-https://openjdk.org/jeps/476
+## Requirement (inlined)
+
+*Upstream source, for reference only:* `https://openjdk.org/jeps/476`
+
+The implementation must work offline. The specification below is authoritative for this task.
 
 ---
 
-**Summary**: JEP 476 提出引入模块导入声明（Module Import Declarations）功能，允许开发者通过 `import module M;` 语法导入一个模块导出的所有包。这是一个预览特性，旨在简化模块化程序中的导入语句，特别是在学习和原型开发阶段。
+## Summary
 
-**Motivation**: 当使用第三方库或 Java 核心库时，开发者经常需要编写大量的导入语句。例如，使用 `java.base` 模块中的各种类时，需要分别导入 `java.util.*`、`java.io.*`、`java.math.*` 等多个包。这在以下场景中尤其繁琐：
+JEP 476 adds a new kind of import declaration, `import module M;`, to the Java language. Such a declaration imports, transitively, every type in every package that is *directly exported* by the module `M` to the current compilation unit. This is a preview language feature: enabled only with `--enable-preview --release <n>` where `<n>` is the version containing the feature.
 
-1. 学习和教学：初学者需要理解包的概念才能正确导入类，增加了学习曲线。
-2. 原型开发：快速开发时，频繁地添加导入语句打断了开发流程。
-3. 脚本和小程序：简单程序中导入语句可能比实际代码还长。
-4. 使用 JShell：交互式环境中，用户希望尽快开始编写代码。
+The feature's goal is to make experimentation, teaching and small programs easier: users of the `java.base` module, for example, can write `import module java.base;` and get access to all of `java.lang.*`, `java.util.*`, `java.nio.*`, etc. without line after line of single-type or on-demand imports.
 
-**Proposal**: 引入新的导入语法 `import module M;`，该语句将导入模块 M 直接或间接导出的所有公共顶级类和接口。这是一个预览特性，需要通过 `--enable-preview` 启用。同时更新 JShell 默认启动脚本以使用新的模块导入功能。
+## Motivation
 
-**Design Details**:
+Currently, when a developer wants to use many types from a module, they must list each package individually (`import java.util.*; import java.util.function.*; import java.util.concurrent.*;`) or import each type by name. For exploratory code, JShell sessions, scripts, and introductory classes this is friction that serves no functional purpose.
 
-1. **扩展 Preview Feature 枚举**：在 `PreviewFeature.java` 中添加 `MODULE_IMPORTS` 枚举值，关联 JEP 476，标记为预览状态。
+Java's module system already knows which packages a module exports to the unnamed module (scripts/class-path code). Letting users leverage that knowledge to import all of them with one declaration eliminates boilerplate without compromising type safety — if a name collides, the ambiguity is reported exactly as it is for star imports today.
 
-2. **更新 Source.Feature 枚举**：在 `Source.java` 中添加 `MODULE_IMPORTS` 特性，指定它在 JDK 23 中作为预览特性引入。
+## 3. Syntactic grammar
 
-3. **修改 Parser（JavacParser）**：扩展 `parseImportDeclaration()` 方法以识别 `import module` 语法。当遇到 `import` 后跟 `module` 关键字时，解析模块名称并创建相应的 AST 节点。
+The grammar of `ImportDeclaration` in JLS 7.5 is extended as follows:
 
-4. **扩展 JCTree AST 节点**：创建新的 `JCModuleImport` 类来表示模块导入声明。该节点应包含模块名称信息，并实现 `ImportTree` 接口。
+```
+ImportDeclaration:
+    SingleTypeImportDeclaration
+    TypeImportOnDemandDeclaration
+    SingleStaticImportDeclaration
+    StaticImportOnDemandDeclaration
+    ModuleImportDeclaration                 // new
 
-5. **更新 ImportTree 接口**：在 `com.sun.source.tree.ImportTree` 中添加 `isModule()` 方法，用于区分普通导入和模块导入。该方法需要标记 `@PreviewFeature` 注解。
+ModuleImportDeclaration:
+    import module ModuleName ;
+```
 
-6. **修改 TypeEnter（语义分析）**：更新 `handleImports()` 方法以处理模块导入。当处理 `JCModuleImport` 时，需要：
-   - 查找指定的模块
-   - 验证当前模块能够读取目标模块
-   - 遍历模块导出的所有包
-   - 将每个导出包中的公共类型导入到当前编译单元的作用域
+- `ModuleName` uses the same production as in a module declaration (a dot-separated sequence of identifiers).
+- A compilation unit may contain any mixture of import kinds, including multiple `import module` declarations.
+- `import module` is a *soft keyword*: only the two-token sequence `import module` introduces the new form; `module` remains usable as an identifier elsewhere.
 
-7. **更新 Check 类**：修改 `checkImportsResolvable()` 和 `checkImportedPackagesObservable()` 方法以正确处理模块导入声明，跳过对 `JCModuleImport` 的传统导入检查。
+## 4. Semantic rules
 
-8. **更新 TreeDiffer 和 TreeCopier**：添加对 `JCModuleImport` 节点的访问方法，确保 AST 比较和复制功能正常工作。
+1. `import module M;` makes *every* public top-level type in every package that module `M` *exports without qualification* to the current compilation unit's module (or to `ALL-UNNAMED` if the current compilation unit is not in a module) available as a type-import-on-demand.
+2. If `M` requires `transitive` another module `N`, then all types exported (unqualified) by `N` are also imported.
+3. Conflicts between module imports and single-type imports are resolved by the existing JLS rules for shadowing: single-type imports win, then module imports tie with type-import-on-demand, then type-import-on-demand, then java.lang.
+4. `import module java.base;` is equivalent to importing every package exported by `java.base`.
 
-9. **更新 Pretty 打印器**：实现 `JCModuleImport` 节点的漂亮打印，正确输出 `import module ...;` 格式。
+### Compilation targets
 
-10. **更新 TreeMaker**：添加创建 `JCModuleImport` 节点的工厂方法。
+- `javac --enable-preview --release <n>` must accept the new form.
+- Without `--enable-preview`, `javac` must fail with `compiler.err.preview.feature.disabled`.
 
-11. **添加编译器诊断消息**：在 `compiler.properties` 中添加相关的错误和警告消息，如模块未找到、模块不可读等。
+### Supporting API
 
-12. **更新 JShell**：修改 JShell 的默认启动脚本和 Eval 类，使其在预览模式下自动导入 `java.base` 模块。
+- `javax.lang.model.element.Modifier` (no change).
+- `javax.lang.model.util.Elements` — add `boolean isModuleImport(ImportTree)` to the Trees API when preview is enabled.
+- `com.sun.source.tree.ImportTree` gains:
+  - `boolean isModule()` — returns true for module imports (preview).
+  - The `qualifiedIdentifier()` for a module import returns the module name `MemberSelectTree` ending in the module's name.
 
-13. **编写测试用例**：添加正向测试（正确使用模块导入）、负向测试（错误用法的诊断）、以及与 JShell 集成的测试。
+### Preview APIs to expose
+
+- `com.sun.tools.javac.tree.JCTree.JCImport`: add a `boolean module` flag.
+- `com.sun.tools.javac.code.Symbol`: resolve module imports through the module graph.
+- Update `TreeMaker`, `TreeCopier`, `TreeScanner`, `TreeTranslator`, `TreeVisitor`, `TreeInfo` to handle the new form.
+
+### Examples
+
+```java
+import module java.base;
+
+public class Hello {
+    public static void main(String[] args) {
+        List<String> msgs = List.of("hi");     // imported from java.util
+        System.out.println(msgs);              // System from java.lang
+        Path p = Path.of(".");                 // java.nio.file from java.base
+    }
+}
+```
+
+```java
+import module java.sql;              // imports java.sql.*, javax.sql.*
+import java.util.List;               // still valid
+```
+
+Ambiguity example (must be a compile error):
+```java
+import module java.sql;      // contains java.sql.Date
+import module java.util;     // contains java.util.Date
+// Date d = ...;            // ERROR: Date is ambiguous
+```
+
+## 5. JVM / tooling behaviour
+
+- No classfile format change: `import module` is a source-level construct only. The compiler translates it to the equivalent set of single-type imports during the `enter` phase.
+- `javadoc`, `javap`, IDEs and other structured tools that walk `ImportTree` must call `ImportTree.isModule()` (new) and handle the module-import subtree.
+- `--release` and `--enable-preview` flags gate the feature.
+
+## Implementation Task
+
+Implement module-import support end-to-end in the OpenJDK compiler and supporting tools. The compilation unit grammar change must be accompanied by:
+
+1. **Parser / AST** (`com.sun.tools.javac.parser.JavacParser`):
+   - Add `PREVIEW` token handling for `module` after `import`.
+   - Produce `JCModuleImport extends JCImport` AST nodes with a `ModuleSymbol` reference and `isModule()==true`.
+   - Preserve positions for error reporting.
+2. **Enter / resolution** (`com.sun.tools.javac.comp.Enter`, `Resolve`, `TypeEnter`):
+   - Expand `import module m;` into the transitive closure of packages exported (unqualified) by `m` and its required-transitive dependencies.
+   - Mark each imported type as `Flags.MODULEIMPORT` for duplicate-import diagnostics.
+   - Emit `compiler.err.preview.feature.disabled` when `--enable-preview` is absent.
+3. **Preview gating** — add `PreviewFeature.Feature.MODULE_IMPORTS` and plumb it through `com.sun.tools.javac.code.Source.Feature` and `PreviewLanguageFeatures`. The class-file minor version bit set for preview must be honoured.
+4. **AST / API changes** — extend `javax.lang.model.element.ModuleElement` and `javax.lang.model.util.Elements#getFileObjectsByModule` accessors are unchanged, but `JCImport` gets a new `Name module` slot; `Trees` API must expose `isModuleImport()`.
+5. **Pretty printing & source retention** — the `-Xprint` output, `javadoc`, and `JShell` import tracker must reproduce the `import module` form verbatim.
+6. **JShell defaults** — the interactive JShell tool auto-imports `module java.base` unless the user overrides it; the preview flag must be inferred from the launcher.
+7. **Testing** — add regression tests for the preview `import module` feature covering:
+   - positive compilation with `--enable-preview`;
+   - failure when `--enable-preview` is omitted;
+   - ambiguity errors between two module imports exporting the same simple name;
+   - interaction with explicit single-type imports (the explicit one wins);
+   - compile and run via `jshell` with the updated startup scripts.
+
+## Out of scope
+
+- Static imports of module members.
+- Implicit imports of `java.base` outside JShell.
+- Runtime reflection on the new `ModuleImport` symbol (none is added; module imports are a source-only construct).

@@ -1,32 +1,119 @@
-# T26: OpenJDK
+# T26: OpenJDK — JEP 483: Ahead-of-Time Class Loading & Linking
 
-**Summary**: JEP 483 提出了 Ahead-of-Time (AOT) 类加载与链接功能，目标是通过在 JDK 运行时启动时以 AOT 缓存的形式，加载和链接所有应用程序类来改善 Java 应用程序的启动时间。该功能通过三阶段工作流程实现：首先在试运行中记录类的使用情况，然后创建包含已加载和已链接类的 AOT 缓存，最后在生产运行中使用该缓存以跳过类加载和链接的重复工作。
+## Requirement source
 
-**Motivation**: Java 应用程序启动时间是一个长期存在的痛点。传统的类加载和链接过程需要在每次启动时重复执行，即使是相同的类集合。CDS（Class Data Sharing）虽然可以缓存类元数据，但仍需在运行时执行类链接（验证、准备、解析）。JEP 483 通过将链接后的类状态（包括已解析的常量池条目、已初始化的静态字段等）保存到 AOT 缓存中，使应用程序能够直接使用这些预链接的类，从而显著减少启动开销。
+JEP 483 ("Ahead-of-Time Class Loading & Linking"), https://openjdk.org/jeps/483.
+The text below paraphrases the JEP. Implementations should match the JEP's
+externally visible behaviour; internal layout, file naming, and helper class
+structure are not constrained beyond what the JEP says.
 
-**Proposal**: 实现 AOT 类加载与链接功能，包括：引入新的 AOT 模式（record/create/auto）控制缓存的生成和使用；扩展 CDS 基础设施以支持类链接状态的归档；实现 AOT 类初始化器以处理静态字段的缓存；添加 AOT 常量池解析器以缓存已解析的常量池条目；支持 Lambda 表达式和 invokedynamic 指令的 AOT 缓存；以及相应的测试和诊断功能。
+## Goal
 
-**Design Details**:
+Extend HotSpot so that the application's classes can be loaded and linked
+ahead of time (AOT) using a cache produced from a *training run*. With a
+warm cache, subsequent JVM startups skip much of the per-run class-loading
+and class-linking work, reducing time to first useful work.
 
-1. AOT 模式与配置：在 `cdsConfig` 模块中实现三种 AOT 模式的支持——`record` 模式用于在试运行中记录类使用情况并生成配置文件，`create` 模式用于根据配置文件创建 AOT 缓存，`auto` 模式用于在生产运行中自动使用缓存。需要添加 `-XX:AOTMode`、`-XX:AOTConfiguration`、`-XX:AOTCache` 等命令行选项。
+The mechanism builds on the existing CDS / AppCDS infrastructure; the
+JEP introduces a higher-level user-facing model and command-line surface
+that hides the multi-step CDS workflow.
 
-2. AOT 类初始化器（AOTClassInitializer）：创建新的类 `aotClassInitializer.cpp/hpp`，负责管理哪些类可以在 dump 时进行 AOT 初始化。实现 `can_archive_initialized_mirror()` 方法来判断类是否适合进行 AOT 初始化，处理类之间的初始化耦合关系，维护允许 AOT 初始化的类白名单。
+## Non-goals
 
-3. AOT 类链接器（AOTClassLinker）：实现 `aotClassLinker.cpp/hpp`，负责在 dump 时执行类链接并记录链接状态。处理类的验证、准备、解析阶段，将链接后的状态保存到归档中，支持在运行时跳过重复的链接工作。
+- Caching arbitrary application state beyond loaded/linked classes.
+- Caching classes from user-defined class loaders (initial scope is
+  built-in and AppCDS-eligible classes only).
+- Altering the JVM/JLS observable behaviour of an application; the AOT
+  cache must be transparent to programs that load and link classes.
 
-4. AOT 常量池解析器（AOTConstantPoolResolver）：创建 `aotConstantPoolResolver.cpp/hpp`，用于在 dump 时解析常量池条目并缓存解析结果。处理 `CONSTANT_Class`、`CONSTANT_Methodref`、`CONSTANT_Fieldref` 等条目的解析，支持 invokedynamic 和方法句柄的缓存。
+## Three-step user model
 
-5. AOT 链接类批量加载器（AOTLinkedClassBulkLoader）：实现 `aotLinkedClassBulkLoader.cpp/hpp`，在运行时从 AOT 缓存中批量加载已链接的类。优化类加载顺序以减少启动时间，处理类加载器委托和类可见性问题。
+The JEP defines a simple two-step workflow that a user can drive with two
+new command-line options:
 
-6. ConstantPool 和 CPCache 扩展：修改 `constantPool.cpp/hpp` 和 `cpCache.cpp/hpp`，添加支持 AOT 解析状态的存储和恢复。实现已解析条目的序列化和反序列化，处理运行时常量池的重建。
+1. **Training run.** The application is launched in `record` mode. The JVM
+   observes which classes get loaded and linked and writes that information
+   to an AOT *configuration* file:
+   ```
+   java -XX:AOTMode=record -XX:AOTConfiguration=app.aotconf -cp app.jar com.example.App
+   ```
+2. **Create the AOT cache** from the configuration:
+   ```
+   java -XX:AOTMode=create -XX:AOTConfiguration=app.aotconf -XX:AOTCache=app.aot \
+        -cp app.jar com.example.App
+   ```
+3. **Production run.** Subsequent runs are launched with the cache. They
+   skip the read/parse/load/link work for cached classes:
+   ```
+   java -XX:AOTCache=app.aot -cp app.jar com.example.App
+   ```
 
-7. 堆归档支持（HeapShared）：扩展 `heapShared.cpp/hpp`，支持将已初始化的类镜像和相关堆对象归档。实现 `find_all_aot_initialized_classes()` 来发现需要 AOT 初始化的类，处理对象图的遍历和归档。
+## Required command-line surface
 
-8. 测试框架扩展：在 `make/RunTests.gmk` 中添加 `AOT_JDK` 测试选项，支持在测试时使用 AOT 缓存。创建新的测试用例覆盖 AOT 类加载、链接、初始化的各种场景，包括 Lambda 表达式、VarHandle、自定义类加载器等。
+The feature is exposed through the following command-line options on the
+`java` launcher:
 
-9. Java 类支持：修改 `java.lang.invoke` 包中的相关类（如 `MethodType`、`MethodHandleNatives`、`StringConcatFactory` 等），添加 `runtimeSetup()` 方法以支持 AOT 初始化后的运行时设置。
+- `-XX:AOTMode=<mode>` — selects the AOT mode. Valid values per the JEP:
+  - `off` — disabled (default).
+  - `record` — write the AOT configuration during this run.
+  - `create` — assemble an AOT cache from the configuration.
+  - `auto` — silently use a cache if available, otherwise behave as `off`.
+  - `on` — use the cache; fail (or warn, depending on diagnostics) if it
+    cannot be loaded.
+- `-XX:AOTConfiguration=<file>` — path to the configuration file used in
+  `record` and `create` modes.
+- `-XX:AOTCache=<file>` — path to the AOT cache file used in subsequent
+  runs.
 
-10. 诊断与验证：实现 `CDSHeapVerifier` 来检测 AOT 初始化的潜在问题，添加日志支持（`-Xlog:cds`）用于调试，提供 `ProblemList` 文件记录已知的测试问题。
+These options replace the more verbose CDS workflow (`-XX:DumpLoadedClassList`,
+`-Xshare:dump`, `-XX:SharedClassListFile`, etc.) for typical usage; the
+underlying CDS machinery still supports the older flags but the JEP
+introduces the AOT options as the user-facing API.
 
-## Requirement
-https://openjdk.org/jeps/483
+## Required behavior
+
+- A training run started with `-XX:AOTMode=record -XX:AOTConfiguration=foo`
+  records information about loaded classes into the configuration file.
+  No AOT cache is produced in this step.
+- A subsequent assembly run started with `-XX:AOTMode=create
+  -XX:AOTConfiguration=foo -XX:AOTCache=app.aot` consumes the
+  configuration and produces an AOT cache file. The application is not
+  executed in this step.
+- A production run with `-XX:AOTCache=app.aot` (no `AOTMode` argument)
+  uses the cache to skip the load/link work for cached classes.
+- The AOT cache must be produced from the same JDK build that consumes
+  it; mismatches must be detected and rejected with a clear error.
+- An invalid or missing cache must not crash the JVM; on failure, the
+  JVM should fall back to running without the cache, optionally warning
+  the user.
+- Only classes that were loaded by the JDK's built-in class loaders
+  (boot, platform, application) during the training run can be cached.
+  Classes from user-defined class loaders are not cached.
+
+## Compatibility constraints (from the JEP)
+
+- Training and production runs must use the same JDK release, the same
+  CPU architecture, and the same operating system family.
+- Class paths and module configurations must match between training
+  and production runs (the production class path may extend the
+  training one).
+- Some module options (`--add-opens`, `--add-exports`,
+  `--add-modules`, etc.) must match.
+- JVMTI agents that rewrite classes (e.g., via `ClassFileLoadHook`)
+  may invalidate the cache; the JVM must detect such cases and fall
+  back to the default just-in-time class loading and linking.
+
+## Acceptance
+
+- The new options `-XX:AOTMode={off,record,create,auto,on}`,
+  `-XX:AOTConfiguration=<file>`, and `-XX:AOTCache=<file>` are
+  recognized and behave as described.
+- A training run followed by a create run produces a cache file that a
+  subsequent production run can consume to skip class loading and
+  linking for cached classes.
+- The feature is opt-in; running without these options must produce
+  the same observable behavior as today.
+- Existing `-Xshare`/CDS options continue to work where they did before.
+- Documented incompatibilities (different JDK build, mismatched class
+  path, JVMTI class transforms, etc.) cause the JVM to disable the AOT
+  cache with a clear diagnostic and fall back to ordinary class loading.

@@ -1,32 +1,119 @@
-# T19: gRPC
+# T19: gRPC C++ - Callback-based Async API (L67)
 
-**Summary**: gRPC C++ 现有的异步 API（基于 CompletionQueue）使用复杂，需要手动管理轮询和 RPC 生命周期。本任务要求实现回调式异步 API，让库在 RPC 操作完成时直接调用用户指定的回调函数，简化异步编程模型，同时保持高性能。
+*Upstream reference (inlined below):* https://github.com/grpc/proposal/blob/master/L67-cpp-callback-api.md plus implementation PR [grpc/grpc#25728](https://github.com/grpc/grpc/pull/25728). All details required to implement this task are inlined below; the agent does not need to consult external resources.
 
-**Motivation**: gRPC C++ 提供两种 API：同步 API 易于使用但性能受限于线程开销；CompletionQueue 异步 API 性能好但使用困难。CQ 模型要求用户显式轮询完成队列、手动请求新的服务器 RPC、管理复杂的生命周期状态。这导致很少有应用能充分利用其功能。许多用户已在 CQ 模型上自行封装回调机制，说明社区对简化异步 API 有强烈需求。
+## 1. Motivation
 
-**Proposal**: 实现基于回调的异步 API，采用"反应器"（Reactor）设计模式。为不同 RPC 类型（unary、client streaming、server streaming、bidi streaming）提供客户端和服务端反应器基类。用户继承这些基类，重写完成回调方法（如 `OnReadDone`、`OnWriteDone`、`OnDone`）即可实现异步逻辑。库内部管理 CompletionQueue 轮询，用户无需关心。
+For years gRPC C++ has exposed two service-style APIs:
 
-**Design Details**:
+1. **Synchronous (sync) API** — straightforward, but the thread pool needs to be large enough to cover every in-flight RPC.
+2. **Asynchronous (CompletionQueue / CQ) API** — scalable, but notoriously hard to use correctly; clients manage tag allocation, polling, lifetime, and cancellation by hand.
 
-1. 示例代码结构：在 `examples/cpp/helloworld/` 下创建回调示例。添加 `greeter_callback_client.cc` 演示客户端回调 API，添加 `greeter_callback_server.cc` 演示服务端回调 API。更新 BUILD、CMakeLists.txt、Makefile 构建这些示例。
+The **callback API** (L67) sits in between. It preserves the throughput of the async API while hiding tag/CQ mechanics: users implement **reactor** subclasses whose methods are invoked by gRPC when bytes are available, instead of polling a queue themselves. The callback API also shares infrastructure with the C++ `EventEngine` work, so it is the long-term successor to the CQ API.
 
-2. 客户端回调 API：在 `include/grpcpp/impl/codegen/client_context.h` 和 `src/cpp/client/client_context.cc` 中扩展 ClientContext。支持通过 `stub_->async()->Method(&context, &request, &response, callback)` 模式发起异步调用。
+## 2. Objectives
 
-3. 服务端回调 API：扩展 `include/grpcpp/server_builder.h` 和 `src/cpp/server/server_builder.cc`。支持注册回调式服务实现。服务实现类继承生成的回调服务基类。
+1. Provide a new high-level API for each RPC pattern (unary, client-streaming, server-streaming, bidi) using *reactors*.
+2. Guarantee that reactor callbacks are **serialised per-RPC** — i.e. at most one callback per reactor executes at a time.
+3. Remove the requirement for application-managed `CompletionQueue`s.
+4. Support both **server-side** (handlers) and **client-side** (stubs) with symmetric APIs.
+5. Coexist with the existing sync and async APIs; zero breakage for current users.
 
-4. Generic Stub 支持：更新 `include/grpcpp/generic/generic_stub.h` 支持 generic 回调调用。允许不依赖生成代码进行回调式 RPC。
+## 3. API surface
 
-5. Route Guide 示例：在 `examples/cpp/route_guide/` 下添加流式 RPC 的回调示例。`route_guide_callback_client.cc` 演示客户端流、服务端流、双向流的回调用法；`route_guide_callback_server.cc` 演示对应的服务端实现。
+### 3.1 Reactor base classes
 
-6. 端到端测试：更新 `test/cpp/end2end/` 下的测试。修改 `client_callback_end2end_test.cc` 测试客户端回调场景；更新 `test_service_impl.cc/h` 添加回调服务实现用于测试。
+```cpp
+// Server side
+template <class Req, class Resp>
+class ServerUnaryReactor {
+ public:
+  virtual void OnCancel() = 0;
+  virtual void OnDone()   = 0;
+  void Finish(Status);
+};
 
-7. 拦截器支持：更新 `test/cpp/end2end/client_interceptors_end2end_test.cc` 和 `interceptors_util.cc`，确保拦截器与回调 API 兼容。
+template <class Req, class Resp>
+class ServerWriteReactor {
+  void StartWrite(const Resp* resp);
+  void StartWriteAndFinish(const Resp* resp, WriteOptions, Status);
+  virtual void OnWriteDone(bool ok) {}
+  virtual void OnCancel() {}
+  virtual void OnDone() {}
+};
 
-8. 性能基准：在 `test/cpp/microbenchmarks/` 下添加回调 API 的基准测试。创建 `callback_streaming_ping_pong.h`、`callback_unary_ping_pong.h` 测量回调模式的性能。实现 `callback_test_service.cc/h` 作为基准测试服务。
+template <class Req, class Resp>
+class ServerReadReactor {
+  void StartRead(Req* req);
+  virtual void OnReadDone(bool ok) {}
+  virtual void OnCancel() {}
+  virtual void OnDone() {}
+  void Finish(Status);
+};
 
-9. QPS 测试：更新 `test/cpp/qps/` 下的 QPS 测试工具。添加 `client_callback.cc` 和 `server_callback.cc` 支持使用回调 API 进行性能测试。
+template <class Req, class Resp>
+class ServerBidiReactor {
+  void StartRead(Req* req);
+  void StartWrite(const Resp* resp);
+  void StartWriteAndFinish(const Resp*, WriteOptions, Status);
+  virtual void OnReadDone(bool ok)  {}
+  virtual void OnWriteDone(bool ok) {}
+  virtual void OnCancel();
+  virtual void OnDone();
+};
+```
 
-10. 平台兼容性：检查 `include/grpc/impl/codegen/port_platform.h` 确保回调 API 在支持的平台上正常工作。
+Corresponding client reactors:
+- `ClientUnaryReactor`, `ClientReadReactor`, `ClientWriteReactor`, `ClientBidiReactor`.
 
-## Requirement
-https://github.com/grpc/proposal/blob/master/L67-cpp-callback-api.md
+### 2.2 Client helpers
+
+Generated stubs expose new convenience methods:
+- `async()->MethodName(ClientContext*, Request*, Response*, std::function<void(Status)> callback);` for unary.
+- `async()->MethodName(ClientContext*, ClientReadReactor<Response>*);` for server-streaming.
+- Equivalent helpers for client-streaming and bidi.
+
+### 2.3 Server registration
+
+The service registration API gains a callback-based implementation:
+
+```cpp
+class ExampleService : public Example::CallbackService {
+ public:
+   grpc::ServerUnaryReactor* Echo(
+       grpc::CallbackServerContext* ctx,
+       const EchoRequest* req,
+       EchoResponse* resp) override {
+     auto* reactor = ctx->DefaultReactor();
+     reactor->Finish(grpc::Status::OK);
+     return reactor;
+   }
+};
+```
+
+The existing synchronous/async completion-queue services continue to work; the callback API is additive.
+
+## 4. Rules / Guarantees
+
+The proposal lists the thread-safety and lifetime rules enforced by the library:
+
+1. The library guarantees that `OnDone()` is the final callback invoked for a server reactor and `OnDone(Status)` for a client reactor.
+2. `StartCall()` on the client side must be called exactly once before any `StartRead`/`StartWrite`.
+3. Multiple concurrent `StartRead` or `StartWrite` invocations on the same reactor are illegal; one outstanding operation per direction is enforced.
+4. Reactors may live longer than the RPC itself — applications typically delete them in `OnDone`.
+5. Concurrent reactors across RPCs are allowed.
+
+## 5. Implementation Notes
+
+1. The gRPC core surface call layer gains callback dispatch paths so that `grpc_call_set_completion_queue` is not required for reactor-style calls.
+2. New top-level callback-common support header in the gRPC C++ public include tree; individual reactor types live in the gRPC C++ codegen callback headers (one per direction).
+3. The auto-generated stub/skeleton includes a `CallbackService` inner class with methods returning `::grpc::ServerUnaryReactor*`, `::grpc::ServerReadReactor<...>*` etc.
+4. The existing generic async stubs delegate to the callback implementation when CompletionQueues are not used.
+5. Documentation: update the C++ callback-API user docs and the hello-world example.
+
+## 6. Acceptance Criteria
+
+- `server_callback_end2end_test` and `client_callback_end2end_test` pass with the new implementation.
+- The C++ microbenchmark suite shows parity or better than the async CQ API for unary RPCs.
+- All four streaming modes (unary, server, client, bidi) can be implemented with only reactor-style code, no CQ plumbing in the sample.
+- Legacy `ClientAsyncReader/Writer/ReaderWriter` APIs continue to compile unchanged.

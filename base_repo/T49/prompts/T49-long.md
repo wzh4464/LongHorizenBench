@@ -1,85 +1,118 @@
-# T49: Kubernetes - 实现 Pod 资源就地垂直伸缩
+# T49: Kubernetes — In-Place Update of Pod Resources (KEP-1287)
 
-## Requirement
+## Requirement source
 
-https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/1287-in-place-update-pod-resources/README.md
-
-## Summary
-
-KEP-1287 实现了 Kubernetes Pod 的就地垂直伸缩功能，允许在不重启 Pod 或容器的情况下动态调整容器的 CPU 和内存资源请求与限制。这解决了传统方式下修改资源配置必须销毁并重建 Pod 的限制，对有状态工作负载和需要高可用性的服务尤为重要。
+Source: KEP-1287 ("In-Place Update of Pod Resources") in `kubernetes/enhancements/keps/sig-node/`. The KEP is the source of truth — implement to its specified API and behaviour. The information below summarises the KEP; you may consult the KEP for any detail not duplicated here.
 
 ## Motivation
 
-当前 Kubernetes 中，Pod 的资源配置（`resources.requests` 和 `resources.limits`）是不可变的。要调整资源，必须删除并重新创建 Pod，这会导致：
-- 服务中断，影响可用性
-- 有状态工作负载需要复杂的迁移流程
-- 批处理作业可能丢失进度
-- VPA（垂直 Pod 自动伸缩器）必须通过 eviction 实现伸缩
+Pod resource requests/limits are immutable today. Changing resource allocation for a running workload requires recreating the pod, which restarts the containers and disrupts in-flight work. KEP-1287 makes `spec.containers[*].resources.requests` and `.limits` mutable while the pod is running, with kubelet driving the actual cgroup updates and the API surface tracking both desired and actual state.
 
-就地伸缩允许：
-- 根据负载变化动态调整资源
-- 在业务低峰期释放资源供其他工作负载使用
-- 在不中断服务的情况下响应 OOM 压力
+## Goals
 
-## Proposal
+1. Allow `spec.containers[i].resources.requests` and `.limits` for `cpu` and `memory` to be changed via a dedicated `/resize` subresource on `Pod`.
+2. Let pod authors declare per-resource policy for resize: whether changing the value requires a container restart (`RestartContainer`) or can be applied in place (`NotRequired`).
+3. Track resize lifecycle in `Pod.Status` so that controllers and humans can see why a desired resize has not yet taken effect.
+4. Preserve the QoS class of the pod across resizes (no transitions between BestEffort, Burstable, and Guaranteed).
 
-将 `spec.containers[].resources` 字段改为可变（仅限 `cpu` 和 `memory`）。引入 `resizePolicy` 字段控制每种资源的调整行为。在 `status` 中添加 `allocatedResources`（已分配资源）、`resources`（实际生效资源）和 `resize`（伸缩状态）字段，实现资源状态的四层追踪：期望 -> 已分配 -> 已执行 -> 实际。
+## Non-goals
 
-## Design Details
+- Resizing GPUs / extended resources / hugepages.
+- Vertical autoscaling (HPA/VPA reuse the new API but are out of scope).
+- Resizing init or ephemeral containers.
 
-1. **API 类型扩展**：在 `staging/src/k8s.io/api/core/v1/types.go` 和 `pkg/apis/core/types.go` 中：
-   - 添加 `ContainerResizePolicy` 类型，包含 `resourceName` 和 `policy`（`RestartNotRequired` 或 `RestartContainer`）字段
-   - 在 `Container` 中添加 `ResizePolicy []ContainerResizePolicy` 字段
-   - 在 `ContainerStatus` 中添加 `Resources` 和 `ResourcesAllocated` 字段
-   - 在 `PodStatus` 中添加 `Resize PodResizeStatus` 字段（取值为 `Proposed`、`InProgress`、`Deferred`、`Infeasible`）
+## API surface
 
-2. **Feature Gate 注册**：在 `pkg/features/kube_features.go` 和 `staging/src/k8s.io/apiserver/pkg/features/kube_features.go` 中注册 `InPlacePodVerticalScaling` feature gate，Alpha 阶段默认关闭。
+A new container-level field `ResizePolicy` is added:
 
-3. **API Validation**：在 `pkg/apis/core/validation/validation.go` 中：
-   - 添加对 `resizePolicy` 的验证逻辑
-   - 实现资源变更的验证规则（仅允许 cpu/memory，不能改变 QoS 类别）
-   - 验证 `resourcesAllocated` 和 `resources` 字段
+```go
+type ContainerResizePolicy struct {
+    // ResourceName is the name of the resource ("cpu" or "memory").
+    ResourceName ResourceName
+    // RestartPolicy is "NotRequired" or "RestartContainer".
+    RestartPolicy ResourceResizeRestartPolicy
+}
 
-4. **Pod 工具函数**：在 `pkg/api/pod/util.go` 和 `pkg/api/v1/pod/util.go` 中：
-   - 添加资源变更检测函数
-   - 实现 feature gate 关闭时的字段剥离逻辑
+type Container struct {
+    // ... existing fields ...
+    ResizePolicy []ContainerResizePolicy
+}
+```
 
-5. **Kubelet 核心实现**：
-   - 在 `pkg/kubelet/kubelet.go` 中添加资源伸缩的协调逻辑
-   - 在 `pkg/kubelet/kubelet_pods.go` 中实现 Pod 资源分配和状态同步
-   - 添加资源伸缩的调度优先级逻辑
+The `Pod` type gets a new subresource, `resize`, accepting a partial pod spec that contains only `spec.containers[*].resources` (and the related ResizePolicy entries). Updates to `spec.containers[*].resources` directly on the main `Pod` resource are rejected.
 
-6. **容器管理器更新**：
-   - 在 `pkg/kubelet/cm/` 下更新 cgroup 管理器支持动态资源调整
-   - 修改 `helpers_linux.go`、`cgroup_manager_linux.go` 支持 cgroup 限制的动态更新
-   - 更新 `pod_container_manager_linux.go` 处理 Pod 级别的资源变更
-   - 在 `cpumanager/policy_static.go` 和 `memorymanager/policy_static.go` 中添加静态策略 Pod 的伸缩限制
+`PodStatus` gains:
+- `Resize` (string): one of `Proposed`, `InProgress`, `Deferred`, `Infeasible`, `""` (none).
+- `Resources` (per-container): the actual allocated resources after the most recent resize.
 
-7. **Kuberuntime 实现**：在 `pkg/kubelet/kuberuntime/` 中：
-   - 修改 `kuberuntime_container.go` 和 `kuberuntime_container_linux.go` 实现容器资源更新
-   - 在 `kuberuntime_manager.go` 中添加资源伸缩的协调逻辑
-   - 更新 `labels.go` 添加资源相关的标签
-   - 实现 `helpers.go` 和 `helpers_linux.go` 中的资源计算辅助函数
+## Behaviour
 
-8. **容器运行时接口**：在 `pkg/kubelet/container/` 中：
-   - 更新 `runtime.go` 添加资源更新接口
-   - 修改 `helpers.go` 支持资源状态查询
+The resize loop:
 
-9. **状态管理器**：在 `pkg/kubelet/status/` 中：
-   - 更新 `status_manager.go` 同步资源伸缩状态到 API server
-   - 在 `state/` 子目录实现资源状态的本地持久化（checkpoint）
+1. User submits `PUT /pods/<name>/resize` with the new `resources`.
+2. API server validates: not changing `requests`/`limits` to QoS-violating values, no add/remove of containers, only `cpu` / `memory` allowed.
+3. Pod's `status.resize` is set to `Proposed`.
+4. Kubelet on the assigned node observes the desired state and either:
+   - Accepts and applies via CRI `UpdateContainerResources`, transitions through `InProgress` to none.
+   - Rejects (insufficient node capacity) and sets `Deferred` (will retry) or `Infeasible` (won't retry).
+5. The container's `ResizePolicy` (per resource, per container) controls whether a restart is required to apply the new value.
 
-10. **调度器支持**：在 `pkg/scheduler/` 中：
-    - 更新 `framework/types.go` 添加资源伸缩相关的数据结构
-    - 修改 `framework/plugins/noderesources/fit.go` 支持伸缩资源的调度评估
-    - 更新 `internal/queue/scheduling_queue.go` 处理资源伸缩 Pod 的重新调度
+Restart policies for resize per resource:
+- `NotRequired`: kubelet attempts to apply the change without restarting the container. If the runtime cannot support an in-place update for that resource (e.g. some runtimes can resize CPU but not memory), kubelet falls back to `RestartContainer`.
+- `RestartContainer`: kubelet restarts the container as part of applying the change.
 
-11. **QoS 和 Eviction**：
-    - 在 `pkg/kubelet/qos/policy.go` 中更新 QoS 类别计算
-    - 在 `pkg/kubelet/eviction/helpers.go` 中添加资源伸缩的驱逐考虑
+`PodSpec` also gains `Resources` at the pod level (alpha-gated by `PodLevelResources`); resizing via the pod-level field is part of the same feature in newer iterations of the KEP.
 
-12. **ResourceQuota 支持**：在 `pkg/quota/v1/evaluator/core/pods.go` 和 `staging/src/k8s.io/apiserver/pkg/admission/plugin/resourcequota/controller.go` 中更新配额计算逻辑。
+## Status reporting
 
-13. **PLEG 更新**：在 `pkg/kubelet/pleg/` 中更新 Pod 生命周期事件生成器以支持资源变更事件。
+The following is added to `PodStatus`:
 
-14. **E2E 测试**：在 `test/e2e/node/pod_resize.go` 中添加全面的端到端测试用例。
+- `Resize` (string) — describes the current state of the resize operation: `""`, `Proposed`, `InProgress`, `Deferred`, `Infeasible`, `Error`.
+- `ContainerStatuses[i].Resources` — the resources currently active in the running container (as observed from the runtime), distinct from the desired `spec` values.
+- `ContainerStatuses[i].AllocatedResources` — the resources kubelet has admitted (may differ from `spec.containers[i].resources` while a resize is being processed).
+
+## Resize subresource
+
+To make changes a kubelet can act on, the API server adds a `resize` subresource on Pods. Only `spec.containers[*].resources` (and the per-pod-level resources, when applicable) and `spec.containers[*].resizePolicy` are mutable through this subresource.
+
+Each container has a per-resource `ResizePolicy` list:
+
+```go
+type ContainerResizePolicy struct {
+    ResourceName  ResourceName               // "cpu" or "memory"
+    RestartPolicy ResourceResizeRestartPolicy // "NotRequired" | "RestartContainer"
+}
+```
+
+Defaults: `RestartContainer` for memory; `NotRequired` for CPU.
+
+## Feature gate
+
+`InPlacePodVerticalScaling` (kubelet, kube-apiserver, kube-controller-manager). When the gate is off, the new fields are dropped on POST/PUT and the `/resize` subresource is unregistered. There is also a `InPlacePodVerticalScalingExclusiveCPUs` gate that scopes the feature on nodes using exclusive CPU pinning.
+
+## Kubelet behaviour
+
+Kubelet uses the per-container `ResizePolicy` to decide between an in-place cgroup update via the runtime's `UpdateContainerResources` CRI call, and a restart-driven update. Resize requests that cannot be satisfied within the node's available capacity are deferred or marked infeasible; a status condition `PodResizeInProgress` is emitted while a resize is being applied.
+
+## Test plan
+
+Per the KEP, tests cover: API validation under feature-gate flips, default values for `ResizePolicy`, conflict detection between resources and limits, the new `/resize` subresource, kubelet `UpdateContainerResources` integration, scheduler accounting against allocated rather than requested resources, and end-to-end pod-resize scenarios (CPU-only, memory-only, restart-required, deferred, infeasible).
+
+## Implementation scope
+
+Implementations must touch (in summary):
+
+1. The core API: add `Resources` and `ResizePolicy` to the container spec; add `AllocatedResources` and per-container resize status to `PodStatus`; register the `/resize` subresource.
+2. API server validation, defaulting, drop-on-no-feature-gate logic, and the `/resize` subresource handlers.
+3. Kubelet: on observing a resize, plan whether the change can be applied in-place, ask the runtime via the CRI `UpdateContainerResources` call, observe success/failure, and update `PodStatus`. Honour `RestartContainer` semantics when the policy demands it.
+4. Scheduler: account for `Pod.Status.AllocatedResources` (rather than spec) so that pending resizes do not over-commit a node.
+5. CRI: pass the new resource configuration through to the container runtime.
+
+The KEP intentionally leaves package and file layout to the implementer; do not invent specific paths beyond what the KEP itself references in its design discussion (such as the kubelet's container manager or the CRI plumbing).
+
+## Acceptance / verification
+
+- Patching a running pod's container resources via the `/resize` subresource succeeds when the node has capacity, with no container restart for `NotRequired` policies.
+- Resizes that exceed node capacity are reported as `Deferred` or `Infeasible` via the per-container resize status.
+- The pod's QoS class is preserved across in-place resize.
+- Disabling the `InPlacePodVerticalScaling` feature gate hides the resize subresource and ignores any resize fields in the spec.

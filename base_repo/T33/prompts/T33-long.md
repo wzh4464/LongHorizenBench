@@ -1,48 +1,131 @@
-# T33: OpenJDK
+# T33: OpenJDK / JEP 500 — Prepare to Make `final` Mean Final
 
-**Summary**: Java 的 `final` 字段本意是表示不可变，但当前反射 API（`Field.set`）和 JNI 允许修改 final 字段的值。JEP 500 提出逐步限制对 final 字段的修改能力，在过渡期内通过警告、命令行选项和 JFR 事件帮助开发者识别和修复依赖此行为的代码，最终目标是让 final 真正意味着不可变。
+(Note: this task uses JEP 500 in the canonical CSV mapping. JEP 500
+prepares the JDK to enforce immutability of `final` fields against
+deep reflection, by introducing diagnostic flags and warnings that
+will eventually become the default.)
 
-**Motivation**: final 字段的不可变性对于 JVM 优化（如常量折叠、内联）和程序正确性至关重要。然而，当前可以通过 `Field.setAccessible(true)` 后调用 `Field.set()` 修改 final 实例字段，也可以通过 JNI `SetField` 函数修改任意 final 字段。这破坏了 final 的语义保证，阻碍了 JIT 优化，也是潜在的安全隐患。需要一个渐进的迁移路径，让用户有时间更新代码。
+## Requirement source
 
-**Proposal**: 为反射修改 final 字段引入可配置的行为模式（allow/warn/debug/deny），通过命令行选项 `--sun-misc-unsafe-memory-access` 和模块系统的 `--add-opens` 控制。同时增加 JFR 事件记录 final 字段修改，帮助诊断问题。对于特殊的"可变静态 final 字段"（如 `System.in/out/err`）保持允许修改。JNI 侧增加警告日志和检查。
+This task is sourced from JEP 500 ("Prepare to Make `final` Mean
+Final"). All behavioural requirements are taken from that JEP. The
+text of the JEP is summarized below; the agent must not invent
+additional implementation details that are not in the JEP.
 
-**Design Details**:
+## Goals (per the JEP)
 
-1. 命令行参数处理：在 `src/hotspot/share/runtime/arguments.cpp` 中解析新的命令行选项，支持配置 final 字段修改的行为模式。在 `src/java.base/share/classes/sun/launcher/` 下更新启动器帮助信息和属性文件。
+- Prepare the JDK and the Java ecosystem for a future change in which
+  the `final` modifier on a field really does prevent that field
+  from being mutated through deep reflection.
+- Issue runtime warnings when deep reflection is used to mutate a
+  `final` field, so that authors of libraries and applications can
+  identify and remove such uses ahead of the future change.
+- Provide a way for users and library authors to opt in to the new
+  behaviour today, both for testing and for selectively suppressing
+  warnings.
+- Continue to allow Java serialization and other JDK-internal APIs
+  that legitimately need to assign to `final` fields to do so without
+  warnings.
 
-2. 核心 API 修改：
-   - `java.lang.reflect.Field`：修改 `set()` 方法，在修改 final 字段时根据配置发出警告或抛出异常
-   - `java.lang.reflect.AccessibleObject`：更新 `setAccessible()` 的行为和文档
-   - `java.lang.invoke.MethodHandles`：更新 `unreflectSetter` 对 final 字段的处理
-   - 添加文档 `doc-files/MutationMethods.html` 说明变更
+## Non-goals (per the JEP)
 
-3. 可变静态 final 字段识别：
-   - `src/hotspot/share/runtime/fieldDescriptor.cpp/hpp`：添加 `is_mutable_static_final()` 方法识别特殊字段（System.in/out/err）
-   - `src/hotspot/share/ci/ciField.cpp`：更新 JIT 常量折叠逻辑，使用新的判断方法
+- Removing the ability to mutate final fields entirely. That is for a
+  later release.
+- Changing `javac` or any source-level semantics.
+- Changing the meaning of `final` in the Java language.
+- Affecting normal Java code that does not use deep reflection,
+  `Unsafe`, or JNI to write to final fields.
 
-4. 模块系统集成：
-   - `java.lang.Module` 和 `java.lang.ModuleLayer`：支持模块级别的配置
-   - `jdk.internal.module.ModuleBootstrap` 和 `Modules`：启动时处理相关配置
-   - `jdk.internal.access.JavaLangAccess` 和 `JavaLangReflectAccess`：内部访问接口更新
+## What "deep reflection" means here
 
-5. JFR 事件：
-   - 在 `jdk.internal.event` 和 `jdk.jfr` 包下添加 `FinalFieldMutationEvent` 类
-   - 更新 `JDKEvents.java`、`MirrorEvents.java`、`PlatformEventType.java` 注册新事件
-   - 修改 `default.jfc` 和 `profile.jfc` 配置文件
+The mechanisms targeted by JEP 500 are those that bypass normal access
+control to write to a `final` field:
 
-6. JNI 检查增强：
-   - `src/hotspot/share/prims/jni.cpp`：在 `SetField`/`SetStaticField` 系列函数中添加 final 字段修改的日志记录
-   - `src/hotspot/share/prims/jniCheck.cpp`：添加 final 字段修改的警告检查
+- `java.lang.reflect.Field.setAccessible(true)` followed by `Field.set*`
+- `java.lang.invoke.MethodHandles.Lookup.unreflectSetter` /
+  `findSetter` etc. on a final field, used to obtain a write
+  method-handle.
+- `sun.misc.Unsafe` / `jdk.internal.misc.Unsafe` final-field writes.
+- JNI `SetField` / `SetStaticField` family on a final field.
 
-7. 测试用例：在 `test/jdk/java/lang/reflect/Field/` 下添加完整的测试覆盖：
-   - `mutateFinals/MutateFinalsTest.java`：核心功能测试
-   - `mutateFinals/FinalFieldMutationEventTest.java`：JFR 事件测试
-   - `cli/CommandLineTest.java`：命令行选项测试
-   - `jar/ExecutableJarTest.java`：可执行 JAR 场景测试
-   - `jni/JNIAttachMutatorTest.java`：JNI 场景测试
-   - `modules/`：模块系统相关测试
+JEP 500 takes the position that all of these break the integrity that
+the language is supposed to give `final` and so should be controlled.
 
-8. HotSpot JNI 测试：在 `test/hotspot/jtreg/runtime/jni/mutateFinals/` 下添加原生测试。
+## Required behaviour
 
-## Requirement
-https://openjdk.org/jeps/500
+The JDK introduces a new launcher option:
+
+```
+--enable-final-field-mutation=<modules>
+```
+
+with a paired option that controls whether mutation is implicitly
+permitted (`ALL-UNNAMED` etc.) and a related JFR/JFR-style logging
+mode. The exact set of values and the option name(s) follow the JEP:
+
+- `--enable-final-field-mutation=ALL-UNNAMED` — opt every class loaded
+  from the unnamed module (i.e., the classpath) into being allowed to
+  mutate `final` fields without a warning.
+- `--enable-final-field-mutation=<module>=<allow|deny>` (or the
+  equivalent name used in JEP 500) — opt a specific named module in
+  or out.
+- A complementary `--illegal-final-field-mutation=<warn|deny|debug|allow>`
+  control sets the default action when code that has not been
+  explicitly enabled tries to mutate a `final` field (the JEP
+  introduces this as the diagnostic / transition control).
+
+The JEP also adds a JDK Flight Recorder event,
+`jdk.FinalFieldMutation`, that records each mutation site so that
+users can audit their applications.
+
+## Behavior
+
+1. Calling `Field.setAccessible(true)` followed by `Field.set(...)`
+   on a `final` field, or any other deep-reflection or `Unsafe`-based
+   path that writes a `final` instance/static field of a class loaded
+   from a module/classpath that has not opted in, must raise a
+   warning by default.
+2. The warning identifies the field, the caller, and tells the user
+   how to opt the caller's module in if the mutation is intentional.
+3. With `--illegal-final-field-mutation=deny` (or equivalent),
+   mutation through deep reflection on a final field throws an
+   `IllegalAccessException` (for the reflective `Field.set` path) or
+   the analogous error for `MethodHandle`-based writes.
+4. Modules listed in `--enable-final-field-mutation=...` retain
+   today's behaviour (mutation succeeds silently).
+5. The JDK's own internal serialization machinery and the existing
+   `--add-opens` / `--add-exports` rules continue to work; the
+   restriction here is specifically about mutating `final` fields,
+   not about reading or invoking them.
+
+## Required behavior
+
+- The new launcher option `--enable-final-field-mutation` and the
+  related `--illegal-final-field-mutation` mode flag are recognized
+  by the `java` launcher.
+- When the JVM is started without opting in, a deep-reflection write
+  to a `final` field of a non-record, non-hidden class results in
+  the configured behaviour (warning by default; `deny` throws).
+- The JFR event for final-field mutations is emitted whenever an
+  illegal mutation is attempted, regardless of whether the JVM
+  permits or rejects the mutation.
+- Existing code that legitimately needs to mutate `final` fields
+  (e.g. deserialization, mocking frameworks) can continue to work
+  by passing the appropriate command-line option or configuring an
+  opt-in via the manifest entry `Enable-Final-Field-Mutation: true`.
+
+## Acceptance
+
+- A program that uses `Field.setAccessible(true)` followed by
+  `Field.set` on a non-record final field produces the expected
+  diagnostic / exception according to `--illegal-final-field-mutation`.
+- The same program, when run with
+  `--enable-final-field-mutation=ALL-UNNAMED`, executes without a
+  warning or exception (the legacy behavior).
+- The JDK ships `jdk.FinalFieldMutation` JFR events so that recordings
+  can identify offending code paths.
+- Calls into `java.io.ObjectInputStream` and similar internal users
+  of final-field writes continue to work because they are issued from
+  code that is implicitly enabled for final field mutation.
+- `MethodHandle`-based writes through `findSetter`/`Lookup` follow the
+  same restrictions.

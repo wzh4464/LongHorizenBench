@@ -1,27 +1,118 @@
-**Summary**: G1 垃圾收集器当前在 JNI 关键区（critical region）期间无法执行垃圾回收，导致线程因等待 GC Locker 而出现长时间延迟。JEP 423 提出实现 Region Pinning 机制，允许 G1 在包含被 JNI 固定对象的 region 上跳过疏散（evacuation），从而在 JNI 关键区期间仍能执行 GC，减少延迟。
+# T09: OpenJDK — JEP 423 Region Pinning for G1
 
-**Motivation**: 当 Java 线程进入 JNI 关键区（通过 GetPrimitiveArrayCritical 等函数）时，它获得了直接访问 Java 堆中数组数据的指针。当前 G1 使用 GC Locker 机制在此期间阻止所有 GC 活动，因为对象移动会使 JNI 指针失效。然而，这种全局阻止策略在高并发场景下会导致严重的 GC 延迟，特别是当多个线程频繁使用 JNI 关键区时。Region Pinning 提供了一种更细粒度的解决方案：只跳过包含被固定对象的 region 的疏散，其他 region 的 GC 照常进行。
+## Requirement source
 
-**Proposal**: 在 G1 中实现 Region Pinning 机制：(1) 为每个 HeapRegion 添加固定对象计数器，在对象被 JNI 固定/解固定时增减；(2) 修改 Collection Set 选择逻辑，将包含固定对象的 region 标记为不可疏散；(3) 在疏散过程中，对于固定 region 中的非固定对象进行原地标记而不移动；(4) 移除 GC Locker 相关的等待和触发 GC 逻辑；(5) 实现固定 region 的生命周期管理，确保长期固定的 region 不会无限期保留在 Collection Set 候选列表中。
+JEP 423 ("Region Pinning for G1") on https://openjdk.org/jeps/423 .
+The text below paraphrases that specification; do not invent
+implementation details that are not implied by it.
 
-**Design Details**:
+## Goals (from the JEP)
 
-1. HeapRegion 固定计数：在 `HeapRegion` 类中添加 `_pinned_object_count` 原子计数器。实现 `increment_pinned_object_count()` 和 `decrement_pinned_object_count()` 方法。添加 `has_pinned_objects()` 方法检查 region 是否包含固定对象。
+- Eliminate stalls of Java threads caused by JNI critical regions when
+  G1 is in use.
+- Implement region pinning in G1 so that JNI critical regions do not
+  prevent the rest of the heap from being collected.
+- Avoid regressions in throughput, latency, or memory footprint when no
+  JNI critical region is active.
 
-2. G1CollectedHeap 固定接口：重新实现 `pin_object` 和 `unpin_object` 方法，改为增减目标对象所在 region 的固定计数，而不是使用 GC Locker。添加类型检查确保只有 typeArray 可以被固定（这是 JNI 规范允许的类型）。
+## Non-goals
 
-3. 移除 GC Locker 依赖：从 `G1CollectedHeap::attempt_allocation_slow` 和 `attempt_allocation_humongous` 中移除 GC Locker 检查和等待逻辑。从 `do_full_collection`、`do_collection_pause_at_safepoint` 等方法中移除 GC Locker 检查。简化分配失败后的重试逻辑。
+- Region pinning for collectors other than G1.
+- Changes to the JNI critical-region API itself.
 
-4. Region Attribute 扩展：在 `G1HeapRegionAttr` 中添加固定状态标志位。创建 `set_is_pinned` 和相关方法。在将 region 注册到 Collection Set 时记录其固定状态。
+## Background (paraphrased)
 
-5. Collection Set 选择修改：在 `G1Policy::select_candidates_from_marking` 和 `select_candidates_from_retained` 中添加固定 region 的处理逻辑。将固定的 marking candidates 移动到 retained candidates 以保持混合 GC 进度。对于长期固定的 retained candidates，在一定次数后从候选列表中移除。
+Java code may enter a JNI critical region via `GetPrimitiveArrayCritical`,
+`GetStringCritical`, etc. While inside such a region, the JVM must keep
+the underlying object at a fixed address until the matching `Release...`
+call. Today, G1 deals with this by disabling garbage collection entirely
+while any thread is inside a critical region (the so-called GC-locker).
+This means a long critical region can stall every Java thread that
+needs allocation and trigger out-of-memory errors even when most of the
+heap is reclaimable.
 
-6. 疏散失败处理增强：扩展 `G1EvacFailureRegions` 类区分固定导致的跳过和分配失败导致的疏散失败。添加 `_regions_pinned` 和 `_regions_alloc_failed` 位图。更新 `record` 方法接受失败原因参数。
+Pinning, used by Shenandoah and ZGC, lets the collector run while the
+critical regions are live: the regions containing pinned objects are
+simply excluded from evacuation, but everything else is collected
+normally.
 
-7. 年轻代 region 处理：年轻代固定 region 仍然留在 Collection Set 中，但跳过疏散。在 `G1YoungCollector` 中处理固定年轻 region 的特殊逻辑。固定 region 中非固定对象保持原地，只更新标记。
+## Goal of this task
 
-8. GC Phase Times 更新：在 `G1GCPhaseTimes` 中添加固定相关的统计信息：固定 region 数量、因固定跳过的字节数等。在 GC 日志中报告固定相关信息。
+Extend G1 so that JNI critical regions no longer rely on the GC-locker /
+disable-GC mechanism. Instead, the regions that contain objects locked by
+active JNI critical sections are pinned, the rest of the heap is
+collected as usual, and only the pinned regions are skipped during
+evacuation.
 
-9. 全局参数：添加 `G1NumCollectionsKeepPinned` 参数控制固定 region 在 retained candidates 中保留的最大 GC 次数。
+## Behavioural requirements
 
-10. 测试：编写测试验证 JNI 关键区期间 GC 可以正常执行。测试固定 region 的疏散跳过逻辑。测试长期固定 region 的候选列表清理逻辑。
+- Maintain a per-region count of how many objects in that region are
+  currently the target of an active JNI critical section. Each
+  `GetPrimitiveArrayCritical`/`GetStringCritical` (and equivalent)
+  increments this counter on the region of the referenced object;
+  the matching `Release*Critical` decrements it.
+- A region whose count is greater than zero is "pinned". A pinned
+  region must not be relocated, evacuated, or have its objects moved.
+  Both young and old generation regions can become pinned.
+- When a young collection or mixed collection encounters a pinned
+  region, that region is left in place. For young collections this
+  must still produce correct results: pinned young regions remain
+  reachable as roots from the rest of the heap.
+- Concurrent marking and old-generation reclamation continue to work
+  on non-pinned regions while some regions are pinned.
+- Once a region's pin count returns to zero it again becomes a
+  candidate for the next collection (subject to the usual G1
+  policies).
+- The existing GC-locker-based path may remain as a fallback for full
+  GCs that have to relocate every region (e.g., heap shrink or
+  diagnostic full GCs), but normal young/mixed cycles must no longer
+  block on JNI critical sections.
+
+## Required behavior
+
+- A Java thread entering a JNI critical region (via `GetPrimitiveArrayCritical`,
+  `GetStringCritical`, etc.) does not block waiting for an in-progress
+  garbage collection, and conversely, a garbage collection started while a
+  thread is in a critical region is not stalled until that thread exits the
+  region. Both can make progress concurrently.
+- Pinned regions are correctly accounted for in heap-occupancy and
+  eden/survivor sizing computations.
+- Heap dumps, GC logs, and JFR/runtime monitoring should reflect that
+  regions are pinned (region state visible in standard diagnostic output).
+- The change is transparent to existing JNI applications: no API change,
+  just better latency characteristics under JNI critical sections.
+
+## Goals (verbatim, paraphrased from the JEP)
+
+- Java threads should never have to wait for a G1 collection to finish
+  because of JNI critical sections in other threads.
+- G1 should be able to do GC while threads are inside JNI critical
+  regions, by leaving the regions that contain critical objects in
+  place rather than moving them.
+- No regression in pause-time targets when no JNI critical region is
+  active.
+- No regression in steady-state throughput.
+
+## Non-goals (from the JEP)
+
+- This work targets G1 only. Other collectors (Parallel, Serial,
+  Shenandoah, ZGC) are out of scope.
+- It does not add new JNI APIs or change critical-region semantics
+  visible to the application.
+
+## Acceptance criteria
+
+- Threads entering and leaving JNI critical regions no longer
+  block GC, and GC threads no longer block on JNI critical
+  regions.
+- A young collection running while a JNI critical region is held in
+  the young generation succeeds: the pinned young region(s) are
+  excluded from evacuation and become "kept" (treated similarly to
+  evacuation-failure regions); the remaining young regions are
+  collected.
+- A full GC running while a JNI critical region is held in the old
+  generation succeeds: the pinned region is left untouched, and the
+  remaining old regions are reclaimed/compacted as usual.
+- Existing JNI critical-region semantics are preserved, including the
+  rules around what is permitted inside a critical section.
+- All existing G1 tests pass.

@@ -1,43 +1,92 @@
-# T42: CPython - PEP 810 Lazy Imports
+# T42: CPython - PEP 810 Explicit Lazy Imports
 
-**Summary**: PEP 810 引入了显式延迟导入（Lazy Imports）语法，通过 `lazy` 软关键字允许开发者将特定的 import 语句标记为延迟执行。当使用 `lazy import module` 或 `lazy from module import name` 时，模块不会在 import 语句处立即加载，而是创建一个 `LazyImportType` 代理对象，在首次访问该名称时才真正加载模块。
+## Requirement (PEP 810 - inlined; no external network access required)
 
-**Motivation**: 大型 Python 应用程序的启动时间和内存消耗是常见的性能瓶颈。许多模块在程序启动时被导入，但可能在整个运行过程中从未被使用。延迟导入机制允许开发者显式标记可以延迟加载的模块，从而：
-1. **减少启动时间**：实际测试显示命令行工具可减少 50-70% 的启动时间
-2. **降低内存占用**：大型应用可节省 30-40% 的内存
-3. **保持语义明确**：通过显式的 `lazy` 关键字，代码的行为清晰可预测
+PEP 810 introduces an explicit `lazy import` syntax for Python modules. The
+existing `import` statement always evaluates the imported module eagerly;
+the new `lazy import` form defers the actual import until the imported name
+is first used. This reduces startup time for applications that import many
+optional or rarely-used modules, while preserving today's `import`
+semantics for everything that is not annotated `lazy`.
 
-**Proposal**: 在 Python 语法中添加 `lazy` 软关键字，支持 `lazy import` 和 `lazy from ... import` 语句。引入新的 `types.LazyImportType` 类型作为延迟导入的代理对象。提供全局控制机制（命令行选项 `-X lazy_imports` 和环境变量 `PYTHON_LAZY_IMPORTS`）以及运行时 API（`sys.set_lazy_imports()`、`sys.get_lazy_imports()`、`sys.set_lazy_imports_filter()`、`sys.get_lazy_imports_filter()`）来控制延迟导入行为。同时添加 `ImportCycleError` 异常用于处理延迟导入引起的循环导入错误。
+## Motivation
 
-**Design Details**:
+Real-world Python startup is dominated by transitive imports that may
+never be exercised at runtime — CLI tools that load large optional
+dependencies behind subcommands, plugin systems that touch every plugin
+during discovery, etc. Implementations have long resorted to ad-hoc
+lazy-import shims, but those are fragile, hard to reason about, and easy
+to mis-use. PEP 810 gives the language a single, explicit, opt-in syntax
+that delivers the optimisation reliably.
 
-1. **语法扩展（Grammar）**：修改 `Grammar/python.gram`，为 import 语句添加可选的 `lazy` 前缀。`lazy` 作为软关键字，仅在 import 语句前有特殊含义，其他地方仍可作为普通标识符使用。需要处理 `lazy import module`、`lazy from module import names` 等形式，但不支持 `lazy from module import *`。
+## Syntactic surface
 
-2. **AST 扩展**：修改 `Parser/Python.asdl`，在 `Import` 和 `ImportFrom` AST 节点中添加 `is_lazy` 字段。更新 `Parser/action_helpers.c` 中的 AST 构建代码。
+`lazy` becomes a soft keyword that legally precedes only `import` and
+`from … import` statements at module scope. All four spellings are
+permitted:
 
-3. **LazyImportObject 实现**：创建 `Objects/lazyimportobject.c`，实现 `LazyImportType` 类型。该代理对象存储原始 import 语句的信息，在首次访问时触发实际的模块加载（reification）。需要处理属性访问、比较操作等，并在 reification 时正确设置全局命名空间。
+```
+lazy import os
+lazy import os.path as p
+lazy from os import path
+lazy from os import path as p
+```
 
-4. **编译器修改**：
-   - 修改 `Python/symtable.c` 添加延迟导入的符号表处理
-   - 修改 `Python/compile.c` 和 `Python/codegen.c` 生成延迟导入的字节码
-   - 添加新的字节码指令或修改现有 `IMPORT_NAME`/`IMPORT_FROM` 指令以支持延迟语义
+Imports inside function bodies and class bodies are unaffected: they
+remain eager, even if textually preceded by `lazy`. The grammar must
+reject `lazy` in any other position.
 
-5. **字节码解释器修改**：修改 `Python/bytecodes.c` 和 `Python/ceval.c`，实现延迟导入的运行时行为。当执行延迟 import 时，创建 `LazyImportType` 对象而非立即导入模块。
+## Semantics
 
-6. **运行时控制 API**：
-   - 在 `Python/sysmodule.c` 中实现 `sys.set_lazy_imports()`、`sys.get_lazy_imports()`、`sys.set_lazy_imports_filter()`、`sys.get_lazy_imports_filter()`
-   - 定义 `PyImport_LazyImportsMode` 枚举和相关 C API
-   - 修改 `Python/initconfig.c` 处理命令行选项和环境变量
+A `lazy import` produces a binding to a *lazy proxy* in the surrounding
+module's namespace. Reading the proxy triggers the actual import, which:
 
-7. **ImportCycleError 异常**：在 `Objects/exceptions.c` 中添加 `ImportCycleError` 异常类，作为 `ImportError` 的子类，用于报告延迟导入导致的循环导入错误。更新异常层次结构文档。
+1. Performs the same import machinery as the eager statement would.
+2. Replaces the binding in the module namespace with the resolved object.
+3. Returns the resolved object to the original caller as if it had been
+   imported eagerly.
 
-8. **types 模块更新**：在 `Lib/types.py` 和 `Modules/_typesmodule.c` 中暴露 `LazyImportType` 类型，使用户可以通过 `types.LazyImportType` 检测延迟导入对象。
+Concurrent reads from multiple threads must observe the same fully
+imported object (the proxy must use double-checked locking or an
+equivalent mechanism). If the deferred import raises, subsequent reads
+raise the same exception until the exception is explicitly cleared via
+`importlib.invalidate_caches()` and a re-attempted access.
 
-9. **文档更新**：
-   - 更新 `Doc/reference/simple_stmts.rst` 添加 lazy imports 章节
-   - 更新 `Doc/reference/lexical_analysis.rst` 添加 `lazy` 软关键字说明
-   - 更新 `Doc/library/sys.rst` 添加新 API 文档
-   - 更新 `Doc/using/cmdline.rst` 添加命令行选项说明
-   - 更新 `Doc/whatsnew/3.15.rst` 添加新特性说明
+`from a.b import c` defers to first access of `c`. The `a.b` module must
+load lazily as well (i.e. the deferred import covers both the package
+import and the attribute lookup).
 
-10. **测试**：在 `Lib/test/test_import/` 下创建 `test_lazy_imports.py` 及相关测试数据文件，全面测试延迟导入的语法解析、运行时行为、全局模式控制、过滤器功能、错误处理等场景。
+The standard `__getattr__`/`__class__` of a module observe the proxy as
+the module attribute until first access; tools that want the live object
+should call `getattr(module, "name")`, which triggers the import.
+
+## Affected machinery
+
+The implementation must:
+
+1. Add new opcodes that perform lazy import in place of `IMPORT_NAME`
+   when the source `lazy_import` flag is set; emit them from the
+   compiler when it sees the `lazy` keyword.
+2. Add a `LazyImportType` (or equivalent proxy object) that represents an
+   unresolved import in module dictionaries. Reading the proxy triggers
+   the import, replaces the module-dict entry, and returns the resolved
+   value.
+3. Wire `lazy import` through the existing import system so that hooks,
+   `sys.modules`, finders, and loaders behave identically to an eager
+   import once resolution occurs.
+
+## Tests and docs
+
+- Tests cover: module-level `import lazy x`, `from x import y` lazy form,
+  failure paths, threading races, interaction with `__init__.py`, and
+  interaction with `importlib.reload`.
+- Documentation covers the language reference (the new `lazy` keyword) and
+  the import system reference.
+
+## Acceptance
+
+* Existing test suite passes with no regressions.
+* `lazy import foo` defers the module load until the name is first used.
+* Failing lazy imports surface the original exception at use site.
+* Reflection (`sys.modules`, `inspect.getmodule`) returns the resolved
+  module after the lazy proxy has been triggered.

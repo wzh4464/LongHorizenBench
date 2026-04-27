@@ -1,51 +1,147 @@
-# T43: Kubernetes - KEP-4960 Container Stop Signals
+# T43: Kubernetes — Configurable Container Stop Signals (KEP-4960)
 
-**Summary**: KEP-4960 提出在 Kubernetes 的容器规范中添加可配置的停止信号（Stop Signal）支持，允许用户在 Pod 定义中指定容器停止时使用的信号，而无需重新构建镜像。该特性通过在 `Container.Lifecycle` 中添加 `StopSignal` 字段实现，并在容器状态中报告实际使用的停止信号。
+## Requirement source
 
-**Motivation**: 当前 Kubernetes 停止容器时使用的信号由容器镜像的 `STOPSIGNAL` 指令或容器运行时的默认值（通常是 SIGTERM）决定。这存在以下问题：
-1. **灵活性不足**：用户无法在不修改镜像的情况下更改停止信号
-2. **镜像依赖**：许多第三方镜像可能没有正确设置 `STOPSIGNAL`，导致容器无法优雅关闭
-3. **场景限制**：某些应用程序（如需要 SIGUSR1 的自定义应用）需要特定的停止信号来执行清理操作
+The behaviour to implement is defined by KEP-4960, "Container Stop Signals", in the
+`kubernetes/enhancements` repository (sig-node). This file inlines the parts of the
+KEP that drive the implementation. Use the KEP as the source of truth; do not invent
+file paths, type names, or test locations beyond what is described here.
 
-**Proposal**: 通过 `ContainerStopSignals` feature gate 控制，在容器的 `Lifecycle` 结构中添加 `StopSignal` 字段。该字段接受符合 Go `syscall.Signal` 格式的字符串值（如 "SIGTERM"、"SIGUSR1"）。停止信号的优先级为：容器规范中的 StopSignal > 镜像中的 STOPSIGNAL > 容器运行时默认值。同时在 `ContainerStatus` 中添加 `StopSignal` 字段以报告实际使用的停止信号。
+## 1. Summary
 
-**Design Details**:
+OCI container images can declare a stop signal (Docker's `STOPSIGNAL`); container
+runtimes use that signal to terminate the container, falling back to `SIGTERM`
+when the image does not declare one. Today there is no way for a Kubernetes user
+to override the stop signal for a container without rebuilding the image, and
+the value the runtime will actually use is not visible through the Kubernetes
+API.
 
-1. **API 类型扩展**：
-   - 在 `pkg/apis/core/types.go` 的 `Lifecycle` 结构体中添加 `StopSignal *string` 字段
-   - 在 `staging/src/k8s.io/api/core/v1/types.go` 的外部 API 类型中添加对应字段
-   - 在 `ContainerStatus` 结构体中添加 `StopSignal string` 字段用于状态报告
-   - 运行 `make generate` 更新 deepcopy、conversion 和 protobuf 代码
+KEP-4960 adds:
 
-2. **Feature Gate 注册**：在 `pkg/features/kube_features.go` 中注册 `ContainerStopSignals` feature gate，Alpha 阶段默认关闭。
+1. A new optional `StopSignal` lifecycle field on a container spec, allowing a
+   pod author to override the stop signal at the spec level.
+2. A new `StopSignal` field on container status that reflects the effective
+   stop signal the runtime will use (image value, spec value, or runtime
+   default — whichever applies).
+3. A propagation path through the CRI to the runtime, so that the runtime can
+   honour the user-supplied signal during termination.
 
-3. **字段剥离逻辑（Drop Logic）**：在 `pkg/api/pod/util.go` 中实现 `dropContainerStopSignals()` 函数：
-   - 当 feature gate 关闭时，剥离 `Lifecycle.StopSignal` 字段
-   - 实现 `containerStopSignalsInUse()` 函数检测已有数据中是否使用了该字段（ratcheting 场景）
-   - 修改 `dropPodLifecycleSleepAction()` 中的 Lifecycle nil 检查逻辑，确保考虑 StopSignal 字段
+The change is gated by a new feature gate, `ContainerStopSignals`.
 
-4. **API Validation**：在 `pkg/apis/core/validation/validation.go` 中添加验证逻辑：
-   - 验证 `StopSignal` 值可解析为有效的信号名称
-   - Linux Pod 支持标准 POSIX 信号
-   - Windows Pod 仅支持 SIGTERM 和 SIGKILL
-   - 要求 Pod 必须设置 `spec.os.name` 才能使用 StopSignal
+## Goals
 
-5. **CRI API 扩展**：在 `staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto` 中，向 `ContainerConfig` 添加 `stop_signal` 字段，使 kubelet 能够将信号配置传递给容器运行时。
+- Let users configure custom stop signals per container without modifying the
+  image.
+- Surface the effective stop signal in container status so operators can see
+  what signal will actually be sent.
+- Pass the configured signal to the container runtime via CRI so runtimes such
+  as containerd and CRI-O can honour it.
 
-6. **Kubelet 实现**：
-   - 在 `pkg/kubelet/kuberuntime/kuberuntime_container.go` 中，创建容器时将 `StopSignal` 传递给 CRI
-   - 在 `pkg/kubelet/kuberuntime/helpers.go` 中添加辅助函数处理信号名称解析
-   - 在 `pkg/kubelet/kubelet_pods.go` 中，生成 Pod 状态时填充 `ContainerStatus.StopSignal`
-   - 在 `pkg/kubelet/container/runtime.go` 中更新相关接口定义
+## Non-goals
 
-7. **测试用例**：
-   - 在 `pkg/api/pod/util_test.go` 中添加 `TestDropContainerStopSignals` 测试字段剥离逻辑
-   - 在 `pkg/apis/core/validation/validation_test.go` 中添加 StopSignal 验证测试
-   - 在 `pkg/kubelet/kuberuntime/kuberuntime_container_linux_test.go` 中添加 kubelet 相关测试
-   - 在 `pkg/api/pod/testing/make.go` 中添加 `SetContainerLifecycle` 测试辅助函数
+- Defining new termination semantics beyond signal selection.
+- Per-probe (livenessProbe / readinessProbe) signal customisation.
+- Changing how `terminationGracePeriodSeconds` is interpreted.
 
-8. **E2E 测试**：
-   - 在 `test/e2e/common/node/lifecycle_hook.go` 中添加 StopSignal 相关的端到端测试
-   - 在 `test/e2e/feature/feature.go` 中注册相关特性标签
+## API shape
 
-9. **OpenAPI 规范更新**：更新 `api/openapi-spec/` 下的 swagger.json 和 v3 openapi.json 文件，添加 StopSignal 字段的描述。
+A new `StopSignal` field is added to the container `Lifecycle` struct (alongside
+`PostStart` and `PreStop`). Its type is a `Signal` enum (string) whose allowed
+values depend on the pod's OS. Validation rules:
+
+- `lifecycle.stopSignal` may only be set when `pod.spec.os.name` is also set.
+  This avoids cross-OS ambiguity.
+- For `os.name=linux`, the allowed values are the standard POSIX signal names
+  (`SIGTERM`, `SIGKILL`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`,
+  `SIGTRAP`, `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGPIPE`, `SIGALRM`,
+  `SIGSTKFLT`, `SIGCHLD`, `SIGCONT`, `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`,
+  `SIGURG`, `SIGXCPU`, `SIGXFSZ`, `SIGVTALRM`, `SIGPROF`, `SIGWINCH`, `SIGIO`,
+  `SIGPWR`, `SIGSYS`, `SIGRTMIN`...`SIGRTMAX`).
+- For `os.name=windows`, the allowed values are `SIGTERM` and `SIGKILL` only.
+
+Container status is extended with an `EffectiveStopSignal` field. Its value is:
+
+1. The signal set in the container's spec, if any; otherwise
+2. The signal that the container runtime reported (e.g. the image's `STOPSIGNAL`),
+   if available; otherwise
+3. Empty (the runtime will use its own default).
+
+## CRI changes
+
+The CRI `ContainerConfig` message is extended with an optional stop-signal field
+of an enum-equivalent type. CRI's `ContainerStatus` reply gains an
+`EffectiveStopSignal` field so kubelet can populate `EffectiveStopSignal` in the
+PodStatus.
+
+For backwards compatibility:
+- A kubelet that supports the feature MUST detect runtime support via the
+  existing CRI version negotiation. If the runtime does not understand the new
+  field, kubelet falls back to the prior behaviour (the image's stop signal
+  applies).
+- A runtime that supports the feature MUST treat an unset stop-signal field as
+  "use the existing default" (image's `STOPSIGNAL`, then `SIGTERM`).
+
+## Validation
+
+Pod admission rejects a pod whose `spec.os.name` is `linux` but whose
+`stopSignal` is one of the Windows-only signals (none in the current proposal),
+and vice versa for Windows pods, where only `SIGTERM` and `SIGKILL` are
+permitted. The validation set lives alongside the existing OS-mismatch
+validations.
+
+`stopSignal` is restricted to a fixed list of POSIX signal names.
+
+## Feature gate
+
+The feature is alpha behind `ContainerStopSignals`. Both API server and kubelet
+must have the gate enabled for the field to be respected. When the gate is off:
+
+- API server drops the field on writes, exactly as for any other alpha field.
+- Kubelet, on receipt of a pod whose container has `lifecycle.stopSignal` set,
+  ignores the field and uses the existing default behaviour (image-defined or
+  CRI-default `SIGTERM`).
+
+## Test plan
+
+The KEP requires:
+
+- API validation tests for the new field (allowed signal names per OS).
+- Round-trip tests for the new API field through API machinery (encoding,
+  defaulting, conversion).
+- Strategy tests for handling the field on update.
+- Kubelet tests that verify the field is propagated into the CRI
+  `ContainerConfig` and used at termination time.
+- Integration tests that exercise the full path: pod with custom `stopSignal`,
+  feature gate on, container actually stopped with the expected signal.
+- Disabled-feature-gate tests that assert the field is ignored end-to-end.
+
+## Implementation Task
+
+Implement the alpha feature behind the `ContainerStopSignals` feature gate:
+
+- Add the new field `Lifecycle.StopSignal *Signal` (or equivalent) to the
+  container API and propagate through API machinery (validation, defaulting,
+  conversion, OpenAPI, deep-copy). Mirror it in `ContainerStatus` so the value
+  the runtime will use is observable.
+- Extend the kubelet runtime adapter so the configured stop signal flows through
+  to the runtime via CRI.
+- Validate the value against the per-OS allowed-signal sets.
+- Drop unknown / invalid stop signals on update for objects pre-dating the
+  feature.
+- Expose the effective stop signal back into `ContainerStatus`.
+
+The KEP does not prescribe a particular file layout beyond what already exists
+for similar lifecycle features (`PreStop`, `PostStart`). Place new logic next
+to the existing equivalents.
+
+## Acceptance
+
+- A pod with `spec.containers[*].lifecycle.stopSignal: "SIGUSR1"` results in the
+  container being stopped with `SIGUSR1` when the feature gate is enabled.
+- With the feature gate disabled, the field is dropped and behaviour is
+  unchanged.
+- `kubectl get pod -o yaml` shows the effective stop signal under
+  `status.containerStatuses[*].effectiveStopSignal` (or the equivalent name
+  defined in this KEP).
+- Validation tests cover OS / signal cross-compatibility.
+- e2e and unit tests exist for the new API surface and CRI propagation.

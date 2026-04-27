@@ -1,31 +1,90 @@
-**Summary**: Presto 的 `UnnestOperator` 是 CPU 消耗排名前五的算子之一，当前实现采用逐行处理方式构建输出块，性能存在较大优化空间。本提案要求重构 `BenchmarkUnnestOperator` 基准测试类，使其能够更全面地测试各种 unnest 场景，为后续的向量化优化提供可靠的性能基准。
+# T10: Presto — Unnest Operator Optimisations
 
-**Motivation**: UnnestOperator 用于展开数组、Map 和嵌套结构，在处理复杂数据类型的查询中被频繁使用。当前的基准测试存在以下问题：(1) 测试场景有限，无法覆盖各种嵌套类型组合；(2) 输入数据生成逻辑复杂且难以维护；(3) 测试参数不够灵活，难以探索不同配置下的性能特征。重构基准测试是进行后续向量化优化（如批量填充 DictionaryBlock、紧凑循环复制等）的必要前置步骤。
+## Requirement — self-contained specification
 
-**Proposal**: 重构 `BenchmarkUnnestOperator` 类：(1) 使用 `PageAssertions.createPageWithRandomData` 替代自定义的输入生成逻辑，简化代码并提高可维护性；(2) 扩展测试参数以覆盖更多场景，包括不同的复制列类型、多种嵌套类型组合、以及 withOrdinality 选项；(3) 将 benchmark 方法移到类的前面以提高可读性；(4) 调整 JMH 配置参数以获得更准确的测量结果。
+*Upstream source (for reference only):* Presto issue #13751 "Improve performance of UNNEST operator" (`https://github.com/prestodb/presto/issues/13751`) and PR #14050. All context and requirements are inlined below.
 
-**Design Details**:
+---
 
-1. 移除自定义 InputGenerator：删除 `InputGenerator` 内部类及其所有方法（`produceBlock`、`produceStringBlock`、`produceIntBlock`、`produceArrayBlock`、`produceMapBlock`、`produceRowBlock`、`generateRandomString`）。这些方法由 `PageAssertions.createPageWithRandomData` 工具方法替代。
+## 1. Motivation
 
-2. 简化 BenchmarkData 状态类：将 `BenchmarkContext` 重命名为 `BenchmarkData`（符合 JMH 命名惯例）。移除 `stringLengths` 和 `nestedLengths` 参数，因为新的随机数据生成方法不需要这些配置。简化类型解析逻辑。
+Presto's `UNNEST` operator is used to explode array / map-typed columns into multiple rows. It is the top-5 most frequently used operator in production Presto deployments and, historically, one of the slower ones. Profiling showed three bottlenecks in the legacy implementation (`UnnestOperator`):
 
-3. 扩展测试参数：
-   - `replicateType`: 从 `varchar` 扩展为支持 `bigint` 和 `varchar`
-   - `nestedType`: 从有限的三种类型扩展为更多组合：`array(varchar)`、`array(integer)`、`map(varchar,varchar)`、`array(row(varchar,varchar,varchar))`、`array(array(varchar))`、`array(bigint)|array(bigint)`、`array(varchar)|array(varchar)`
-   - 添加 `withOrdinality` 布尔参数测试带序号输出的场景
-   - 使用管道符 `|` 分隔支持多个 unnest 列
+1. **Per-row block construction** — each output row allocated a fresh `BlockBuilder` for each unnest column, incurring per-row boxing and bounds-check overhead.
+2. **Repeated null-bit lookups** — `isNull(i)` was called multiple times on the same position, once per column, once per replicate.
+3. **Inefficient replicate columns** — columns that are replicated (not unnested) were rebuilt row-by-row rather than via a `DictionaryBlock` wrapping the source column.
 
-4. 简化通道构建逻辑：将原来的单一 `channelsBuilder` 拆分为 `replicatedChannelsBuilder` 和 `unnestChannelsBuilder`，分别管理复制列和 unnest 列的通道索引。类似地拆分类型构建器。
+The goal is to replace the row-at-a-time implementation with a column-at-a-time implementation that processes entire pages at once, reuses block builders across rows, and emits dictionary-backed replicate columns.
 
-5. 使用 PageAssertions 生成测试数据：在 setup 方法中调用 `createPageWithRandomData(types, positionsPerPage, false, false, primitiveNullsRatio, rowNullsRatio, false, ImmutableList.of())` 生成测试页面。这提供了与现有测试框架一致的随机数据生成能力。
+## 2. Required algorithmic changes
 
-6. 调整 JMH 配置：
-   - 将输出时间单位从 `TimeUnit.SECONDS` 改为 `TimeUnit.MICROSECONDS`
-   - 将预热迭代从 20 次减少到 8 次
-   - 将测量迭代从 20 次减少到 8 次
-   - 添加 `@BenchmarkMode(Mode.AverageTime)` 注解明确测量模式
+### 2.1 UnnestOperator skeleton
 
-7. 代码结构调整：将 `@Benchmark unnest` 方法移到类的开头位置（在 `BenchmarkData` 之前），提高代码可读性。更新导入语句，移除不再使用的导入（如 `Random`、`Arrays`、`checkArgument` 等），添加新需要的导入（如 `PageAssertions`、`ArrayList`、`BenchmarkMode`、`Mode`）。
+Keep the public type signature:
 
-8. 修正 OperatorFactory 引用：将 `UnnestOperatorFactory` 改为 `UnnestOperator.UnnestOperatorFactory`，使用正确的内部类引用方式。
+```java
+public final class UnnestOperator implements Operator {
+    UnnestOperator(
+        OperatorContext context,
+        List<Type> replicateTypes,
+        List<Integer> replicateChannels,
+        List<Type> unnestTypes,
+        List<Integer> unnestChannels,
+        boolean withOrdinality);
+    Page getOutput();
+    void addInput(Page page);
+}
+```
+
+### 2.2 Per-column unnester
+
+Introduce an abstract `Unnester` with concrete implementations `ArrayUnnester`, `MapUnnester`, `ArrayOfRowsUnnester`. Each `Unnester` holds its own `BlockBuilder`, is reused across pages, and exposes:
+
+```java
+interface Unnester {
+    int getChannelCount();                 // number of output columns
+    int[] getCardinalities(Block block);   // cardinality per input row
+    void processRow(int rowIndex, int cardinality, int maxCardinality);
+    Block[] buildOutputBlocks();
+    void reset();
+}
+```
+
+Concrete implementations:
+
+- `ArrayUnnester` — produces a single block; cardinality = array length per row.
+- `ArrayOfRowsUnnester` — produces one block per row field.
+- `MapUnnester` — produces two blocks (keys, values).
+
+### 3.2 Ordinality & With-Ordinality
+
+When the SQL uses `UNNEST(...) WITH ORDINALITY`, the operator appends a `bigint` channel with 1-based row indices. This is implemented uniformly in the operator rather than in each `Unnester`.
+
+### 3.3 Replicated channels
+
+`UnnestOperator` supports replicated source channels: the channels that are not being unnested are duplicated for each output row. The new implementation copies block regions in bulk (`Block.copyPositions`) instead of per-row.
+
+## 4. Implementation Task
+
+Refactor the Presto unnest operator and related classes:
+
+1. Introduce the `Unnester` abstract class / interface with the three concrete implementations above.
+2. Replace the per-row output loop in `UnnestOperator#getOutput` with a three-phase flow:
+   - compute cardinalities,
+   - compute the total output position count and allocate builders with the right capacity,
+   - stream-fill builders using bulk `writeStructure` / `writeByte` etc. to avoid per-element method dispatch.
+3. Replicate replicated columns via `DictionaryBlock` or `RunLengthEncodedBlock` instead of copying each row, where feasible.
+4. Ordinality channel: build a `LongArrayBlock` directly with `Math.toIntExact` guard.
+5. Ensure all `Unnester` implementations support both "concat" mode (single unnest) and "cross" mode (multiple unnests with equal cardinalities).
+
+Test expectations:
+
+- The Unnest integration tests must continue to pass.
+- The unnest-operator unit tests are extended to cover replicated channels and multi-unnest.
+- The Unnest microbenchmarks show a ~30-50% reduction in operator latency for common cases.
+
+## 5. Acceptance
+
+- Code compiles with `./mvnw -pl presto-main -am compile` and the `presto-main` unit suite passes.
+- `TestUnnestOperator` extended tests cover: nested rows (array(row)), mixed null cardinalities across columns, single-row pages.
+- No changes to SQL-visible semantics; `EXPLAIN` should report the same plan shape.

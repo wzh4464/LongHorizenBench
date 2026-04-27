@@ -1,86 +1,127 @@
-# T38: Kubernetes Manifest-Based Admission Control Config
+# T38: Kubernetes Enhancement KEP-5793 — Manifest-Based Admission Control Configuration
 
-## Requirement
-https://github.com/kubernetes/enhancements/blob/master/keps/sig-api-machinery/5793-manifest-based-admission-control-config/README.md
+## Requirement source
+
+This task corresponds to KEP-5793 ("Manifest Based Admission Control Configuration") in `kubernetes/enhancements`, sig-api-machinery. The summary below is the contract you implement against; do not invent additional structure, paths, or naming beyond what the KEP specifies.
 
 ---
 
-**Summary**: KEP-5793 提出为 kube-apiserver 添加基于文件清单（manifest）的准入控制配置功能。该功能允许通过文件系统上的清单文件配置准入 webhooks 和策略，这些策略在 API server 启动时加载，独立于 Kubernetes API 存在，无法通过 API 修改或删除。
+## 1. Motivation
 
-**Motivation**: 当前 Kubernetes 的策略执行主要通过 API 对象实现（如 ValidatingAdmissionPolicy、MutatingWebhookConfiguration 等）。这种方式存在几个关键缺陷：
+Kubernetes admission control today is registered exclusively through API objects (`ValidatingWebhookConfiguration`, `MutatingWebhookConfiguration`, `ValidatingAdmissionPolicy`/`Binding`, `MutatingAdmissionPolicy`/`Binding`). Three gaps result:
 
-1. **启动时间差**：策略在 API 对象创建并被动态准入控制器读取后才生效，在集群初始化期间存在策略未生效的窗口期。
-2. **自我保护缺失**：webhook 和 policy 配置对象本身不受 webhook 准入控制保护（为避免循环依赖），有足够权限的恶意或误操作用户可以删除关键准入策略。
-3. **etcd 依赖**：当前准入配置依赖 etcd 可用性，如果 etcd 不可用或损坏，准入策略可能无法正确加载。
+1. There is a *bootstrap gap*: until the API server is serving and the controller manager has reconciled webhook objects, admission requests are not subject to those webhooks.
+2. There is a *self-protection gap*: any actor with sufficient RBAC on the admissionregistration group can delete or weaken the very policies meant to protect the cluster (these objects are not subject to themselves to avoid recursion).
+3. There is an *availability gap*: admission policies depend on etcd being readable; if etcd is unhealthy or partitioned, configurations cannot be reread.
 
-**Proposal**: 扩展 `AdmissionConfiguration` 资源，添加 `staticManifestsDir` 字段来指定包含准入配置的清单文件目录。这些清单文件在 API server 启动时加载，并在运行时监控文件变化动态重新加载。清单配置的策略在 API 配置的策略之前评估，提供平台级别的保护。
+KEP-5793 addresses all three by allowing the kube-apiserver to load admission configurations from a directory of manifest files at startup and on file changes, completely independent of the API server's etcd state.
 
-**Design Details**:
+## 2. Goals (per KEP)
 
-1. **扩展 AdmissionConfiguration Schema**：
-   - 为 `WebhookAdmissionConfiguration` 添加 `staticManifestsDir` 字段
-   - 为 `ValidatingAdmissionPolicyConfiguration` 添加 `staticManifestsDir` 字段
-   - 为 `MutatingAdmissionPolicyConfiguration` 添加 `staticManifestsDir` 字段
-   - 更新 `staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/config/apis/webhookadmission/` 下的类型定义
+1. *Bootstrap*: file-configured admission policies and webhooks are active before the first API request is admitted.
+2. *Self-protection*: manifest-based objects exist outside the REST API; they cannot be edited or deleted through the API server.
+3. *Etcd-independence*: manifest-based configurations remain in effect even if etcd is unavailable.
+4. *Dynamic reload*: changes to manifest files on disk are picked up at runtime without restart.
+5. *Namespacing*: all manifest-defined objects are reserved with names ending in `.static.k8s.io`; REST handlers reject creation of API-driven objects with this suffix.
+6. *Observability*: metrics and audit annotations expose the source of each admission decision.
 
-2. **创建 Policy Config API 类型**：
-   - 在 `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/config/apis/policyconfig/` 下创建新的 API 类型
-   - 定义 internal 类型（`types.go`）和 v1 版本类型
-   - 实现 `register.go` 和 `install/install.go` 用于 scheme 注册
+## 5. Configuration surface (from the KEP)
 
-3. **实现清单加载器（Manifest Loader）**：
-   - 在 `staging/src/k8s.io/apiserver/pkg/admission/plugin/manifest/` 下创建通用加载器
-   - 实现从目录读取 YAML/JSON 文件的功能
-   - 实现文件内容的解码、默认值填充和验证
-   - 按字母顺序处理文件以保证确定性行为
+The feature extends the kube-apiserver `AdmissionConfiguration` (passed via `--admission-control-config-file`) so that each of the four admission plugins can be told to read additional configuration from disk. The new field is `staticManifestsDir`, an absolute path to a directory containing manifest YAML/JSON files. Example:
 
-4. **实现 Webhook 清单加载**：
-   - 在 `staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/manifest/` 下创建 webhook 特定的加载器
-   - 支持 `ValidatingWebhookConfiguration` 和 `MutatingWebhookConfiguration`
-   - 验证只允许 URL 类型的 clientConfig（不支持 Service 引用）
+```yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+- name: ValidatingAdmissionWebhook
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: WebhookAdmissionConfiguration
+    staticManifestsDir: /etc/kubernetes/admission/validating-webhooks
+- name: MutatingAdmissionWebhook
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: WebhookAdmissionConfiguration
+    staticManifestsDir: /etc/kubernetes/admission/mutating-webhooks
+- name: ValidatingAdmissionPolicy
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1alpha1
+    kind: ValidatingAdmissionPolicyConfiguration
+    staticManifestsDir: /etc/kubernetes/admission/vap
+- name: MutatingAdmissionPolicy
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1alpha1
+    kind: MutatingAdmissionPolicyConfiguration
+    staticManifestsDir: /etc/kubernetes/admission/map
+```
 
-5. **实现 Policy 清单加载**：
-   - 在 `pkg/admission/plugin/policy/manifest/loader/` 下创建 policy 加载器
-   - 支持 `ValidatingAdmissionPolicy`、`ValidatingAdmissionPolicyBinding`
-   - 支持 `MutatingAdmissionPolicy`、`MutatingAdmissionPolicyBinding`
-   - 验证不允许 `paramKind` 和 `paramRef`
+### Supported manifest types
 
-6. **实现复合策略源（Composite Policy Source）**：
-   - 在 `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/` 下创建 `composite_policy_source.go`
-   - 合并清单配置和 API 配置
-   - 确保清单配置优先评估
+Files in each `staticManifestsDir` may contain only the resource kinds appropriate to that admission plugin:
 
-7. **实现文件监控和动态重载**：
-   - 使用 fsnotify 监控文件变化
-   - 添加轮询回退机制（默认 1 分钟间隔）
-   - 计算文件内容哈希用于变更检测
-   - 验证失败时保留上一个有效配置
+- Webhook plugins: `ValidatingWebhookConfiguration`, `MutatingWebhookConfiguration` (`admissionregistration.k8s.io/v1`), or their `…List` forms. Each manifest may also be a `ValidatingWebhookConfigurationList` / `MutatingWebhookConfigurationList`, or a generic `v1.List` whose items are these types.
+- VAP/MAP plugins: `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding` / `MutatingAdmissionPolicy` + `MutatingAdmissionPolicyBinding`, in the v1 group, or the equivalent List wrappers.
 
-8. **命名和冲突解决**：
-   - 强制清单对象名称必须以 `.static.k8s.io` 后缀结尾
-   - 在 strategy 层阻止 REST API 创建带此后缀的对象
-   - 更新 `pkg/registry/admissionregistration/*/strategy.go` 添加验证
+Mixing plugin types in a single directory is rejected at startup.
 
-9. **添加静态后缀验证**：
-   - 在 `pkg/apis/admissionregistration/validation/` 下创建 `static_suffix.go`
-   - 实现检查 `.static.k8s.io` 后缀的验证函数
+### Naming and constraints
 
-10. **添加 Feature Gate**：
-    - 在 `staging/src/k8s.io/apiserver/pkg/features/kube_features.go` 中注册 `ManifestBasedAdmissionControlConfig`
-    - 在 `pkg/features/kube_features.go` 中同步添加
+- Every object loaded from disk must have a `metadata.name` ending in `.static.k8s.io`. Any other name is rejected at load time.
+- The same suffix is rejected by the REST handlers for the corresponding API group/version: a `POST` of an object whose name ends in `.static.k8s.io` returns `Forbidden` ("name suffix is reserved for static manifests"). When the feature gate is off, the REST handler instead emits a warning header but still admits the create — this preserves backwards compatibility.
+- Webhooks loaded from manifests must use `clientConfig.url`. `clientConfig.service` is rejected at load time, because the static manifest path runs before the service network is necessarily reachable.
+- Webhooks must use static authentication (kubeconfig or in-line CA bundle); they may not reference a `Secret` for credentials.
+- Policies and bindings reference each other only by name within the same manifest set — no cross-set references and no references to API-managed VAP/MAP objects.
 
-11. **添加指标和审计**：
-    - 在 `staging/src/k8s.io/apiserver/pkg/admission/plugin/manifest/metrics/` 下添加指标
-    - 记录重载计数和时间戳
-    - 记录当前配置哈希用于漂移检测
+## 5. Manifest layout
 
-12. **更新准入初始化器**：
-    - 更新 `pkg/kubeapiserver/admission/initializer.go`
-    - 更新 `staging/src/k8s.io/apiserver/pkg/admission/initializer/`
-    - 传递清单目录配置到各准入插件
+The API server is configured with one or more directories. Each directory is scanned non-recursively. Files matching `*.yaml` or `*.json` are read. Each file may contain one resource or a `v1.List` (or comma/`---`-separated documents in YAML). Mixing kinds within one file is allowed.
 
-13. **编写测试**：
-    - 为加载器编写单元测试
-    - 为文件监控和重载编写测试
-    - 为复合源编写测试
-    - 添加集成测试验证端到端功能
+The same field is reachable from the existing `AdmissionConfiguration` config file plumbing — i.e. the alpha API version of `WebhookAdmissionConfiguration` / `ValidatingAdmissionPolicyConfiguration` / `MutatingAdmissionPolicyConfiguration` gains a new `StaticManifestsDir` (string) field that points at the directory.
+
+## 5. Loading and reload semantics
+
+1. On API server start, before any built-in admission plugin reads etcd, the new loader scans every configured `StaticManifestsDir`, parses each YAML/JSON document, and registers the resulting objects with the corresponding admission plugin in addition to whatever is configured via the API.
+2. The loader uses `fsnotify` (or equivalent) on the directory; when files are added, removed, or modified the loader re-parses and atomically swaps the in-memory set for that directory. Changes are eventually consistent with running webhook/policy evaluation.
+3. If a manifest is malformed, the loader logs a structured error, increments a failure metric, and **retains the previous good state** for that directory. It does not abort startup once the API server is running; at startup, malformed manifests cause the API server to fail fast.
+4. Loaded objects are merged with API-server-stored configurations during admission: the same matching rules and ordering apply, but the manifest-loaded objects always evaluate first within their plugin so they cannot be silenced by REST configuration.
+
+## 6. Validation and admission semantics
+
+- Manifest objects go through the same versioning, defaulting, and validation as API-stored objects (the alpha implementation uses the same `Strategy` types).
+- Manifest-loaded `ValidatingAdmissionPolicy` bindings may reference only manifest-loaded policies (not REST-stored ones). The same applies to mutating variants.
+- Static objects are visible via a new read-only listing surface: `GET /apis/admissionregistration.k8s.io/v1/staticvalidatingadmissionpolicies` and the analogous endpoints for the other three kinds. These endpoints are list/watch only — no create/update/delete.
+- Static objects are returned by the standard List/Watch endpoints if and only if the request includes the label selector `admissionregistration.k8s.io/static=true`. Default lists must not return them, to avoid breaking existing controllers.
+- Admission events triggered by static configurations carry an audit annotation `admission.k8s.io/source=manifest` plus the manifest file path.
+
+## 6. Reload metrics
+
+A small set of Prometheus metrics is emitted by each plugin that supports the feature:
+
+- a counter incremented every time a reload is attempted, labelled by plugin and by outcome (`success` / `failure`);
+- a gauge holding the timestamp of the last successful reload per plugin;
+- a counter of objects currently loaded from disk per plugin.
+
+Failure to load any single manifest must not poison the rest: each file is parsed independently, errors are logged with file path, and only successfully parsed objects participate in admission.
+
+## 7. Feature gate and graduation
+
+The feature is guarded by the `ManifestBasedAdmissionControlConfig` feature gate (alpha). With the gate disabled, the new fields on the configuration types are ignored and the new endpoints are not registered.
+
+## 8. Test plan (informative)
+
+- **Unit:** YAML/JSON decoding, name-suffix validation, kind allow-list, conflict detection between manifests and API objects, and plugin-specific validation (e.g. `MatchConditions` parsing).
+- **Integration:** start the API server with manifest directories populated; verify that the static manifests are enforced before any API objects exist; verify that file-watch reloads occur within a small bounded delay; verify the REST API path that lists static objects returns a stable view.
+- **Conformance / e2e:** none initially; the feature is alpha and gated.
+
+## 5. Implementation notes (informative)
+
+The KEP does not prescribe a particular package layout. Implementations are expected to:
+
+- Add a `staticManifestsDir` field to the alpha admission-plugin configuration types for each of the four affected plugins.
+- Wire up a directory loader and `fsnotify` watcher in each plugin so that the same parsing and validation is reused for both startup and runtime reload.
+- Reject any object whose name does not end in `.static.k8s.io` and any object whose `kind` is outside the per-plugin allow-list.
+- Surface the loaded set through whatever in-memory store the plugin already uses for API-driven objects, tagging each object as manifest-sourced so that conflict checks and audit annotations can distinguish the two.
+- Add the new feature gate `ManifestBasedAdmissionControlConfig` and gate all new behaviour on it.
+- Add metrics named with the `apiserver_admission_manifest_` prefix covering load attempts, parse failures per directory, and the count of currently loaded objects per plugin.
+
+The KEP intentionally leaves file naming and exact internal type layout to the implementation.
